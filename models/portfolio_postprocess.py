@@ -98,10 +98,15 @@ def main() -> None:
         "--position-output", default="models/risk_position.png",
         help="Only used with --risk-overlay: path to save the position-vs-scaling plot images",
     )
+    parser.add_argument(
+        "--vol-matched-output", default="models/risk_vol_matched_pnl.png",
+        help="Only used with --risk-overlay: path to save the out-of-sample "
+             "raw/risk-weighted/attenuated PnL plot, all rescaled to match --target-vol",
+    )
     args = parser.parse_args()
 
     result = run_pipeline_multi_seed(args)
-    if not args.load_portfolio:
+    if  args.save_portfolio:
         result.model.save_model(x_mean=result.x_mean, x_std=result.x_std)
 
     if not args.risk_overlay:
@@ -118,6 +123,7 @@ def main() -> None:
     from models.risk_postprocess import (
         plot_pnl as plot_risk_pnl,
         plot_position_and_scaling,
+        plot_vol_matched_pnl,
         print_sharpe_ratios as print_risk_sharpe_ratios,
     )
 
@@ -127,6 +133,7 @@ def main() -> None:
     print_risk_sharpe_ratios(risk_result)
     plot_risk_pnl(risk_result, args.output)
     plot_position_and_scaling(risk_result, args.position_output)
+    plot_vol_matched_pnl(risk_result, args.vol_matched_output, target_vol=args.target_vol)
 
 
 if __name__ == "__main__":

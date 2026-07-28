@@ -144,6 +144,66 @@ def plot_position_and_scaling(result: RiskResult, output_path: str) -> None:
     )
 
 
+def annualized_vol(returns: np.ndarray, periods_per_year: int = 252) -> float:
+    """Realized annualized volatility of a daily log-return series."""
+    return float(np.std(returns) * np.sqrt(periods_per_year))
+
+
+def scale_to_target_vol(returns: np.ndarray, target_vol: float, periods_per_year: int = 252) -> np.ndarray:
+    """Rescale `returns` by a single constant factor so its REALIZED
+    annualized volatility over the given period equals `target_vol`.
+
+    This is a plotting-time normalization, distinct from
+    portfolio_lstm.py's scale_weights_to_target_vol (which rescales
+    weights day-by-day, using each day's own trailing-window covariance
+    estimate, before the fact). Here the series is already fixed - we're
+    just rescaling it after the fact, using its own REALIZED volatility
+    over the whole period, purely so several return series that naturally
+    run at different risk levels can be compared on the same chart: any
+    remaining difference in cumulative PnL then reflects differences in
+    SKILL/SHAPE (drawdowns, smoothness) rather than just how much risk
+    each one happened to take.
+    """
+    vol = annualized_vol(returns, periods_per_year)
+    if vol < 1e-12:
+        return returns  # degenerate all-zero series - nothing to scale
+    return returns * (target_vol / vol)
+
+
+def plot_vol_matched_pnl(result: RiskResult, output_path: str, target_vol: float = 0.20) -> None:
+    """Plot OUT-OF-SAMPLE ONLY cumulative PnL for three strategies, each
+    independently rescaled (by its own realized volatility) to the SAME
+    annualized volatility target:
+      - "raw": PortfolioLSTM's weights before --target-vol scaling.
+      - "risk-weighted": after --target-vol scaling (the normal, un-
+        attenuated pipeline output), before the risk overlay.
+      - "attenuated": after the risk overlay's per-asset attenuation on
+        top of the risk-weighted position.
+
+    Comparing cumulative PnL directly can be misleading when the
+    strategies run at very different risk levels - a naturally lower-vol
+    strategy looks "worse" purely from being smaller. Vol-matching removes
+    that confound.
+    """
+    raw = scale_to_target_vol(result.portfolio_result.returns_val_unscaled, target_vol)
+    risk_weighted = scale_to_target_vol(result.returns_val_raw, target_vol)
+    attenuated = scale_to_target_vol(result.returns_val_scaled, target_vol)
+
+    fig, ax = plt.subplots(figsize=(12, 5))
+    ax.plot(result.dates_val, np.cumsum(raw), label="raw (pre vol-target)", color="tab:gray", linewidth=1)
+    ax.plot(result.dates_val, np.cumsum(risk_weighted), label="risk-weighted (vol-targeted)", color="tab:blue", linewidth=1)
+    ax.plot(result.dates_val, np.cumsum(attenuated), label="attenuated (risk overlay)", color="black", linewidth=1)
+    ax.axhline(0, color="gray", linewidth=0.8, linestyle="--")
+    ax.set_title(f"Out-of-sample cumulative PnL, all matched to {target_vol:.0%} annualized volatility")
+    ax.set_xlabel("date")
+    ax.set_ylabel("cumulative log-return P&L (vol-matched)")
+    ax.legend()
+    fig.autofmt_xdate()
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    logger.info("Saved plot to %s", output_path)
+
+
 def plot_pnl(result: RiskResult, output_path: str) -> None:
     """Plot raw vs attenuated cumulative PnL as two SEPARATE figures - one
     for the in-sample (train) period, one for the out-of-sample
@@ -178,6 +238,11 @@ def main() -> None:
         "--position-output", default="models/risk_position.png",
         help="Path to save the position-vs-scaling plot images",
     )
+    parser.add_argument(
+        "--vol-matched-output", default="models/risk_vol_matched_pnl.png",
+        help="Path to save the out-of-sample raw/risk-weighted/attenuated PnL plot, "
+             "all rescaled to match --target-vol",
+    )
     args = parser.parse_args()
 
     result = run_pipeline(args)
@@ -185,6 +250,7 @@ def main() -> None:
     print_sharpe_ratios(result)
     plot_pnl(result, args.output)
     plot_position_and_scaling(result, args.position_output)
+    plot_vol_matched_pnl(result, args.vol_matched_output, target_vol=args.target_vol)
 
 
 if __name__ == "__main__":

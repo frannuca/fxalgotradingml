@@ -113,6 +113,20 @@ gradient descent on the (negated) Sharpe ratio of the whole train-period
 return path, then prints in-sample (train) and out-of-sample (validation)
 Sharpe ratio and cumulative PnL.
 
+**Volatility targeting** (`--target-vol`, default `0.20` = 20% annualized):
+right after PortfolioLSTM computes its raw weights (softmax/tanh_norm),
+they're uniformly rescaled per day so the portfolio's ANNUALIZED
+volatility - estimated from the realized covariance of the same lookback
+window - matches this target. FX portfolios are naturally low-vol (a few
+percent annualized), so hitting 20% usually means leveraging weights up
+(`sum(weights)` can end up well above 1) - that's the intended effect, not
+a bug. This scaling is baked into training itself (the Sharpe objective is
+computed on the vol-targeted returns, so the model directly optimizes
+for them) and into evaluation; the risk overlay (`--risk-overlay`, below)
+only ever reduces these already-scaled weights further, it never
+re-scales them. Set `--target-vol` to something tiny (e.g. `1e-6`) to
+effectively disable it and get the old raw-weight behavior back.
+
 Add `--risk-overlay` to also train the risk-attenuation network from step
 9 on top, in the same run:
 
@@ -228,12 +242,20 @@ touching the others, and never zeroes any asset out entirely.
 
 This is a two-stage pipeline, not one joint model:
 
-1. Train PortfolioLSTM exactly as in step 7 (reuses that same code).
-2. Freeze it, and use its predicted weights as a fixed input (no
-   gradients flow back into PortfolioLSTM from this stage).
-3. RiskLSTM looks at the same log-return window plus those frozen
-   weights, and is trained on its own to maximize the Sharpe ratio of the
-   *attenuated* portfolio (`weights * attenuation`, elementwise per asset).
+1. Train PortfolioLSTM exactly as in step 7 (reuses that same code,
+   volatility targeting included) and freeze it.
+2. Use its predicted (already vol-targeted) weights as a fixed input - no
+   gradients flow back into PortfolioLSTM from this stage.
+3. RiskLSTM does NOT read raw log returns. For every trailing
+   `--risk-rolling-window` days inside the lookback window, it computes
+   each asset's rolling **standard deviation, skewness, and excess
+   kurtosis** - the moments a risk manager actually looks at (vol =
+   realized risk, skewness = asymmetric tail risk, kurtosis = fat-tail /
+   regime instability) - and feeds that rolling-moment sequence through
+   its own LSTM. Its final hidden state is concatenated with the frozen
+   weights, and trained on its own to maximize the Sharpe ratio of the
+   *attenuated* portfolio (`weights * attenuation`, elementwise per asset,
+   no further volatility rescaling).
 
 ```bash
 python -m models.risk_lstm \
@@ -261,6 +283,9 @@ Accepts every `models/portfolio_lstm.py` argument (for stage 1) plus:
   fraction of its proposed weight, and 1 means no attenuation at all
   (full-size position) - a limit that holds regardless of what the
   network learns, not just a training-time preference for smaller bets.
+- `--risk-rolling-window` (default 10, must be `< --lookback`): the
+  trailing window (in days) the rolling volatility/skewness/kurtosis
+  features above are computed over.
 
 `--dropout`/`--weight-decay`/`--noise-std` are shared between both
 networks' training stages. Prints raw (unattenuated) vs attenuated Sharpe
@@ -303,6 +328,15 @@ de-risked while another stays near full size ->
 
 - `models/risk_position_insample.png`
 - `models/risk_position_outsample.png`
+
+It also saves a third, OUT-OF-SAMPLE-ONLY chart (`--vol-matched-output`,
+default `models/risk_vol_matched_pnl.png`) overlaying three cumulative-PnL
+curves - raw (pre `--target-vol`), risk-weighted (post `--target-vol`,
+pre risk overlay), and attenuated (post risk overlay) - each
+**independently rescaled by its own realized volatility** to the same
+target (`--target-vol`, default 20%), so differences between the curves
+reflect differences in shape/skill (drawdowns, smoothness) rather than
+just how much risk each one happened to run.
 
 ## 11. Inference only - load saved models instead of retraining
 

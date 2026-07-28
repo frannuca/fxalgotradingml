@@ -22,12 +22,18 @@ Pipeline (two stages, not a single joint model)
    weights as a FIXED input - no gradient flows back into PortfolioLSTM
    from here on, so the risk network can only learn to scale the given
    position, not reshape which assets it favors.
-3. RiskLSTM looks at the SAME log-return window PortfolioLSTM saw, plus
-   those frozen weights (concatenated onto its final hidden state), and
-   outputs one attenuation factor per asset in [max_attenuation, 1] - see
-   --max-attenuation (default 0.33): a hard floor on exposure per asset
-   that holds regardless of how unconfident the network gets, so it can
-   de-risk an asset without ever fully zeroing it out.
+3. RiskLSTM does NOT look at raw log returns directly. Instead, for every
+   trailing `--risk-rolling-window` days inside the lookback window, it
+   computes each asset's rolling standard deviation, skewness, and excess
+   kurtosis - the moments a risk manager actually looks at (vol = realized
+   risk, skewness = asymmetric tail risk, kurtosis = fat-tail/regime
+   instability) - and feeds THAT rolling-moment sequence through its own
+   LSTM. The final hidden state is concatenated with the frozen portfolio
+   weights, and the combined vector maps to one attenuation factor per
+   asset in [max_attenuation, 1] - see --max-attenuation (default 0.33): a
+   hard floor on exposure per asset that holds regardless of how
+   unconfident the network gets, so it can de-risk an asset without ever
+   fully zeroing it out.
 4. It is trained on its own (a separate optimizer, only its own
    parameters) to maximize the Sharpe ratio of the ATTENUATED portfolio:
        final_weights = portfolio_weights * attenuation   (elementwise, per asset)
@@ -67,6 +73,47 @@ logger = logging.getLogger(__name__)
 
 
 # --------------------------------------------------------------------------
+# Rolling risk statistics: RiskLSTM's actual input features
+# --------------------------------------------------------------------------
+
+def rolling_moments(x: torch.Tensor, window: int, eps: float = 1e-6) -> torch.Tensor:
+    """Compute each asset's rolling standard deviation, skewness, and excess
+    kurtosis over trailing `window`-day sub-windows of `x`.
+
+    x: (batch, lookback, n_assets) log returns.
+    Returns: (batch, lookback - window + 1, 3 * n_assets) - for every day
+    from `window` onward inside the lookback window, the trailing
+    `window`-day std/skewness/kurtosis of every asset, concatenated along
+    the feature axis in that order.
+
+    These three moments are a more direct read on "how risky does this
+    asset look right now" than raw returns are: std is realized volatility
+    (the classic risk signal), skewness flags asymmetric tails (crash risk
+    vs. melt-up), and excess kurtosis (0 for a normal distribution) flags
+    fat tails / regime instability. Feeding these directly, rather than
+    hoping an LSTM rediscovers them from raw returns, is a more direct and
+    sample-efficient way to teach a small network "is there a clear,
+    stable trend or not."
+    """
+    if x.shape[1] < window:
+        raise ValueError(f"lookback ({x.shape[1]}) must be >= rolling window ({window})")
+
+    # (batch, T', n_assets, window): one trailing `window`-day slice ending
+    # at each of the T' = lookback - window + 1 valid days.
+    windows = x.unfold(dimension=1, size=window, step=1)
+
+    mean = windows.mean(dim=-1, keepdim=True)
+    centered = windows - mean
+    variance = (centered ** 2).mean(dim=-1)
+    std = torch.sqrt(variance + eps)
+
+    skewness = (centered ** 3).mean(dim=-1) / (std ** 3 + eps)
+    kurtosis = (centered ** 4).mean(dim=-1) / (std ** 4 + eps) - 3.0  # excess kurtosis: 0 for a normal dist
+
+    return torch.cat([std, skewness, kurtosis], dim=-1)  # (batch, T', 3 * n_assets)
+
+
+# --------------------------------------------------------------------------
 # Model
 # --------------------------------------------------------------------------
 
@@ -75,21 +122,22 @@ class RiskLSTM(nn.Module):
     PortfolioLSTM proposed for that same window) to a PER-ASSET
     attenuation vector, each entry independently in [max_attenuation, 1].
 
-    Architecturally this is its own small LSTM over the return window
-    (so it can judge "is there a clear trend here?" independently of
-    PortfolioLSTM), whose final hidden state is concatenated with the
-    proposed weight vector, then passed through two Linear layers
-    (`head` -> LeakyReLU -> `head_2` -> sigmoid) that map down to one
-    attenuation value per asset - the weights tell it WHAT position is
-    being considered, the LSTM tells it whether each asset's recent
-    returns look confident enough to hold it at full size. LeakyReLU
+    Rather than reading raw log returns, this network's own LSTM reads the
+    ROLLING STD/SKEWNESS/KURTOSIS of every asset (see rolling_moments()
+    above), computed over trailing `rolling_window`-day sub-windows -
+    directly-computed risk statistics instead of raw returns the LSTM
+    would otherwise have to rediscover them from. Its final hidden state
+    is concatenated with the proposed weight vector, then passed through
+    two Linear layers (`head` -> LeakyReLU -> `head_2` -> sigmoid) that
+    map down to one attenuation value per asset - the weights tell it WHAT
+    position is being considered, the moments tell it whether each asset's
+    recent behavior looks stable enough to hold it at full size. LeakyReLU
     (rather than plain ReLU) keeps a small gradient flowing even for units
     with a negative pre-activation, avoiding "dying ReLU" units that get
     stuck and stop learning.
 
     `max_attenuation` (default 0.33) is a FLOOR, not a ceiling: each
-    asset's logit is squashed through a sigmoid and rescaled into
-    [max_attenuation, 1] -
+    asset's sigmoid output is rescaled into [max_attenuation, 1] -
         max_attenuation + (1 - max_attenuation) * sigmoid(logit)
     - a smooth rescaling (not a hard clamp), so there's no dead gradient
     zone. sigmoid=0 gives max_attenuation (the most this asset can ever be
@@ -104,10 +152,13 @@ class RiskLSTM(nn.Module):
         num_layers: int = 1,
         dropout: float = 0.0,
         max_attenuation: float = 0.33,
+        rolling_window: int = 10,
     ):
         super().__init__()
         if not (0.0 < max_attenuation <= 1.0):
             raise ValueError(f"max_attenuation must be in (0, 1], got {max_attenuation}")
+        if rolling_window < 2:
+            raise ValueError(f"rolling_window must be >= 2 (need >=2 points for std/skew/kurtosis), got {rolling_window}")
         # Stashed so save_model() can persist enough to reconstruct this
         # exact architecture on load, mirroring PortfolioLSTM.
         self.n_assets = n_assets
@@ -115,16 +166,18 @@ class RiskLSTM(nn.Module):
         self.num_layers = num_layers
         self.dropout_p = dropout
         self.max_attenuation = max_attenuation
+        self.rolling_window = rolling_window
+        n_moment_features = 3 * n_assets  # std, skewness, excess kurtosis per asset
         self.lstm = nn.LSTM(
-            input_size=n_assets,
+            input_size=n_moment_features,
             hidden_size=hidden_size,
             num_layers=num_layers,
             batch_first=True,
         )
         self.dropout = nn.Dropout(dropout)
         # + n_assets for the concatenated portfolio weight vector.
-        self.head = nn.Linear(hidden_size + n_assets, hidden_size//2)
-        self.head_2 = nn.Linear(hidden_size//2, n_assets)
+        self.head = nn.Linear(hidden_size + n_assets, hidden_size // 2)
+        self.head_2 = nn.Linear(hidden_size // 2, n_assets)
         # LeakyReLU (not plain ReLU) between the two Linear layers: a
         # standard ReLU zeroes both the output AND the gradient for any
         # unit with a negative pre-activation, so a unit that lands there
@@ -134,11 +187,16 @@ class RiskLSTM(nn.Module):
         self.leaky_relu = nn.LeakyReLU()
 
     def forward(self, x: torch.Tensor, portfolio_weights: torch.Tensor) -> torch.Tensor:
-        # x: (batch, lookback, n_assets); portfolio_weights: (batch, n_assets)
-        _, (h_n, _) = self.lstm(x)
+        # x: (batch, lookback, n_assets) RAW log returns; portfolio_weights:
+        # (batch, n_assets). Moments are computed here, inside forward, so
+        # every caller (training and inference alike) always passes the
+        # same raw window - there is exactly one place this transform
+        # happens, so training and inference can never drift out of sync.
+        moments = rolling_moments(x, self.rolling_window)  # (batch, T', 3*n_assets)
+        _, (h_n, _) = self.lstm(moments)
         hidden = self.dropout(h_n[-1])                             # (batch, hidden_size)
         combined = torch.cat([hidden, portfolio_weights], dim=-1)  # (batch, hidden_size + n_assets)
-        features = self.leaky_relu(self.head(combined))            # (batch, n_assets) - LeakyReLU in
+        features = self.leaky_relu(self.head(combined))            # (batch, hidden_size // 2) - LeakyReLU in
         # between the two Linear layers is what makes head_2 an actual second
         # layer rather than collapsing into one big linear transform.
         attenuation_logit = torch.sigmoid(self.head_2(features))   # (batch, n_assets), one per asset
@@ -161,6 +219,7 @@ class RiskLSTM(nn.Module):
                     "num_layers": self.num_layers,
                     "dropout": self.dropout_p,
                     "max_attenuation": self.max_attenuation,
+                    "rolling_window": self.rolling_window,
                 },
                 "state_dict": self.state_dict(),
             },
@@ -195,6 +254,11 @@ def train_risk_model(
     """Full-batch training of RiskLSTM only - `portfolio_weights_train` is a
     fixed input (already detached from PortfolioLSTM's graph by the caller),
     so gradients here only ever update the risk network's own parameters.
+
+    `X_train` is the RAW log-return window (not a pre-computed rolling
+    statistic) - risk_model.forward() computes rolling std/skewness/
+    kurtosis internally (see rolling_moments()), so training and inference
+    always apply the identical transform and can never drift out of sync.
     """
     optimizer = torch.optim.Adam(risk_model.parameters(), lr=lr, weight_decay=weight_decay)
 
@@ -222,7 +286,20 @@ def train_risk_model(
 @dataclass
 class RiskResult:
     """Everything needed to score and plot the risk-attenuated portfolio,
-    alongside the unattenuated (raw PortfolioLSTM) baseline for comparison."""
+    alongside the unattenuated (vol-targeted PortfolioLSTM) baseline and
+    the fully-raw (pre-vol-targeting) baseline for comparison.
+
+    Three levels of the pipeline, all available here:
+      1. portfolio_result.returns_train_unscaled / returns_val_unscaled -
+         PortfolioLSTM's raw output, before volatility targeting.
+      2. returns_train_raw / returns_val_raw (this class) - after
+         volatility targeting (--target-vol), before the risk overlay.
+         Sourced directly from portfolio_result.returns_train/returns_val.
+      3. returns_train_scaled / returns_val_scaled (this class) - after
+         BOTH volatility targeting AND the risk overlay's per-asset
+         attenuation. The risk overlay only ever reduces stage 2's
+         weights further; it never re-applies any volatility scaling.
+    """
 
     portfolio_result: PortfolioResult
     risk_model: RiskLSTM
@@ -230,9 +307,9 @@ class RiskResult:
     dates_val: pd.DatetimeIndex
     attenuation_train: np.ndarray        # (n_train, n_assets), each entry in [max_attenuation, 1]
     attenuation_val: np.ndarray          # (n_val, n_assets), each entry in [max_attenuation, 1]
-    returns_train_raw: np.ndarray        # portfolio returns WITHOUT attenuation
+    returns_train_raw: np.ndarray        # vol-targeted portfolio returns WITHOUT attenuation
     returns_val_raw: np.ndarray
-    returns_train_scaled: np.ndarray     # portfolio returns WITH attenuation
+    returns_train_scaled: np.ndarray     # vol-targeted portfolio returns WITH attenuation
     returns_val_scaled: np.ndarray
 
 
@@ -262,12 +339,18 @@ def add_risk_overlay(portfolio_result: PortfolioResult, args: argparse.Namespace
     for param in portfolio_model.parameters():
         param.requires_grad_(False)
 
-    with torch.no_grad():
-        weights_train = portfolio_model(portfolio_result.X_train)  # (n_train, n_assets)
-        weights_val = portfolio_model(portfolio_result.X_val)
+    # portfolio_result.weights_train/weights_val are already the FINAL,
+    # volatility-targeted weights (PortfolioLSTM's raw output rescaled to
+    # --target-vol - see scale_weights_to_target_vol in portfolio_lstm.py).
+    # Reuse them directly rather than recomputing the forward pass, so
+    # RiskLSTM always attenuates the exact same weights reported/plotted
+    # everywhere else. Per design, RiskLSTM only ever reduces these
+    # weights further - it never re-applies any volatility scaling.
+    weights_train = torch.tensor(portfolio_result.weights_train)  # (n_train, n_assets)
+    weights_val = torch.tensor(portfolio_result.weights_val)
 
     # Stage 2 - load a previously-trained risk overlay, or train a new one
-    # on top of the frozen weights.
+    # on top of the frozen, vol-targeted weights.
     if args.load_risk:
         risk_model = RiskLSTM.load_model(args.load_risk)
     else:
@@ -277,6 +360,7 @@ def add_risk_overlay(portfolio_result: PortfolioResult, args: argparse.Namespace
             hidden_size=args.risk_hidden_size,
             dropout=args.dropout,
             max_attenuation=args.max_attenuation,
+            rolling_window=args.risk_rolling_window,
         )
         train_risk_model(
             risk_model, portfolio_result.X_train, weights_train, next_returns_train,
