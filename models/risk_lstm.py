@@ -13,34 +13,45 @@ directionless - so the strategy scales down its exposure to that specific
 asset rather than betting full size on a coin flip, without necessarily
 touching the others.
 
-Pipeline (two stages, not a single joint model)
-------------------------------------------------
-1. Train PortfolioLSTM exactly as in models/portfolio_lstm.py (unchanged -
-   this reuses run_pipeline_multi_seed() from that module directly, so
-   --n-seeds/--restart-strategy apply here too).
-2. Freeze it. For every window (train and validation), take its predicted
-   weights as a FIXED input - no gradient flows back into PortfolioLSTM
-   from here on, so the risk network can only learn to scale the given
-   position, not reshape which assets it favors.
-3. RiskLSTM does NOT look at raw log returns directly. Instead, for every
-   trailing `--risk-rolling-window` days inside the lookback window, it
-   computes each asset's rolling standard deviation, skewness, and excess
-   kurtosis - the moments a risk manager actually looks at (vol = realized
-   risk, skewness = asymmetric tail risk, kurtosis = fat-tail/regime
-   instability) - and feeds THAT rolling-moment sequence through its own
-   LSTM. The final hidden state is concatenated with the frozen portfolio
-   weights, and the combined vector maps to one attenuation factor per
-   asset in [max_attenuation, 1] - see --max-attenuation (default 0.33): a
-   hard floor on exposure per asset that holds regardless of how
-   unconfident the network gets, so it can de-risk an asset without ever
-   fully zeroing it out.
-4. It is trained on its own (a separate optimizer, only its own
-   parameters) to maximize the Sharpe ratio of the ATTENUATED portfolio:
-       final_weights = portfolio_weights * attenuation   (elementwise, per asset)
-       portfolio_return = dot(final_weights, next_returns)
-   Exactly like models/portfolio_lstm.py, this is full-batch training on
-   the whole train-period return path - Sharpe is a property of the
-   return distribution, not of individual samples.
+Pipeline: JOINT training (the common case), or a frozen fallback for
+loaded portfolios
+------------------------------------------------------------------------
+The common case - training a fresh PortfolioLSTM with a risk overlay
+(--risk-overlay, without --load-portfolio) - trains PortfolioLSTM and
+RiskLSTM TOGETHER, end-to-end, on one shared objective:
+1. PortfolioLSTM proposes raw weights; models/portfolio_lstm.py's
+   scale_weights_to_target_vol rescales them to --target-vol.
+2. RiskLSTM reads the SAME log-return window, plus those (vol-targeted)
+   weights, and outputs a per-asset attenuation factor. Rather than raw
+   returns, RiskLSTM's own LSTM actually reads each asset's rolling
+   standard deviation, skewness, and excess kurtosis over trailing
+   `--risk-rolling-window` days (see rolling_moments()) - the moments a
+   risk manager actually looks at (vol = realized risk, skewness =
+   asymmetric tail risk, kurtosis = fat-tail/regime instability) - mapped
+   to one attenuation factor per asset in [max_attenuation, 1] (a hard
+   floor - see --max-attenuation, default 0.33 - so an asset is de-risked,
+   never fully zeroed out).
+3. final_weights = vol_targeted_weights * attenuation (elementwise);
+   portfolio_return = dot(final_weights, next_returns).
+4. ONE optimizer updates BOTH networks' parameters from the gradient of
+   the SAME (negated) Sharpe ratio of that final return series - not two
+   separate optimizers/training loops with PortfolioLSTM frozen partway
+   through. This lets RiskLSTM's attenuation shape what PortfolioLSTM
+   learns to propose in the first place (e.g. favoring positions that are
+   easier to de-risk cleanly), and lets PortfolioLSTM's weights adapt
+   knowing they will be attenuated downstream. --n-seeds/--restart-strategy
+   restarts reseed and retrain BOTH networks together per restart (see
+   run_pipeline_multi_seed() below).
+
+Exactly like models/portfolio_lstm.py, this is full-batch training on the
+whole train-period return path - Sharpe is a property of the return
+distribution, not of individual samples.
+
+Fallback: if --load-portfolio is given, that PortfolioLSTM is fixed (it
+was explicitly loaded for inference, per its own documented contract) -
+joint training doesn't apply, so RiskLSTM is instead trained alone on top
+of it, frozen (see add_risk_overlay()/train_risk_model() below) - this is
+the same two-stage behavior as before.
 
 Usage
 -----
@@ -62,9 +73,15 @@ import torch
 from torch import nn
 
 from models.portfolio_lstm import (
+    EnsemblePortfolioLSTM,
+    PortfolioLSTM,
     PortfolioResult,
+    _PreparedData,
+    _prepare_data,
     build_arg_parser as build_portfolio_arg_parser,
-    run_pipeline_multi_seed as run_portfolio_pipeline,
+    evaluate_portfolio_model,
+    load_pipeline as load_portfolio_pipeline,
+    scale_weights_to_target_vol,
     sharpe_ratio,
 )
 
@@ -237,6 +254,76 @@ class RiskLSTM(nn.Module):
         return model
 
 
+class EnsembleRiskLSTM(nn.Module):
+    """Wraps several independently (jointly-)trained RiskLSTMs and averages
+    their predicted per-asset attenuation - mirrors EnsemblePortfolioLSTM's
+    role on the portfolio side, for the same reason: averaging tends to
+    cancel out each individual restart's idiosyncratic overfitting to its
+    own attenuation local optimum.
+
+    Unlike EnsemblePortfolioLSTM's weight-averaging, no renormalization is
+    needed here: every member's attenuation already lives in
+    [max_attenuation, 1], and a plain average of several values in that
+    range stays in that same range.
+    """
+
+    def __init__(self, models: list[RiskLSTM]):
+        super().__init__()
+        self.models = nn.ModuleList(models)
+
+    def forward(self, x: torch.Tensor, portfolio_weights: torch.Tensor) -> torch.Tensor:
+        attenuations = torch.stack([m(x, portfolio_weights) for m in self.models], dim=0)
+        return attenuations.mean(dim=0)
+
+    def save_model(self, path: str = "models/risk_lstm_ensemble.pt") -> None:
+        """Persist every member's config + weights so the ensemble can be reloaded without retraining."""
+        torch.save(
+            {
+                "members": [
+                    {
+                        "config": {
+                            "n_assets": m.n_assets,
+                            "hidden_size": m.hidden_size,
+                            "num_layers": m.num_layers,
+                            "dropout": m.dropout_p,
+                            "max_attenuation": m.max_attenuation,
+                            "rolling_window": m.rolling_window,
+                        },
+                        "state_dict": m.state_dict(),
+                    }
+                    for m in self.models
+                ],
+            },
+            path,
+        )
+        logger.info("Saved ensemble risk weights (%d members) to %s", len(self.models), path)
+
+    @classmethod
+    def load_model(cls, path: str) -> "EnsembleRiskLSTM":
+        """Reconstruct every member from a checkpoint saved by save_model()."""
+        checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+        members = []
+        for member_checkpoint in checkpoint["members"]:
+            member = RiskLSTM(**member_checkpoint["config"])
+            member.load_state_dict(member_checkpoint["state_dict"])
+            member.eval()
+            members.append(member)
+        ensemble = cls(members)
+        ensemble.eval()
+        return ensemble
+
+
+def load_risk_model(path: str) -> nn.Module:
+    """Load a RiskLSTM or EnsembleRiskLSTM checkpoint, auto-detecting which
+    kind it is from the file's structure - mirrors
+    models/portfolio_lstm.py's load_portfolio_model.
+    """
+    checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+    if "members" in checkpoint:
+        return EnsembleRiskLSTM.load_model(path)
+    return RiskLSTM.load_model(path)
+
+
 # --------------------------------------------------------------------------
 # Training
 # --------------------------------------------------------------------------
@@ -279,6 +366,63 @@ def train_risk_model(
             )
 
 
+def train_joint_model(
+    portfolio_model: nn.Module,
+    risk_model: nn.Module,
+    X_train: torch.Tensor,
+    X_train_raw: torch.Tensor,
+    next_returns_train: torch.Tensor,
+    target_vol: float,
+    epochs: int,
+    lr: float,
+    weight_decay: float = 0.0,
+    noise_std: float = 0.0,
+    freeze_risk: bool = False,
+) -> None:
+    """Train PortfolioLSTM and RiskLSTM TOGETHER, end-to-end, on one shared
+    objective: the Sharpe ratio of the FINAL portfolio returns after both
+    volatility targeting and risk attenuation. ONE optimizer updates both
+    networks' parameters from the same gradient signal every epoch -
+    unlike train_risk_model() above, which trains RiskLSTM alone on top of
+    an already-frozen PortfolioLSTM.
+
+    This lets RiskLSTM's attenuation shape what PortfolioLSTM learns to
+    propose in the first place (e.g. favoring positions that are easier to
+    de-risk cleanly without wrecking Sharpe), and lets PortfolioLSTM's
+    weights adapt to the fact that they'll be attenuated downstream -
+    neither network trains "blind" to the other's existence.
+
+    `freeze_risk=True` excludes risk_model's parameters from the optimizer
+    (used when a --load-risk checkpoint is supplied: risk_model is fixed,
+    but PortfolioLSTM still trains "aware" of it, since gradients still
+    flow through risk_model's forward pass into the shared weights it
+    consumes as input - only its own parameters don't move).
+    """
+    params = list(portfolio_model.parameters())
+    if not freeze_risk:
+        params += list(risk_model.parameters())
+    optimizer = torch.optim.Adam(params, lr=lr, weight_decay=weight_decay)
+
+    portfolio_model.train()
+    risk_model.train(mode=not freeze_risk)  # eval() (no dropout) if frozen, train() otherwise
+    for epoch in range(1, epochs + 1):
+        optimizer.zero_grad()
+        noisy_X_train = X_train + torch.randn_like(X_train) * noise_std if noise_std > 0 else X_train
+        raw_weights = portfolio_model(noisy_X_train)
+        weights = scale_weights_to_target_vol(raw_weights, X_train_raw, target_vol)
+        attenuation = risk_model(noisy_X_train, weights)                       # (n_train, n_assets)
+        scaled_weights = weights * attenuation                                # elementwise, per asset
+        portfolio_returns = (scaled_weights * next_returns_train).sum(dim=-1)  # (n_train,)
+        loss = -sharpe_ratio(portfolio_returns)
+        loss.backward()
+        optimizer.step()
+        if epoch == 1 or epoch % max(epochs // 10, 1) == 0:
+            logger.info(
+                "epoch %d/%d - train Sharpe (joint, attenuated) %.4f | mean attenuation %.3f",
+                epoch, epochs, -loss.item(), attenuation.mean().item(),
+            )
+
+
 # --------------------------------------------------------------------------
 # End-to-end pipeline
 # --------------------------------------------------------------------------
@@ -302,7 +446,7 @@ class RiskResult:
     """
 
     portfolio_result: PortfolioResult
-    risk_model: RiskLSTM
+    risk_model: nn.Module  # RiskLSTM or EnsembleRiskLSTM
     dates_train: pd.DatetimeIndex
     dates_val: pd.DatetimeIndex
     attenuation_train: np.ndarray        # (n_train, n_assets), each entry in [max_attenuation, 1]
@@ -321,52 +465,16 @@ def build_arg_parser(description: str) -> argparse.ArgumentParser:
     return build_portfolio_arg_parser(description)
 
 
-def add_risk_overlay(portfolio_result: PortfolioResult, args: argparse.Namespace) -> RiskResult:
-    """Stage 2 only: given an already-trained PortfolioResult (from
-    models/portfolio_lstm.py's run_pipeline), freeze it and train a
-    RiskLSTM on top to attenuate its weights.
-
-    Split out from run_pipeline() below so models/portfolio_lstm.py can
-    call this directly on a PortfolioResult it already has, via its
-    `--risk-overlay` flag, without training PortfolioLSTM a second time.
-    `args` needs `--risk-hidden-size`/`--risk-epochs`/`--risk-lr` plus the
-    `--dropout`/`--weight-decay`/`--noise-std` also used for PortfolioLSTM.
+def _build_risk_result(portfolio_result: PortfolioResult, risk_model: nn.Module) -> RiskResult:
+    """Given a PortfolioResult and an already-trained-or-loaded RiskLSTM/
+    EnsembleRiskLSTM, compute attenuation and the final (vol-targeted AND
+    attenuated) returns, and package a RiskResult. Shared by both the
+    joint-training path and the frozen-portfolio fallback path below -
+    the only difference between them is HOW risk_model got trained, not
+    how its output turns into a RiskResult.
     """
-    # Freeze PortfolioLSTM: no more training, and no gradients flow back
-    # into it through the weights RiskLSTM consumes as input.
-    portfolio_model = portfolio_result.model
-    portfolio_model.eval()
-    for param in portfolio_model.parameters():
-        param.requires_grad_(False)
-
-    # portfolio_result.weights_train/weights_val are already the FINAL,
-    # volatility-targeted weights (PortfolioLSTM's raw output rescaled to
-    # --target-vol - see scale_weights_to_target_vol in portfolio_lstm.py).
-    # Reuse them directly rather than recomputing the forward pass, so
-    # RiskLSTM always attenuates the exact same weights reported/plotted
-    # everywhere else. Per design, RiskLSTM only ever reduces these
-    # weights further - it never re-applies any volatility scaling.
-    weights_train = torch.tensor(portfolio_result.weights_train)  # (n_train, n_assets)
+    weights_train = torch.tensor(portfolio_result.weights_train)  # (n_train, n_assets), already vol-targeted
     weights_val = torch.tensor(portfolio_result.weights_val)
-
-    # Stage 2 - load a previously-trained risk overlay, or train a new one
-    # on top of the frozen, vol-targeted weights.
-    if args.load_risk:
-        risk_model = RiskLSTM.load_model(args.load_risk)
-    else:
-        next_returns_train = torch.tensor(portfolio_result.next_returns_train)
-        risk_model = RiskLSTM(
-            n_assets=len(portfolio_result.pairs),
-            hidden_size=args.risk_hidden_size,
-            dropout=args.dropout,
-            max_attenuation=args.max_attenuation,
-            rolling_window=args.risk_rolling_window,
-        )
-        train_risk_model(
-            risk_model, portfolio_result.X_train, weights_train, next_returns_train,
-            epochs=args.risk_epochs, lr=args.risk_lr,
-            weight_decay=args.weight_decay, noise_std=args.noise_std,
-        )
 
     risk_model.eval()
     with torch.no_grad():
@@ -393,35 +501,177 @@ def add_risk_overlay(portfolio_result: PortfolioResult, args: argparse.Namespace
     )
 
 
-def run_pipeline(args: argparse.Namespace) -> RiskResult:
-    """Stage 1: train PortfolioLSTM (unchanged, via models/portfolio_lstm.py).
-    Stage 2: add_risk_overlay() freezes it and trains RiskLSTM on top.
+def add_risk_overlay(portfolio_result: PortfolioResult, args: argparse.Namespace) -> RiskResult:
+    """Fallback path: given an ALREADY-TRAINED-OR-LOADED, FROZEN
+    PortfolioResult (used when --load-portfolio was given, so joint
+    training doesn't apply - there's nothing left to jointly train on the
+    portfolio side), train a RiskLSTM alone on top of it, or load one via
+    --load-risk.
+
+    For the common case (a FRESH PortfolioLSTM with --risk-overlay, no
+    --load-portfolio), see run_pipeline_multi_seed() below instead - that
+    path trains PortfolioLSTM and RiskLSTM TOGETHER rather than freezing
+    the portfolio first.
     """
-    portfolio_result = run_portfolio_pipeline(args)  # identical to `python -m models.portfolio_lstm`
-    return add_risk_overlay(portfolio_result, args)
+    portfolio_model = portfolio_result.model
+    portfolio_model.eval()
+    for param in portfolio_model.parameters():
+        param.requires_grad_(False)
+
+    # portfolio_result.weights_train/weights_val are already the FINAL,
+    # volatility-targeted weights (PortfolioLSTM's raw output rescaled to
+    # --target-vol - see scale_weights_to_target_vol in portfolio_lstm.py).
+    weights_train = torch.tensor(portfolio_result.weights_train)  # (n_train, n_assets)
+
+    if args.load_risk:
+        risk_model = load_risk_model(args.load_risk)
+    else:
+        next_returns_train = torch.tensor(portfolio_result.next_returns_train)
+        risk_model = RiskLSTM(
+            n_assets=len(portfolio_result.pairs),
+            hidden_size=args.risk_hidden_size,
+            dropout=args.dropout,
+            max_attenuation=args.max_attenuation,
+            rolling_window=args.risk_rolling_window,
+        )
+        train_risk_model(
+            risk_model, portfolio_result.X_train, weights_train, next_returns_train,
+            epochs=args.risk_epochs, lr=args.risk_lr,
+            weight_decay=args.weight_decay, noise_std=args.noise_std,
+        )
+
+    return _build_risk_result(portfolio_result, risk_model)
 
 
-def main() -> None:
-    parser = build_arg_parser("Train a risk-attenuation LSTM on top of the PortfolioLSTM allocator.")
-    args = parser.parse_args()
-    result = run_pipeline(args)
+def _train_and_evaluate_joint(data: _PreparedData, args: argparse.Namespace) -> RiskResult:
+    """Construct one PortfolioLSTM and one RiskLSTM (whatever random seed
+    is currently set - seeding it once before calling this affects BOTH
+    networks' initialization, since they're constructed back to back),
+    train them TOGETHER via train_joint_model(), and evaluate the pair on
+    both splits.
+    """
+    portfolio_model = PortfolioLSTM(
+        n_assets=len(data.pairs),
+        hidden_size=args.hidden_size,
+        weight_scheme=args.weight_scheme,
+        dropout=args.dropout,
+    )
+
+    freeze_risk = bool(args.load_risk)
+    if freeze_risk:
+        risk_model = load_risk_model(args.load_risk)
+    else:
+        risk_model = RiskLSTM(
+            n_assets=len(data.pairs),
+            hidden_size=args.risk_hidden_size,
+            dropout=args.dropout,
+            max_attenuation=args.max_attenuation,
+            rolling_window=args.risk_rolling_window,
+        )
+
+    train_joint_model(
+        portfolio_model, risk_model, data.X_train, data.X_train_raw,
+        torch.tensor(data.next_returns_train_raw),
+        target_vol=args.target_vol,
+        epochs=args.epochs, lr=args.lr,
+        weight_decay=args.weight_decay, noise_std=args.noise_std,
+        freeze_risk=freeze_risk,
+    )
+
+    portfolio_result = evaluate_portfolio_model(portfolio_model, data, args.weight_scheme, args.target_vol)
+    return _build_risk_result(portfolio_result, risk_model)
+
+
+def run_pipeline_multi_seed(args: argparse.Namespace) -> RiskResult:
+    """Train (or load) PortfolioLSTM and RiskLSTM for the --risk-overlay
+    pipeline, honoring --n-seeds/--restart-strategy for BOTH networks
+    together when both are trained fresh:
+
+      - --load-portfolio given: the portfolio is fixed - joint training
+        doesn't apply - fall back to add_risk_overlay() (RiskLSTM trained,
+        or loaded via --load-risk, alone on top of the frozen portfolio).
+        --n-seeds doesn't apply either in this case (nothing to restart on
+        the portfolio side), matching models/portfolio_lstm.py's own
+        run_pipeline_multi_seed().
+      - Otherwise (the common case): train --n-seeds independent
+        (PortfolioLSTM, RiskLSTM) pairs TOGETHER (see train_joint_model),
+        each restart reseeding and retraining BOTH networks, and combine
+        the restarts via --restart-strategy (on the ATTENUATED validation
+        Sharpe, since that is the actual end-to-end objective now).
+    """
+    if args.load_portfolio:
+        portfolio_result = load_portfolio_pipeline(args)
+        return add_risk_overlay(portfolio_result, args)
+
+    if args.n_seeds < 1:
+        raise ValueError(f"--n-seeds must be >= 1, got {args.n_seeds}")
+
+    data = _prepare_data(args)  # load/split/standardize once, reused by every seed
+
+    results = []
+    for seed in range(args.n_seeds):
+        torch.manual_seed(seed)  # seeds BOTH PortfolioLSTM and RiskLSTM's initialization
+        logger.info("--- joint restart %d/%d (seed=%d) ---", seed + 1, args.n_seeds, seed)
+        results.append(_train_and_evaluate_joint(data, args))
+
+    if len(results) == 1:
+        return results[0]
+
+    if args.restart_strategy == "best":
+        best_idx, best = max(
+            enumerate(results), key=lambda item: float(sharpe_ratio(torch.tensor(item[1].returns_val_scaled)))
+        )
+        logger.info(
+            "Best of %d joint restarts: #%d (validation attenuated Sharpe %.3f)",
+            len(results), best_idx, float(sharpe_ratio(torch.tensor(best.returns_val_scaled))),
+        )
+        return best
+
+    # "ensemble": average both networks' outputs across restarts.
+    ensemble_portfolio = EnsemblePortfolioLSTM([r.portfolio_result.model for r in results])
+    ensemble_risk = EnsembleRiskLSTM([r.risk_model for r in results])
+    portfolio_result = evaluate_portfolio_model(ensemble_portfolio, data, args.weight_scheme, args.target_vol)
+    ensemble_result = _build_risk_result(portfolio_result, ensemble_risk)
+    logger.info(
+        "Ensemble of %d joint restarts: validation attenuated Sharpe %.3f",
+        len(results), float(sharpe_ratio(torch.tensor(ensemble_result.returns_val_scaled))),
+    )
+    return ensemble_result
+
+
+def main(args: argparse.Namespace | None = None) -> None:
+    """CLI entry point. Accepts an optional pre-parsed `args` so
+    models/portfolio_lstm.py's own main() can delegate here directly
+    (when --risk-overlay is set) without re-parsing argv a second time.
+    """
+    if args is None:
+        parser = build_arg_parser("Train PortfolioLSTM and RiskLSTM together (or a risk overlay on a loaded portfolio).")
+        args = parser.parse_args()
+
+    result = run_pipeline_multi_seed(args)
     if not args.load_portfolio:
-        result.portfolio_result.model.save_model(x_mean=result.portfolio_result.x_mean, x_std=result.portfolio_result.x_std)
+        result.portfolio_result.model.save_model(
+            x_mean=result.portfolio_result.x_mean, x_std=result.portfolio_result.x_std,
+        )
     if not args.load_risk:
         result.risk_model.save_model()
 
+    unscaled_train_sharpe = float(sharpe_ratio(torch.tensor(result.portfolio_result.returns_train_unscaled)))
+    unscaled_val_sharpe = float(sharpe_ratio(torch.tensor(result.portfolio_result.returns_val_unscaled)))
     raw_train_sharpe = float(sharpe_ratio(torch.tensor(result.returns_train_raw)))
     scaled_train_sharpe = float(sharpe_ratio(torch.tensor(result.returns_train_scaled)))
     raw_val_sharpe = float(sharpe_ratio(torch.tensor(result.returns_val_raw)))
     scaled_val_sharpe = float(sharpe_ratio(torch.tensor(result.returns_val_scaled)))
 
     logger.info(
-        "In-sample  (train): raw Sharpe %.3f -> attenuated Sharpe %.3f | mean attenuation %.3f",
-        raw_train_sharpe, scaled_train_sharpe, result.attenuation_train.mean(),
+        "In-sample  (train): raw Sharpe %.3f -> vol-targeted Sharpe %.3f -> attenuated Sharpe %.3f "
+        "| mean attenuation %.3f",
+        unscaled_train_sharpe, raw_train_sharpe, scaled_train_sharpe, result.attenuation_train.mean(),
     )
     logger.info(
-        "Out-of-sample (val): raw Sharpe %.3f -> attenuated Sharpe %.3f | mean attenuation %.3f",
-        raw_val_sharpe, scaled_val_sharpe, result.attenuation_val.mean(),
+        "Out-of-sample (val): raw Sharpe %.3f -> vol-targeted Sharpe %.3f -> attenuated Sharpe %.3f "
+        "| mean attenuation %.3f",
+        unscaled_val_sharpe, raw_val_sharpe, scaled_val_sharpe, result.attenuation_val.mean(),
     )
 
 

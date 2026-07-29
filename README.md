@@ -240,22 +240,29 @@ close to 1 for an asset in a normal, tradeable period, down towards
 directionless - so the strategy can de-risk one pair without necessarily
 touching the others, and never zeroes any asset out entirely.
 
-This is a two-stage pipeline, not one joint model:
+PortfolioLSTM and RiskLSTM are trained **TOGETHER**, end-to-end, on one
+shared objective (not frozen/sequential):
 
-1. Train PortfolioLSTM exactly as in step 7 (reuses that same code,
-   volatility targeting included) and freeze it.
-2. Use its predicted (already vol-targeted) weights as a fixed input - no
-   gradients flow back into PortfolioLSTM from this stage.
-3. RiskLSTM does NOT read raw log returns. For every trailing
+1. PortfolioLSTM proposes raw weights; volatility targeting (step 7)
+   rescales them to `--target-vol`.
+2. RiskLSTM does NOT read raw log returns. For every trailing
    `--risk-rolling-window` days inside the lookback window, it computes
    each asset's rolling **standard deviation, skewness, and excess
    kurtosis** - the moments a risk manager actually looks at (vol =
    realized risk, skewness = asymmetric tail risk, kurtosis = fat-tail /
-   regime instability) - and feeds that rolling-moment sequence through
-   its own LSTM. Its final hidden state is concatenated with the frozen
-   weights, and trained on its own to maximize the Sharpe ratio of the
-   *attenuated* portfolio (`weights * attenuation`, elementwise per asset,
-   no further volatility rescaling).
+   regime instability) - feeds that rolling-moment sequence through its
+   own LSTM, concatenates the final hidden state with the (vol-targeted)
+   weights, and maps to one attenuation factor per asset.
+3. `final_weights = vol_targeted_weights * attenuation` (elementwise);
+   `portfolio_return = dot(final_weights, next_returns)`.
+4. **ONE optimizer updates both networks' parameters** from the gradient
+   of the same (negated) Sharpe ratio of that final return series - so
+   RiskLSTM's attenuation can shape what PortfolioLSTM learns to propose
+   (e.g. favoring positions that are easier to de-risk cleanly), and
+   PortfolioLSTM's weights adapt knowing they'll be attenuated downstream.
+   `--n-seeds`/`--restart-strategy` (step 7) reseed and retrain **both**
+   networks together per restart - a restart's seed affects RiskLSTM's
+   initialization too, not just PortfolioLSTM's.
 
 ```bash
 python -m models.risk_lstm \
@@ -265,9 +272,15 @@ python -m models.risk_lstm \
 ```
 
 (Equivalent to step 7's `python -m models.portfolio_lstm ... --risk-overlay`
-- both call the same `add_risk_overlay()`. Use whichever entry point is
-more convenient; this one exists mainly so `models/risk_postprocess.py`
-below has a plain function to call.)
+- both delegate to the same `run_pipeline_multi_seed()`. Use whichever
+entry point is more convenient; this one exists mainly so
+`models/risk_postprocess.py` below has a plain function to call.)
+
+**Exception**: if `--load-portfolio` is given, that PortfolioLSTM is fixed
+(loaded explicitly for inference), so joint training doesn't apply -
+`--n-seeds` is ignored and RiskLSTM is instead trained alone on top of the
+frozen portfolio (or loaded too, via `--load-risk`) - the old two-stage
+behavior, kept specifically for this case.
 
 Accepts every `models/portfolio_lstm.py` argument (for stage 1) plus:
 
@@ -342,11 +355,13 @@ just how much risk each one happened to run.
 
 Every script above saves its model(s) after training (`models/portfolio_lstm.pt`,
 or `models/portfolio_lstm_ensemble.pt` when `--restart-strategy ensemble` was
-used, plus `models/risk_lstm.pt` with `--risk-overlay`). Each checkpoint is
-self-contained: architecture config, weights, and (for the portfolio model)
-the exact input standardization stats (`x_mean`/`x_std`) it was trained
-with - so `--load-portfolio`/`--load-risk` reload it without needing to
-know which flags originally trained it.
+used, plus `models/risk_lstm.pt` with `--risk-overlay` - or
+`models/risk_lstm_ensemble.pt` if the joint training's `--restart-strategy
+ensemble` was used, since a restart's seed reseeds and retrains RiskLSTM
+too now). Each checkpoint is self-contained: architecture config, weights,
+and (for the portfolio model) the exact input standardization stats
+(`x_mean`/`x_std`) it was trained with - so `--load-portfolio`/`--load-risk`
+reload it without needing to know which flags originally trained it.
 
 `--load-portfolio <path>` skips PortfolioLSTM training entirely (all of
 `--n-seeds`/`--restart-strategy`/`--epochs`/etc. are ignored) and just

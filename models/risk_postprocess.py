@@ -3,8 +3,10 @@ cumulative PnL and print the Sharpe ratio of both, for the in-sample
 (train) and out-of-sample (validation) periods.
 
 Kept in its own file, mirroring models/portfolio_postprocess.py. Reuses
-`run_pipeline()` from risk_lstm.py, so the plot and metrics always reflect
-the exact same trained PortfolioLSTM + RiskLSTM pair.
+`run_pipeline_multi_seed()` from risk_lstm.py (which now trains
+PortfolioLSTM and RiskLSTM TOGETHER, end-to-end - see that module's
+docstring), so the plot and metrics always reflect the exact same trained
+pair.
 
 Usage
 -----
@@ -25,7 +27,7 @@ import numpy as np
 import torch
 
 from models.portfolio_lstm import sharpe_ratio
-from models.risk_lstm import RiskResult, build_arg_parser, run_pipeline
+from models.risk_lstm import RiskResult, build_arg_parser, run_pipeline_multi_seed
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -245,7 +247,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    result = run_pipeline(args)
+    result = run_pipeline_multi_seed(args)
 
     print_sharpe_ratios(result)
     plot_pnl(result, args.output)

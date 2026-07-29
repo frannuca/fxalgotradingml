@@ -629,7 +629,7 @@ def _prepare_data(
     )
 
 
-def _evaluate(model: nn.Module, data: _PreparedData, weight_scheme: str, target_vol: float) -> PortfolioResult:
+def evaluate_portfolio_model(model: nn.Module, data: _PreparedData, weight_scheme: str, target_vol: float) -> PortfolioResult:
     """Run an already-trained-or-loaded model (eval mode, no grad) over both
     splits, rescale its raw weights to `target_vol` (see
     scale_weights_to_target_vol), and package the result - keeping both the
@@ -694,7 +694,7 @@ def _train_and_evaluate(data: _PreparedData, args: argparse.Namespace) -> Portfo
         epochs=args.epochs, lr=args.lr,
         weight_decay=args.weight_decay, noise_std=args.noise_std,
     )
-    return _evaluate(model, data, args.weight_scheme, args.target_vol)
+    return evaluate_portfolio_model(model, data, args.weight_scheme, args.target_vol)
 
 
 def load_pipeline(args: argparse.Namespace) -> PortfolioResult:
@@ -706,7 +706,7 @@ def load_pipeline(args: argparse.Namespace) -> PortfolioResult:
     """
     model = load_portfolio_model(args.load_portfolio)
     data = _prepare_data(args, x_mean=model.x_mean, x_std=model.x_std)
-    return _evaluate(model, data, args.weight_scheme, args.target_vol)
+    return evaluate_portfolio_model(model, data, args.weight_scheme, args.target_vol)
 
 
 def run_pipeline(args: argparse.Namespace) -> PortfolioResult:
@@ -764,7 +764,7 @@ def run_pipeline_multi_seed(args: argparse.Namespace) -> PortfolioResult:
 
     # "ensemble": average every restart's predicted weights.
     ensemble_model = EnsemblePortfolioLSTM([r.model for r in results])
-    ensemble_result = _evaluate(ensemble_model, data, args.weight_scheme, args.target_vol)
+    ensemble_result = evaluate_portfolio_model(ensemble_model, data, args.weight_scheme, args.target_vol)
     logger.info(
         "Ensemble of %d restarts: validation Sharpe %.3f",
         len(results), float(sharpe_ratio(torch.tensor(ensemble_result.returns_val))),
@@ -775,6 +775,21 @@ def run_pipeline_multi_seed(args: argparse.Namespace) -> PortfolioResult:
 def main() -> None:
     parser = build_arg_parser("Train an LSTM portfolio allocator that maximizes Sharpe ratio.")
     args = parser.parse_args()
+
+    if args.risk_overlay:
+        # --risk-overlay trains PortfolioLSTM and RiskLSTM TOGETHER (joint
+        # training - see models/risk_lstm.py's train_joint_model), so this
+        # delegates the ENTIRE pipeline (data, training, --n-seeds restarts)
+        # to risk_lstm.py rather than training a portfolio-only model here
+        # first - there is no separate "train portfolio alone, then attach
+        # risk" step to run in that case. Deferred import: risk_lstm.py
+        # imports from this module at load time, so importing it back at
+        # module level here would be a circular import.
+        from models.risk_lstm import main as risk_main
+
+        risk_main(args)
+        return
+
     result = run_pipeline_multi_seed(args)
     if not args.load_portfolio:
         result.model.save_model(x_mean=result.x_mean, x_std=result.x_std)
@@ -791,31 +806,6 @@ def main() -> None:
         "Out-of-sample (val): raw Sharpe %.3f -> vol-targeted (%.0f%%) Sharpe %.3f | cumulative PnL %.4f",
         unscaled_val_sharpe, result.target_vol * 100, val_sharpe, float(result.returns_val.sum()),
     )
-
-    if args.risk_overlay:
-        # Deferred import: models/risk_lstm.py imports build_arg_parser and
-        # run_pipeline from this module at load time, so importing it back
-        # at module level here would be a circular import. Importing inside
-        # main() instead defers it until both modules are already loaded.
-        from models.risk_lstm import add_risk_overlay
-
-        risk_result = add_risk_overlay(result, args)
-        if not args.load_risk:
-            risk_result.risk_model.save_model()
-
-        raw_train_sharpe = float(sharpe_ratio(torch.tensor(risk_result.returns_train_raw)))
-        scaled_train_sharpe = float(sharpe_ratio(torch.tensor(risk_result.returns_train_scaled)))
-        raw_val_sharpe = float(sharpe_ratio(torch.tensor(risk_result.returns_val_raw)))
-        scaled_val_sharpe = float(sharpe_ratio(torch.tensor(risk_result.returns_val_scaled)))
-
-        logger.info(
-            "In-sample  (train) risk overlay: raw Sharpe %.3f -> attenuated Sharpe %.3f | mean attenuation %.3f",
-            raw_train_sharpe, scaled_train_sharpe, risk_result.attenuation_train.mean(),
-        )
-        logger.info(
-            "Out-of-sample (val) risk overlay: raw Sharpe %.3f -> attenuated Sharpe %.3f | mean attenuation %.3f",
-            raw_val_sharpe, scaled_val_sharpe, risk_result.attenuation_val.mean(),
-        )
 
 
 if __name__ == "__main__":

@@ -105,35 +105,42 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    result = run_pipeline_multi_seed(args)
-    if  args.save_portfolio:
-        result.model.save_model(x_mean=result.x_mean, x_std=result.x_std)
+    if args.risk_overlay:
+        # --risk-overlay trains PortfolioLSTM and RiskLSTM TOGETHER (joint
+        # training - see models/risk_lstm.py), so this delegates the ENTIRE
+        # pipeline to risk_lstm.py's run_pipeline_multi_seed rather than
+        # training a portfolio-only model here first and attaching a risk
+        # overlay after the fact - there is no separate portfolio-only
+        # training step to run in that case. Deferred import: risk_lstm.py
+        # imports from this module at load time, so importing it back at
+        # module level here would be a circular import.
+        from models.risk_lstm import run_pipeline_multi_seed as run_joint_pipeline
+        from models.risk_postprocess import (
+            plot_pnl as plot_risk_pnl,
+            plot_position_and_scaling,
+            plot_vol_matched_pnl,
+            print_sharpe_ratios as print_risk_sharpe_ratios,
+        )
 
-    if not args.risk_overlay:
-        print_sharpe_ratios(result)
-        plot_pnl(result, args.output)
+        risk_result = run_joint_pipeline(args)
+        if not args.load_portfolio:
+            risk_result.portfolio_result.model.save_model(
+                x_mean=risk_result.portfolio_result.x_mean, x_std=risk_result.portfolio_result.x_std,
+            )
+        if not args.load_risk:
+            risk_result.risk_model.save_model()
+        print_risk_sharpe_ratios(risk_result)
+        plot_risk_pnl(risk_result, args.output)
+        plot_position_and_scaling(risk_result, args.position_output)
+        plot_vol_matched_pnl(risk_result, args.vol_matched_output, target_vol=args.target_vol)
         return
 
-    # --risk-overlay: hand off to the exact same functions
-    # models/risk_postprocess.py uses, so both entry points produce
-    # identical output - a single raw-vs-attenuated PnL plot (not the
-    # plain one above, which --output would otherwise collide with) plus
-    # the position-vs-scaling plot, for both splits.
-    from models.risk_lstm import add_risk_overlay
-    from models.risk_postprocess import (
-        plot_pnl as plot_risk_pnl,
-        plot_position_and_scaling,
-        plot_vol_matched_pnl,
-        print_sharpe_ratios as print_risk_sharpe_ratios,
-    )
+    result = run_pipeline_multi_seed(args)
+    if args.save_portfolio:
+        result.model.save_model(x_mean=result.x_mean, x_std=result.x_std)
 
-    risk_result = add_risk_overlay(result, args)
-    if not args.load_risk:
-        risk_result.risk_model.save_model()
-    print_risk_sharpe_ratios(risk_result)
-    plot_risk_pnl(risk_result, args.output)
-    plot_position_and_scaling(risk_result, args.position_output)
-    plot_vol_matched_pnl(risk_result, args.vol_matched_output, target_vol=args.target_vol)
+    print_sharpe_ratios(result)
+    plot_pnl(result, args.output)
 
 
 if __name__ == "__main__":
