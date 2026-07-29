@@ -74,10 +74,12 @@ from torch import nn
 
 from models.portfolio_lstm import (
     EnsemblePortfolioLSTM,
+    NoisyLinear,
     PortfolioLSTM,
     PortfolioResult,
     _PreparedData,
     _prepare_data,
+    apply_transaction_costs_torch,
     evaluate_portfolio_model,
     load_pipeline as load_portfolio_pipeline,
     scale_weights_to_target_vol,
@@ -169,6 +171,7 @@ class RiskLSTM(nn.Module):
         dropout: float = 0.0,
         max_attenuation: float = 0.33,
         rolling_window: int = 10,
+        noisy_head: bool = False,
     ):
         super().__init__()
         if not (0.0 < max_attenuation <= 1.0):
@@ -183,6 +186,7 @@ class RiskLSTM(nn.Module):
         self.dropout_p = dropout
         self.max_attenuation = max_attenuation
         self.rolling_window = rolling_window
+        self.noisy_head = noisy_head
         n_moment_features = 3 * n_assets  # std, skewness, excess kurtosis per asset
         self.lstm = nn.LSTM(
             input_size=n_moment_features,
@@ -193,7 +197,7 @@ class RiskLSTM(nn.Module):
         self.dropout = nn.Dropout(dropout)
         # + n_assets for the concatenated portfolio weight vector.
         self.head = nn.Linear(hidden_size + n_assets, hidden_size // 2)
-        self.head_2 = nn.Linear(hidden_size // 2, n_assets)
+        self.head_2 = NoisyLinear(hidden_size // 2, n_assets) if noisy_head else nn.Linear(hidden_size // 2, n_assets)
         # LeakyReLU (not plain ReLU) between the two Linear layers: a
         # standard ReLU zeroes both the output AND the gradient for any
         # unit with a negative pre-activation, so a unit that lands there
@@ -221,12 +225,16 @@ class RiskLSTM(nn.Module):
         # this), sigmoid=1 -> 1 (no attenuation - full-size position).
         return self.max_attenuation + (1.0 - self.max_attenuation) * attenuation_logit
 
-    def _checkpoint_dict(self) -> dict:
+    def _checkpoint_dict(self, pairs: list[str]) -> dict:
         """Build the checkpoint dict shared by save_model() (-> local file)
         and save_to_db() (-> quant.model_registry blob). Unlike
         PortfolioLSTM, no standardization stats are needed here - RiskLSTM
         consumes the same already-standardized X the (separately
-        saved/loaded) PortfolioLSTM does.
+        saved/loaded) PortfolioLSTM does. `pairs` is still persisted (the
+        ordered FX pairs this risk model was trained/attenuated on) purely
+        so a loaded RiskLSTM can be checked against the portfolio it's
+        paired with at inference time (see add_risk_overlay) - attenuation
+        i must line up with the same asset as portfolio weight i.
         """
         return {
             "config": {
@@ -236,8 +244,10 @@ class RiskLSTM(nn.Module):
                 "dropout": self.dropout_p,
                 "max_attenuation": self.max_attenuation,
                 "rolling_window": self.rolling_window,
+                "noisy_head": self.noisy_head,
             },
             "state_dict": self.state_dict(),
+            "pairs": list(pairs),
         }
 
     @classmethod
@@ -247,14 +257,15 @@ class RiskLSTM(nn.Module):
         model = cls(**checkpoint["config"])
         model.load_state_dict(checkpoint["state_dict"])
         model.eval()
+        model.pairs = checkpoint["pairs"]
         return model
 
-    def save_model(self, path: str = "models/risk_lstm.pt") -> None:
+    def save_model(self, path: str = "models/risk_lstm.pt", *, pairs: list[str]) -> None:
         """Persist trained weights and the architecture config needed to reconstruct this model."""
-        torch.save(self._checkpoint_dict(), path)
+        torch.save(self._checkpoint_dict(pairs), path)
         logger.info("Saved model weights to %s", path)
 
-    def save_to_db(self, name: str, description: str = "") -> None:
+    def save_to_db(self, name: str, *, pairs: list[str], description: str = "") -> None:
         """Serialize the same checkpoint save_model() would write, and
         upsert it into quant.model_registry under `name` instead of a
         local file.
@@ -262,7 +273,7 @@ class RiskLSTM(nn.Module):
         from data.model_registry import save_model_blob
 
         buffer = io.BytesIO()
-        torch.save(self._checkpoint_dict(), buffer)
+        torch.save(self._checkpoint_dict(pairs), buffer)
         save_model_blob(name, buffer.getvalue(), model_type="risk", description=description)
 
     @classmethod
@@ -301,7 +312,7 @@ class EnsembleRiskLSTM(nn.Module):
         attenuations = torch.stack([m(x, portfolio_weights) for m in self.models], dim=0)
         return attenuations.mean(dim=0)
 
-    def _checkpoint_dict(self) -> dict:
+    def _checkpoint_dict(self, pairs: list[str]) -> dict:
         """Build the checkpoint dict shared by save_model() (-> local file)
         and save_to_db() (-> quant.model_registry blob)."""
         return {
@@ -314,11 +325,13 @@ class EnsembleRiskLSTM(nn.Module):
                         "dropout": m.dropout_p,
                         "max_attenuation": m.max_attenuation,
                         "rolling_window": m.rolling_window,
+                        "noisy_head": m.noisy_head,
                     },
                     "state_dict": m.state_dict(),
                 }
                 for m in self.models
             ],
+            "pairs": list(pairs),
         }
 
     @classmethod
@@ -333,14 +346,15 @@ class EnsembleRiskLSTM(nn.Module):
             members.append(member)
         ensemble = cls(members)
         ensemble.eval()
+        ensemble.pairs = checkpoint["pairs"]
         return ensemble
 
-    def save_model(self, path: str = "models/risk_lstm_ensemble.pt") -> None:
+    def save_model(self, path: str = "models/risk_lstm_ensemble.pt", *, pairs: list[str]) -> None:
         """Persist every member's config + weights so the ensemble can be reloaded without retraining."""
-        torch.save(self._checkpoint_dict(), path)
+        torch.save(self._checkpoint_dict(pairs), path)
         logger.info("Saved ensemble risk weights (%d members) to %s", len(self.models), path)
 
-    def save_to_db(self, name: str, description: str = "") -> None:
+    def save_to_db(self, name: str, *, pairs: list[str], description: str = "") -> None:
         """Serialize the same checkpoint save_model() would write, and
         upsert it into quant.model_registry under `name` instead of a
         local file.
@@ -348,7 +362,7 @@ class EnsembleRiskLSTM(nn.Module):
         from data.model_registry import save_model_blob
 
         buffer = io.BytesIO()
-        torch.save(self._checkpoint_dict(), buffer)
+        torch.save(self._checkpoint_dict(pairs), buffer)
         save_model_blob(name, buffer.getvalue(), model_type="risk_ensemble", description=description)
 
     @classmethod
@@ -404,6 +418,7 @@ def train_risk_model(
     lr: float,
     weight_decay: float = 0.0,
     noise_std: float = 0.0,
+    transaction_cost: float = 0.0,
 ) -> None:
     """Full-batch training of RiskLSTM only - `portfolio_weights_train` is a
     fixed input (already detached from PortfolioLSTM's graph by the caller),
@@ -413,6 +428,11 @@ def train_risk_model(
     statistic) - risk_model.forward() computes rolling std/skewness/
     kurtosis internally (see rolling_moments()), so training and inference
     always apply the identical transform and can never drift out of sync.
+
+    `transaction_cost` > 0 nets the training return series against turnover
+    (of the FINAL, attenuated weights) before computing Sharpe - see
+    apply_transaction_costs_torch in portfolio_lstm.py - so RiskLSTM learns
+    to avoid attenuation patterns that cause abrupt, costly weight swings.
     """
     optimizer = torch.optim.Adam(risk_model.parameters(), lr=lr, weight_decay=weight_decay)
 
@@ -423,12 +443,13 @@ def train_risk_model(
         attenuation = risk_model(noisy_X_train, portfolio_weights_train)        # (n_train, n_assets)
         scaled_weights = portfolio_weights_train * attenuation                  # elementwise, per asset
         portfolio_returns = (scaled_weights * next_returns_train).sum(dim=-1)   # (n_train,)
+        portfolio_returns = apply_transaction_costs_torch(scaled_weights, portfolio_returns, transaction_cost)
         loss = -sharpe_ratio(portfolio_returns)
         loss.backward()
         optimizer.step()
         if epoch == 1 or epoch % max(epochs // 10, 1) == 0:
             logger.info(
-                "epoch %d/%d - train Sharpe (attenuated) %.4f | mean attenuation %.3f",
+                "epoch %d/%d - train Sharpe (attenuated, net of costs) %.4f | mean attenuation %.3f",
                 epoch, epochs, -loss.item(), attenuation.mean().item(),
             )
 
@@ -445,6 +466,7 @@ def train_joint_model(
     weight_decay: float = 0.0,
     noise_std: float = 0.0,
     freeze_risk: bool = False,
+    transaction_cost: float = 0.0,
 ) -> None:
     """Train PortfolioLSTM and RiskLSTM TOGETHER, end-to-end, on one shared
     objective: the Sharpe ratio of the FINAL portfolio returns after both
@@ -464,6 +486,13 @@ def train_joint_model(
     but PortfolioLSTM still trains "aware" of it, since gradients still
     flow through risk_model's forward pass into the shared weights it
     consumes as input - only its own parameters don't move).
+
+    `transaction_cost` > 0 nets the training return series against turnover
+    of the FINAL (vol-targeted + attenuated) weights before computing
+    Sharpe (see apply_transaction_costs_torch in portfolio_lstm.py) - both
+    networks then learn, from the same gradient, that abrupt day-to-day
+    weight swings carry a real cost, not just whatever Sharpe on gross
+    returns happens to reward.
     """
     params = list(portfolio_model.parameters())
     if not freeze_risk:
@@ -480,12 +509,13 @@ def train_joint_model(
         attenuation = risk_model(noisy_X_train, weights)                       # (n_train, n_assets)
         scaled_weights = weights * attenuation                                # elementwise, per asset
         portfolio_returns = (scaled_weights * next_returns_train).sum(dim=-1)  # (n_train,)
+        portfolio_returns = apply_transaction_costs_torch(scaled_weights, portfolio_returns, transaction_cost)
         loss = -sharpe_ratio(portfolio_returns)
         loss.backward()
         optimizer.step()
         if epoch == 1 or epoch % max(epochs // 10, 1) == 0:
             logger.info(
-                "epoch %d/%d - train Sharpe (joint, attenuated) %.4f | mean attenuation %.3f",
+                "epoch %d/%d - train Sharpe (joint, attenuated, net of costs) %.4f | mean attenuation %.3f",
                 epoch, epochs, -loss.item(), attenuation.mean().item(),
             )
 
@@ -541,6 +571,19 @@ def risk_model_name(args: argparse.Namespace) -> str:
         risk_rolling_window=args.risk_rolling_window,
         max_attenuation=args.max_attenuation,
     )
+
+
+def _check_pairs_match(risk_pairs: list[str], portfolio_pairs: list[str]) -> None:
+    """A loaded RiskLSTM's attenuation output i must line up with the same
+    asset as the paired PortfolioLSTM's weight i - raise loudly rather than
+    silently attenuating the wrong assets if the two checkpoints disagree
+    on which pairs (or what order) they were trained on.
+    """
+    if list(risk_pairs) != list(portfolio_pairs):
+        raise ValueError(
+            f"Risk model was trained on pairs {risk_pairs}, but the paired portfolio "
+            f"model uses {portfolio_pairs} - the two checkpoints are incompatible."
+        )
 
 
 def load_risk_model_auto(value: str) -> nn.Module:
@@ -613,6 +656,7 @@ def add_risk_overlay(portfolio_result: PortfolioResult, args: argparse.Namespace
 
     if args.load_risk:
         risk_model = load_risk_model_auto(args.load_risk)
+        _check_pairs_match(risk_model.pairs, portfolio_result.pairs)
     else:
         next_returns_train = torch.tensor(portfolio_result.next_returns_train)
         risk_model = RiskLSTM(
@@ -621,11 +665,13 @@ def add_risk_overlay(portfolio_result: PortfolioResult, args: argparse.Namespace
             dropout=args.dropout,
             max_attenuation=args.max_attenuation,
             rolling_window=args.risk_rolling_window,
+            noisy_head=args.noisy_head,
         )
         train_risk_model(
             risk_model, portfolio_result.X_train, weights_train, next_returns_train,
             epochs=args.risk_epochs, lr=args.risk_lr,
             weight_decay=args.weight_decay, noise_std=args.noise_std,
+            transaction_cost=args.transaction_cost,
         )
 
     return _build_risk_result(portfolio_result, risk_model)
@@ -643,11 +689,13 @@ def _train_and_evaluate_joint(data: _PreparedData, args: argparse.Namespace) -> 
         hidden_size=args.hidden_size,
         weight_scheme=args.weight_scheme,
         dropout=args.dropout,
+        noisy_head=args.noisy_head,
     )
 
     freeze_risk = bool(args.load_risk)
     if freeze_risk:
         risk_model = load_risk_model_auto(args.load_risk)
+        _check_pairs_match(risk_model.pairs, data.pairs)
     else:
         risk_model = RiskLSTM(
             n_assets=len(data.pairs),
@@ -655,6 +703,7 @@ def _train_and_evaluate_joint(data: _PreparedData, args: argparse.Namespace) -> 
             dropout=args.dropout,
             max_attenuation=args.max_attenuation,
             rolling_window=args.risk_rolling_window,
+            noisy_head=args.noisy_head,
         )
 
     train_joint_model(
@@ -664,6 +713,7 @@ def _train_and_evaluate_joint(data: _PreparedData, args: argparse.Namespace) -> 
         epochs=args.epochs, lr=args.lr,
         weight_decay=args.weight_decay, noise_std=args.noise_std,
         freeze_risk=freeze_risk,
+        transaction_cost=args.transaction_cost,
     )
 
     portfolio_result = evaluate_portfolio_model(portfolio_model, data, args.weight_scheme, args.target_vol)

@@ -19,7 +19,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from models.portfolio_lstm import sharpe_ratio
+from models.portfolio_lstm import apply_transaction_costs, sharpe_ratio
 from models.risk_lstm import RiskResult
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -224,5 +224,59 @@ def plot_pnl(result: RiskResult, output_path: str) -> None:
         title=f"Out-of-sample (validation) cumulative PnL - Sharpe raw {raw_val:.2f} / attenuated {scaled_val:.2f}",
         output_path=_suffixed_path(output_path, "outsample"),
     )
+
+
+def plot_return_histograms(result: RiskResult, output_path: str, bins: int = 40) -> None:
+    """Plot OUT-OF-SAMPLE daily return histograms for the risk-weighted
+    (pre-attenuation) and risk-attenuated (post-attenuation) return series,
+    overlaid - lets you compare their distribution SHAPE (tails, spread),
+    not just their summary Sharpe ratio.
+    """
+    raw = result.returns_val_raw
+    scaled = result.returns_val_scaled
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.hist(raw, bins=bins, alpha=0.5, label="risk-weighted (no attenuation)", color="tab:gray", density=True)
+    ax.hist(scaled, bins=bins, alpha=0.5, label="risk-attenuated", color="black", density=True)
+    ax.axvline(0, color="gray", linewidth=0.8, linestyle="--")
+    ax.set_title("Out-of-sample daily return distribution")
+    ax.set_xlabel("daily log return")
+    ax.set_ylabel("density")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    logger.info("Saved plot to %s", output_path)
+
+
+def plot_transaction_cost_pnl(result: RiskResult, output_path: str, transaction_cost_bps: float) -> None:
+    """Plot OUT-OF-SAMPLE cumulative PnL for the risk-attenuated strategy,
+    gross vs NET of an estimated transaction-cost drag (see
+    apply_transaction_costs in models/portfolio_lstm.py) - the final,
+    most "realistic" view of the strategy's net-of-costs performance.
+    """
+    final_weights_val = result.portfolio_result.weights_val * result.attenuation_val  # already-attenuated weights
+    net_returns = apply_transaction_costs(final_weights_val, result.returns_val_scaled, transaction_cost_bps)
+
+    gross_sharpe = float(sharpe_ratio(torch.tensor(result.returns_val_scaled)))
+    net_sharpe = float(sharpe_ratio(torch.tensor(net_returns)))
+
+    fig, ax = plt.subplots(figsize=(12, 5))
+    ax.plot(
+        result.dates_val, np.cumsum(result.returns_val_scaled),
+        label=f"gross (no costs) - Sharpe {gross_sharpe:.2f}", color="tab:gray", linewidth=1,
+    )
+    ax.plot(
+        result.dates_val, np.cumsum(net_returns),
+        label=f"net ({transaction_cost_bps:.1f}bps/turnover) - Sharpe {net_sharpe:.2f}", color="black", linewidth=1,
+    )
+    ax.axhline(0, color="gray", linewidth=0.8, linestyle="--")
+    ax.set_title(f"Out-of-sample cumulative PnL: risk-attenuated, gross vs net of {transaction_cost_bps:.1f}bps costs")
+    ax.set_xlabel("date")
+    ax.set_ylabel("cumulative log-return P&L")
+    ax.legend()
+    fig.autofmt_xdate()
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    logger.info("Saved plot to %s", output_path)
 
 

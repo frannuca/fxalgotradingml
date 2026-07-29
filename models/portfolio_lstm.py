@@ -172,6 +172,71 @@ def make_portfolio_sequences(
 
 
 # --------------------------------------------------------------------------
+# Noisy layers: parameter-space noise (NoisyNet, Fortunato et al. 2017)
+# --------------------------------------------------------------------------
+
+class NoisyLinear(nn.Module):
+    """Drop-in replacement for nn.Linear whose weight/bias are themselves
+    noisy: `weight = weight_mu + weight_sigma * epsilon`, with epsilon
+    resampled fresh from N(0, 1) every forward() call while training.
+
+    This is the "noisy cell" analogue of `noise_std` (which perturbs the
+    INPUT window instead): rather than the model seeing a slightly
+    different input each epoch, it has to produce a good Sharpe ratio under
+    a slightly different version of its OWN decision boundary each epoch.
+    That makes it harder for the model to lock onto one razor-sharp weight
+    configuration that happens to maximize Sharpe on this exact training
+    sample but doesn't generalize - the two noise sources compose (both can
+    be enabled together) rather than replace each other.
+
+    In eval() mode, weight/bias fall back to their mu-only (noise-free)
+    values, so inference is deterministic - mirroring how dropout also
+    turns itself off outside training.
+
+    `sigma_init` sets the initial noise magnitude relative to fan-in (0.5 is
+    the standard NoisyNet default); sigma is itself a learned parameter, so
+    the model can shrink it over training if noise stops helping.
+    """
+
+    def __init__(self, in_features: int, out_features: int, sigma_init: float = 0.5):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.weight_mu = nn.Parameter(torch.empty(out_features, in_features))
+        self.weight_sigma = nn.Parameter(torch.empty(out_features, in_features))
+        self.bias_mu = nn.Parameter(torch.empty(out_features))
+        self.bias_sigma = nn.Parameter(torch.empty(out_features))
+        # Buffers, not parameters: resampled every forward() call, never
+        # trained via gradient descent themselves.
+        self.register_buffer("weight_epsilon", torch.empty(out_features, in_features))
+        self.register_buffer("bias_epsilon", torch.empty(out_features))
+        self._sigma_init = sigma_init
+        self._reset_parameters()
+        self._reset_noise()
+
+    def _reset_parameters(self) -> None:
+        bound = 1.0 / (self.in_features ** 0.5)
+        nn.init.uniform_(self.weight_mu, -bound, bound)
+        nn.init.uniform_(self.bias_mu, -bound, bound)
+        nn.init.constant_(self.weight_sigma, self._sigma_init * bound)
+        nn.init.constant_(self.bias_sigma, self._sigma_init * bound)
+
+    def _reset_noise(self) -> None:
+        self.weight_epsilon.normal_()
+        self.bias_epsilon.normal_()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.training:
+            self._reset_noise()
+            weight = self.weight_mu + self.weight_sigma * self.weight_epsilon
+            bias = self.bias_mu + self.bias_sigma * self.bias_epsilon
+        else:
+            weight = self.weight_mu
+            bias = self.bias_mu
+        return nn.functional.linear(x, weight, bias)
+
+
+# --------------------------------------------------------------------------
 # Model
 # --------------------------------------------------------------------------
 
@@ -189,6 +254,7 @@ class PortfolioLSTM(nn.Module):
         num_layers: int = 1,
         weight_scheme: str = "softmax",
         dropout: float = 0.0,
+        noisy_head: bool = False,
     ):
         super().__init__()
         if weight_scheme not in ("softmax", "tanh_norm"):
@@ -201,6 +267,7 @@ class PortfolioLSTM(nn.Module):
         self.num_layers = num_layers
         self.weight_scheme = weight_scheme
         self.dropout_p = dropout
+        self.noisy_head = noisy_head
         self.lstm = nn.LSTM(
             input_size=n_assets,
             hidden_size=hidden_size,
@@ -210,7 +277,7 @@ class PortfolioLSTM(nn.Module):
         # Dropout on the final hidden state only - a no-op (p=0) when
         # `dropout` isn't set, and inactive automatically in model.eval().
         self.dropout = nn.Dropout(dropout)
-        self.head = nn.Linear(hidden_size, n_assets)
+        self.head = NoisyLinear(hidden_size, n_assets) if noisy_head else nn.Linear(hidden_size, n_assets)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (batch, lookback, n_assets)
@@ -227,10 +294,27 @@ class PortfolioLSTM(nn.Module):
         raw = torch.tanh(logits)
         return raw / (raw.abs().sum(dim=-1, keepdim=True) + 1e-8)
 
-    def _checkpoint_dict(self, x_mean: np.ndarray, x_std: np.ndarray) -> dict:
+    def _checkpoint_dict(
+        self, x_mean: np.ndarray, x_std: np.ndarray, pairs: list[str], lookback: int,
+    ) -> dict:
         """Build the checkpoint dict shared by save_model() (-> local file)
         and save_to_db() (-> quant.model_registry blob) - one definition of
         what a PortfolioLSTM checkpoint contains, serialized to either target.
+
+        `pairs` is the ordered list of FX pairs this model was trained on -
+        weight i in the model's output always corresponds to pairs[i], so
+        this must be persisted alongside the weights and restored on load
+        (see _from_checkpoint) rather than trusted to whatever pair list/
+        order a caller happens to pass in later.
+
+        `lookback` is the sequence length (days per input window) this
+        model was trained on. The LSTM itself doesn't enforce a fixed
+        sequence length (nn.LSTM runs on any T), so feeding it windows of a
+        different length than training wouldn't error - it would just
+        silently evaluate the model outside the regime it learned. Storing
+        it lets load_pipeline rebuild windows the same size the model was
+        actually trained on, rather than trusting whatever lookback a
+        caller passes in later.
         """
         return {
             "config": {
@@ -239,37 +323,64 @@ class PortfolioLSTM(nn.Module):
                 "num_layers": self.num_layers,
                 "weight_scheme": self.weight_scheme,
                 "dropout": self.dropout_p,
+                "noisy_head": self.noisy_head,
             },
             "state_dict": self.state_dict(),
             "x_mean": torch.as_tensor(x_mean),
             "x_std": torch.as_tensor(x_std),
+            "pairs": list(pairs),
+            "lookback": lookback,
         }
 
     @classmethod
     def _from_checkpoint(cls, checkpoint: dict) -> "PortfolioLSTM":
         """Reconstruct a PortfolioLSTM from a checkpoint dict (however it was
         loaded - from a local file or a DB blob). The returned model also
-        carries `.x_mean`/`.x_std` (as numpy arrays) so callers can
-        standardize new input windows identically to training.
+        carries `.x_mean`/`.x_std` (as numpy arrays), `.pairs` (the ordered
+        FX pairs it was trained on), and `.lookback` (the sequence length it
+        was trained on) so callers can standardize new input windows
+        identically to training and build them with the correct asset
+        order/length without having to re-supply either themselves.
         """
         model = cls(**checkpoint["config"])
         model.load_state_dict(checkpoint["state_dict"])
         model.eval()
         model.x_mean = checkpoint["x_mean"].numpy()
         model.x_std = checkpoint["x_std"].numpy()
+        model.pairs = checkpoint["pairs"]
+        model.lookback = checkpoint["lookback"]
         return model
 
-    def save_model(self, path: str = "models/portfolio_lstm.pt", *, x_mean: np.ndarray, x_std: np.ndarray) -> None:
-        """Persist trained weights, the architecture config, and the input
-        standardization stats (x_mean/x_std) this model was trained with -
-        a self-contained checkpoint that load_model() can rebuild and run
-        inference from without retraining or needing a fresh training split
-        to re-derive x_mean/x_std.
+    def save_model(
+        self,
+        path: str = "models/portfolio_lstm.pt",
+        *,
+        x_mean: np.ndarray,
+        x_std: np.ndarray,
+        pairs: list[str],
+        lookback: int,
+    ) -> None:
+        """Persist trained weights, the architecture config, the input
+        standardization stats (x_mean/x_std), the ordered FX pairs, and the
+        sequence length this model was trained on - a self-contained
+        checkpoint that load_model() can rebuild and run inference from
+        without retraining, without needing a fresh training split to
+        re-derive x_mean/x_std, and without risking weights being applied
+        to the wrong assets or windows of the wrong length.
         """
-        torch.save(self._checkpoint_dict(x_mean, x_std), path)
+        torch.save(self._checkpoint_dict(x_mean, x_std, pairs, lookback), path)
         logger.info("Saved model weights to %s", path)
 
-    def save_to_db(self, name: str, *, x_mean: np.ndarray, x_std: np.ndarray, description: str = "") -> None:
+    def save_to_db(
+        self,
+        name: str,
+        *,
+        x_mean: np.ndarray,
+        x_std: np.ndarray,
+        pairs: list[str],
+        lookback: int,
+        description: str = "",
+    ) -> None:
         """Serialize the same checkpoint save_model() would write, and
         upsert it into quant.model_registry under `name` instead of a
         local file - see data/model_registry.py.
@@ -277,7 +388,7 @@ class PortfolioLSTM(nn.Module):
         from data.model_registry import save_model_blob
 
         buffer = io.BytesIO()
-        torch.save(self._checkpoint_dict(x_mean, x_std), buffer)
+        torch.save(self._checkpoint_dict(x_mean, x_std, pairs, lookback), buffer)
         save_model_blob(name, buffer.getvalue(), model_type="portfolio", description=description)
 
     @classmethod
@@ -326,11 +437,14 @@ class EnsemblePortfolioLSTM(nn.Module):
         # invested" invariant each individual model already satisfies.
         return averaged / (averaged.abs().sum(dim=-1, keepdim=True) + 1e-8)
 
-    def _checkpoint_dict(self, x_mean: np.ndarray, x_std: np.ndarray) -> dict:
+    def _checkpoint_dict(
+        self, x_mean: np.ndarray, x_std: np.ndarray, pairs: list[str], lookback: int,
+    ) -> dict:
         """Build the checkpoint dict shared by save_model() (-> local file)
         and save_to_db() (-> quant.model_registry blob). All restarts were
-        trained on the same standardized data, so one x_mean/x_std pair
-        covers the whole ensemble.
+        trained on the same standardized data, so one x_mean/x_std pair, one
+        ordered `pairs` list, and one `lookback` (see
+        PortfolioLSTM._checkpoint_dict) cover the whole ensemble.
         """
         return {
             "members": [
@@ -341,6 +455,7 @@ class EnsemblePortfolioLSTM(nn.Module):
                         "num_layers": m.num_layers,
                         "weight_scheme": m.weight_scheme,
                         "dropout": m.dropout_p,
+                        "noisy_head": m.noisy_head,
                     },
                     "state_dict": m.state_dict(),
                 }
@@ -348,14 +463,16 @@ class EnsemblePortfolioLSTM(nn.Module):
             ],
             "x_mean": torch.as_tensor(x_mean),
             "x_std": torch.as_tensor(x_std),
+            "pairs": list(pairs),
+            "lookback": lookback,
         }
 
     @classmethod
     def _from_checkpoint(cls, checkpoint: dict) -> "EnsemblePortfolioLSTM":
         """Reconstruct every member from a checkpoint dict (however it was
         loaded - from a local file or a DB blob). The returned ensemble
-        also carries `.x_mean`/`.x_std` (as numpy arrays), same as
-        PortfolioLSTM._from_checkpoint()."""
+        also carries `.x_mean`/`.x_std` (as numpy arrays), `.pairs`, and
+        `.lookback`, same as PortfolioLSTM._from_checkpoint()."""
         members = []
         for member_checkpoint in checkpoint["members"]:
             member = PortfolioLSTM(**member_checkpoint["config"])
@@ -366,16 +483,33 @@ class EnsemblePortfolioLSTM(nn.Module):
         ensemble.eval()
         ensemble.x_mean = checkpoint["x_mean"].numpy()
         ensemble.x_std = checkpoint["x_std"].numpy()
+        ensemble.pairs = checkpoint["pairs"]
+        ensemble.lookback = checkpoint["lookback"]
         return ensemble
 
     def save_model(
-        self, path: str = "models/portfolio_lstm_ensemble.pt", *, x_mean: np.ndarray, x_std: np.ndarray
+        self,
+        path: str = "models/portfolio_lstm_ensemble.pt",
+        *,
+        x_mean: np.ndarray,
+        x_std: np.ndarray,
+        pairs: list[str],
+        lookback: int,
     ) -> None:
         """Persist every member's config + weights so the ensemble can be reloaded without retraining any of them."""
-        torch.save(self._checkpoint_dict(x_mean, x_std), path)
+        torch.save(self._checkpoint_dict(x_mean, x_std, pairs, lookback), path)
         logger.info("Saved ensemble weights (%d members) to %s", len(self.models), path)
 
-    def save_to_db(self, name: str, *, x_mean: np.ndarray, x_std: np.ndarray, description: str = "") -> None:
+    def save_to_db(
+        self,
+        name: str,
+        *,
+        x_mean: np.ndarray,
+        x_std: np.ndarray,
+        pairs: list[str],
+        lookback: int,
+        description: str = "",
+    ) -> None:
         """Serialize the same checkpoint save_model() would write, and
         upsert it into quant.model_registry under `name` instead of a
         local file.
@@ -383,7 +517,7 @@ class EnsemblePortfolioLSTM(nn.Module):
         from data.model_registry import save_model_blob
 
         buffer = io.BytesIO()
-        torch.save(self._checkpoint_dict(x_mean, x_std), buffer)
+        torch.save(self._checkpoint_dict(x_mean, x_std, pairs, lookback), buffer)
         save_model_blob(name, buffer.getvalue(), model_type="portfolio_ensemble", description=description)
 
     @classmethod
@@ -495,6 +629,72 @@ def scale_weights_to_target_vol(
 
 
 # --------------------------------------------------------------------------
+# Transaction costs
+# --------------------------------------------------------------------------
+
+def apply_transaction_costs(
+    weights: np.ndarray, returns: np.ndarray, transaction_cost_bps: float
+) -> np.ndarray:
+    """Subtract an estimated transaction-cost drag from a realized return
+    series, based on day-to-day TURNOVER in `weights` - the standard way to
+    approximate the real-world cost of actually executing a strategy's
+    rebalancing (spread, slippage, commissions).
+
+    Numpy version, used for REPORTING (plots/API responses) once weights
+    are already fixed numbers. See apply_transaction_costs_torch for the
+    differentiable version used INSIDE training.
+
+    weights: (n_days, n_assets) - the FINAL weights (e.g. risk-attenuated)
+    the `returns` series was realized from.
+    returns: (n_days,) - realized portfolio returns for the same days.
+    transaction_cost_bps: cost per unit of turnover, in basis points (1 bps
+    = 0.0001 = 0.01% of notional). E.g. 5.0 means fully rebuilding the book
+    from flat costs 0.05% of NAV.
+
+    turnover_t = sum(|weights_t - weights_{t-1}|) - how much of the book
+    was bought/sold moving from yesterday's position to today's. The very
+    first day charges sum(|weights_0|), the cost of putting the initial
+    position on from flat.
+    """
+    turnover = np.empty(len(weights), dtype=weights.dtype)
+    turnover[0] = np.abs(weights[0]).sum()
+    turnover[1:] = np.abs(np.diff(weights, axis=0)).sum(axis=1)
+    cost = (transaction_cost_bps / 10_000) * turnover
+    return returns - cost
+
+
+def apply_transaction_costs_torch(
+    weights: torch.Tensor, returns: torch.Tensor, transaction_cost_bps: float
+) -> torch.Tensor:
+    """Differentiable twin of apply_transaction_costs, for use INSIDE the
+    training loop (see `transaction_cost` in train_portfolio_model/
+    train_joint_model/train_risk_model) rather than only as a post-hoc
+    reporting adjustment.
+
+    Training the Sharpe objective directly on these net-of-cost returns
+    (instead of gross returns) makes the model favor smoother weight paths
+    over abrupt day-to-day swings whenever `transaction_cost_bps` > 0 -
+    without adding any extra tunable penalty term: it reuses the same
+    turnover-based cost that was already being reported, just moved inside
+    the loss instead of applied only afterwards. `transaction_cost_bps=0`
+    (the default) reproduces the original gross-return objective exactly.
+
+    weights: (n_days, n_assets), requires_grad-tracked - the FINAL weights
+    (post vol-targeting and, if present, risk attenuation) for the whole
+    training period this epoch.
+    returns: (n_days,) - the (differentiable) gross portfolio returns for
+    the same days.
+    """
+    if transaction_cost_bps <= 0:
+        return returns
+    turnover_first = weights[:1].abs().sum(dim=-1)          # (1,) - cost of the initial position from flat
+    turnover_rest = (weights[1:] - weights[:-1]).abs().sum(dim=-1)  # (n_days - 1,)
+    turnover = torch.cat([turnover_first, turnover_rest], dim=0)    # (n_days,)
+    cost = (transaction_cost_bps / 10_000) * turnover
+    return returns - cost
+
+
+# --------------------------------------------------------------------------
 # Training
 # --------------------------------------------------------------------------
 
@@ -508,6 +708,7 @@ def train_portfolio_model(
     lr: float,
     weight_decay: float = 0.0,
     noise_std: float = 0.0,
+    transaction_cost: float = 0.0,
 ) -> None:
     """Full-batch training: at every epoch, allocate weights for the WHOLE
     training period at once, rescale them to --target-vol (see
@@ -529,6 +730,15 @@ def train_portfolio_model(
     (`X_train_raw`), not the noised one - noise regularizes what the LSTM
     sees, it shouldn't distort the real volatility estimate. `weight_decay`
     is passed straight through to Adam as an L2 penalty.
+
+    `transaction_cost` > 0 (basis points per unit of turnover - the same
+    knob apply_transaction_costs uses for reporting) subtracts a turnover-
+    based cost from the return series BEFORE computing Sharpe (see
+    apply_transaction_costs_torch), so the model is trained to maximize
+    Sharpe net of trading costs directly - it learns to avoid abrupt,
+    expensive day-to-day weight swings whenever they're not worth their
+    cost, rather than being scored on gross returns and only having costs
+    applied afterwards as a reporting adjustment.
     """
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
 
@@ -539,11 +749,12 @@ def train_portfolio_model(
         raw_weights = model(noisy_X_train)                                       # (n_train, n_assets)
         weights = scale_weights_to_target_vol(raw_weights, X_train_raw, target_vol)
         portfolio_returns = (weights * next_returns_train).sum(dim=-1)  # (n_train,)
+        portfolio_returns = apply_transaction_costs_torch(weights, portfolio_returns, transaction_cost)
         loss = -sharpe_ratio(portfolio_returns)
         loss.backward()
         optimizer.step()
         if epoch == 1 or epoch % max(epochs // 10, 1) == 0:
-            logger.info("epoch %d/%d - train Sharpe (vol-targeted) %.4f", epoch, epochs, -loss.item())
+            logger.info("epoch %d/%d - train Sharpe (vol-targeted, net of costs) %.4f", epoch, epochs, -loss.item())
 
 
 # --------------------------------------------------------------------------
@@ -573,6 +784,7 @@ class PortfolioResult:
 
     model: PortfolioLSTM
     pairs: list[str]
+    lookback: int
     weight_scheme: str
     target_vol: float
     dates_train: pd.DatetimeIndex
@@ -613,6 +825,13 @@ DEFAULT_CONFIG: dict = {
     "weight_decay": 1e-4,
     "noise_std": 0.05,
     "target_vol": 0.20,
+    # Parameter-space noise (NoisyNet) on the output head(s) - PortfolioLSTM's
+    # head, and RiskLSTM's head_2 when risk_overlay is on - resampled every
+    # forward() call during training, mu-only (deterministic) at eval time.
+    # Composes with noise_std rather than replacing it: noise_std perturbs
+    # the input, this perturbs the model's own decision boundary, so neither
+    # alone is enough to memorize one exact Sharpe-maximizing configuration.
+    "noisy_head": False,
     # Multi-seed restarts (see run_pipeline_multi_seed)
     "n_seeds": 1,
     "restart_strategy": "best",  # "best" or "ensemble"
@@ -623,6 +842,12 @@ DEFAULT_CONFIG: dict = {
     "risk_lr": 1e-3,
     "max_attenuation": 0.33,
     "risk_rolling_window": 10,
+    # Transaction costs, in basis points per unit of turnover - 0 disables
+    # them entirely. Applied BOTH inside the training objective (Sharpe is
+    # computed net of turnover-based costs - see apply_transaction_costs_torch
+    # - so the model learns to avoid abrupt, costly weight swings) and to
+    # reported/plotted returns (see apply_transaction_costs).
+    "transaction_cost": 0.0,
     # Persistence: each of load_portfolio/load_risk accepts EITHER a local
     # .pt file path OR a quant.model_registry name (see
     # load_portfolio_model_auto below); save_db additionally persists
@@ -631,11 +856,13 @@ DEFAULT_CONFIG: dict = {
     "load_risk": None,
     "save_db": False,
     "model_description": "",
-    # Plot output paths (main.py always saves cumulative PnL; the other
-    # two are only used when risk_overlay is true).
+    # Plot output paths (main.py always saves cumulative PnL; the rest are
+    # only used when risk_overlay is true).
     "output": "models/portfolio_pnl.png",
     "position_output": "models/risk_position.png",
     "vol_matched_output": "models/risk_vol_matched_pnl.png",
+    "histogram_output": "models/risk_return_histogram.png",
+    "transaction_cost_output": "models/risk_transaction_cost_pnl.png",
 }
 
 
@@ -675,6 +902,7 @@ class _PreparedData:
     """Data shared across restarts - loaded and split once, not once per seed."""
 
     pairs: list[str]
+    lookback: int
     dates_train: pd.DatetimeIndex
     dates_val: pd.DatetimeIndex
     X_train: torch.Tensor
@@ -688,7 +916,11 @@ class _PreparedData:
 
 
 def _prepare_data(
-    args: argparse.Namespace, x_mean: np.ndarray | None = None, x_std: np.ndarray | None = None
+    args: argparse.Namespace,
+    x_mean: np.ndarray | None = None,
+    x_std: np.ndarray | None = None,
+    pairs: list[str] | None = None,
+    lookback: int | None = None,
 ) -> _PreparedData:
     """Load data (via db.py), build sequences, split by time, and
     standardize - everything a training (or inference) run needs that
@@ -698,14 +930,32 @@ def _prepare_data(
     are used as-is instead of being freshly fit - inference must standardize
     new data exactly the way the loaded model was trained, not according to
     whatever training split happens to be in front of it today.
+
+    If `pairs`/`lookback` are given, they OVERRIDE args.pairs/args.lookback
+    - used when loading a saved model, whose checkpoint carries the exact
+    ordered pair list AND sequence length it was trained on (see
+    PortfolioLSTM._from_checkpoint/load_pipeline below). Model weight i
+    always corresponds to pairs[i], and the LSTM's learned dynamics assume
+    windows of exactly the trained lookback, so a loaded model's own stored
+    values must win over whatever a caller (e.g. a UI form) passes in.
     """
-    pairs = list(dict.fromkeys(args.pairs))  # de-duplicate, keep order
+    if pairs is None:
+        pairs = list(dict.fromkeys(args.pairs))  # de-duplicate, keep order
+    if lookback is None:
+        lookback = args.lookback
 
     logger.info("Loading %s via db.py", pairs)
     prices = load_close_prices(pairs, years=args.years)
     returns = to_log_returns(prices)
 
-    X, next_returns, dates = make_portfolio_sequences(returns, lookback=args.lookback)
+    min_rows = lookback + 1  # need `lookback` history days plus 1 realized return to form even one sequence
+    if len(returns) < min_rows:
+        raise ValueError(
+            f"Only {len(returns)} days of history available for {pairs}, but this model needs at least "
+            f"{min_rows} (sequence length {lookback} + 1) - increase 'years' to fetch more history."
+        )
+
+    X, next_returns, dates = make_portfolio_sequences(returns, lookback=lookback)
 
     # Time-based split: train on the earlier segment, validate on the later
     # (most recent) one - this is the out-of-sample set.
@@ -724,6 +974,7 @@ def _prepare_data(
 
     return _PreparedData(
         pairs=pairs,
+        lookback=lookback,
         dates_train=dates_train,
         dates_val=dates_val,
         X_train=X_train,
@@ -765,6 +1016,7 @@ def evaluate_portfolio_model(model: nn.Module, data: _PreparedData, weight_schem
     return PortfolioResult(
         model=model,
         pairs=data.pairs,
+        lookback=data.lookback,
         weight_scheme=weight_scheme,
         target_vol=target_vol,
         dates_train=data.dates_train,
@@ -795,12 +1047,14 @@ def _train_and_evaluate(data: _PreparedData, args: argparse.Namespace) -> Portfo
         hidden_size=args.hidden_size,
         weight_scheme=args.weight_scheme,
         dropout=args.dropout,
+        noisy_head=args.noisy_head,
     )
     train_portfolio_model(
         model, data.X_train, data.X_train_raw, torch.tensor(data.next_returns_train_raw),
         target_vol=args.target_vol,
         epochs=args.epochs, lr=args.lr,
         weight_decay=args.weight_decay, noise_std=args.noise_std,
+        transaction_cost=args.transaction_cost,
     )
     return evaluate_portfolio_model(model, data, args.weight_scheme, args.target_vol)
 
@@ -810,13 +1064,32 @@ def load_pipeline(args: argparse.Namespace) -> PortfolioResult:
     `args.load_portfolio` (a local file path OR a quant.model_registry
     name - see load_portfolio_model_auto) and evaluate it on freshly-loaded
     data - no training happens at all. The checkpoint carries its own
-    x_mean/x_std (fit during its original training run), so new data is
-    standardized identically without needing to reconstruct the original
-    training split.
+    x_mean/x_std (fit during its original training run), the ordered list
+    of FX pairs, and the sequence length (lookback) it was trained on, so
+    new data is standardized/windowed identically without needing to
+    reconstruct the original training split or trust whatever
+    `args.pairs`/`args.lookback` a caller passed in - those are genuinely
+    part of the model, not free evaluation-time parameters. Only the
+    amount of history to fetch (`args.years`), how much of it counts as
+    "recent" (`args.train_frac`), and post-hoc knobs (`args.target_vol`,
+    transaction cost) remain caller-controlled.
     """
     model = load_portfolio_model_auto(args.load_portfolio)
-    data = _prepare_data(args, x_mean=model.x_mean, x_std=model.x_std)
-    return evaluate_portfolio_model(model, data, args.weight_scheme, args.target_vol)
+    requested_pairs = list(dict.fromkeys(args.pairs)) if args.pairs else None
+    if requested_pairs is not None and set(requested_pairs) != set(model.pairs):
+        logger.warning(
+            "Requested pairs %s don't match the pairs %s this model was trained on - "
+            "using the model's own pairs (weight order must match training).",
+            requested_pairs, model.pairs,
+        )
+    if args.lookback and args.lookback != model.lookback:
+        logger.warning(
+            "Requested lookback %d doesn't match the sequence length %d this model was trained on - "
+            "using the model's own lookback.",
+            args.lookback, model.lookback,
+        )
+    data = _prepare_data(args, x_mean=model.x_mean, x_std=model.x_std, pairs=model.pairs, lookback=model.lookback)
+    return evaluate_portfolio_model(model, data, model.weight_scheme, args.target_vol)
 
 
 def run_pipeline(args: argparse.Namespace) -> PortfolioResult:

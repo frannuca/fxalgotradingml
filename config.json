@@ -7,22 +7,22 @@
 
     "weight_scheme": "softmax",
     "hidden_size": 64,
-    "epochs": 300,
+    "epochs": 150,
     "lr": 0.001,
     "dropout": 0.1,
     "weight_decay": 0.0001,
-    "noise_std": 0.05,
+    "noise_std": 0.10,
     "target_vol": 0.05,
 
     "n_seeds": 5,
     "restart_strategy": "best",
 
     "risk_overlay": true,
-    "risk_hidden_size": 32,
-    "risk_epochs": 200,
+    "risk_hidden_size": 64,
+    "risk_epochs": 50,
     "risk_lr": 0.001,
     "max_attenuation": 0.33,
-    "risk_rolling_window": 10,
+    "risk_rolling_window": 40,
 
     "load_portfolio": null,
     "load_risk": null,

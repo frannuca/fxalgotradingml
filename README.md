@@ -1,10 +1,13 @@
 # fx-forecasting
 
 LSTM portfolio allocator for FX pairs, trained end-to-end to maximize
-Sharpe ratio, with an optional risk-attenuation overlay and volatility
-targeting. One JSON-driven entry point (`main.py`) runs the whole thing -
-data loading, training (or loading a saved model), volatility targeting,
-the risk overlay, multi-seed restarts, saving, printing, and plotting.
+Sharpe ratio, with an optional risk-attenuation overlay, volatility
+targeting, and transaction-cost reporting. Three ways to run it:
+
+- **CLI**: a JSON-driven entry point (`main.py`) - see steps 1-8 below.
+- **Web app**: a FastAPI backend (`api/`) + React frontend (`frontend/`)
+  with a Training page (set parameters, train, save) and an Evaluation
+  page (pick saved models, refresh quotes, run, view plots) - see step 9.
 
 ## 1. Install dependencies
 
@@ -96,6 +99,8 @@ Full config showing every option and its default:
     "max_attenuation": 0.33,
     "risk_rolling_window": 10,
 
+    "transaction_cost": 0.0,
+
     "load_portfolio": null,
     "load_risk": null,
     "save_db": false,
@@ -103,7 +108,9 @@ Full config showing every option and its default:
 
     "output": "models/portfolio_pnl.png",
     "position_output": "models/risk_position.png",
-    "vol_matched_output": "models/risk_vol_matched_pnl.png"
+    "vol_matched_output": "models/risk_vol_matched_pnl.png",
+    "histogram_output": "models/risk_return_histogram.png",
+    "transaction_cost_output": "models/risk_transaction_cost_pnl.png"
 }
 ```
 
@@ -118,7 +125,9 @@ Full config showing every option and its default:
    in another config's `load_portfolio`/`load_risk`.
 4. Print Sharpe ratios (raw / vol-targeted / attenuated, as applicable).
 5. Save plots: cumulative PnL always; with `risk_overlay`, also
-   position-vs-attenuation and the out-of-sample vol-matched comparison.
+   position-vs-attenuation, the out-of-sample vol-matched comparison,
+   out-of-sample return histograms, and cumulative PnL net of
+   `transaction_cost` (see step 8).
 
 ## 5. PortfolioLSTM: the allocator (Sharpe ratio optimization)
 
@@ -290,7 +299,7 @@ architecture-related is ignored in favor of what's baked into the checkpoint.
 Cumulative PnL is always saved (`output`, two files: `<name>_insample.png`
 / `<name>_outsample.png`, each with its Sharpe ratio in the title).
 
-With `risk_overlay: true`, two more are saved:
+With `risk_overlay: true`, four more are saved:
 
 - `position_output`: per-pair position (portfolio weight, solid line) vs.
   that same pair's attenuation (dashed line, same color, right y-axis
@@ -303,3 +312,60 @@ With `risk_overlay: true`, two more are saved:
   rescaled by its own realized volatility to `target_vol`, so differences
   between the curves reflect differences in shape/skill (drawdowns,
   smoothness) rather than just how much risk each one happened to run.
+- `histogram_output`: **out-of-sample only**, overlaid histograms of daily
+  returns for the risk-weighted (baseline) and risk-attenuated series -
+  compares distribution shape (tails, spread), not just Sharpe.
+- `transaction_cost_output`: **out-of-sample only**, the risk-attenuated
+  strategy's cumulative PnL, gross vs. net of `transaction_cost` (see
+  `apply_transaction_costs` in `models/portfolio_lstm.py`) - a turnover-based
+  estimate of real-world execution drag (spread/slippage/commissions),
+  in basis points per unit of turnover. This is a POST-HOC reporting
+  adjustment only - it is never added to the Sharpe training objective,
+  so training behavior is unaffected by this setting.
+
+## 9. Web app: Training + Evaluation in the browser
+
+A FastAPI backend (`api/`) and React frontend (`frontend/`) wrap the same
+pipeline in a UI - useful for setting parameters interactively and
+browsing plots without re-running the CLI each time.
+
+**Backend** (run from the repo root, same Postgres env vars as above):
+
+```bash
+uvicorn api.server:app --reload --port 8000
+```
+
+**Frontend**:
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+Then open the printed local URL (typically `http://localhost:5173`). If
+the backend isn't on `http://127.0.0.1:8000`, copy `frontend/.env.example`
+to `frontend/.env` and set `VITE_API_BASE_URL`.
+
+**Training page**: pick FX pairs (from the majors, or type a custom
+ticker), set architecture/regularization/volatility-targeting/risk-overlay/
+multi-seed/transaction-cost parameters, and train. Training runs as a
+background job on the server (polled every 2s) since it can take longer
+than one HTTP request should block for; on completion the trained
+model(s) are saved locally and, if requested, to `quant.model_registry`.
+
+**Evaluation page**: pick FX pairs, optionally refresh their latest quotes
+into Postgres, pick a saved portfolio model (and optionally a risk-overlay
+model) from a dropdown populated from `quant.model_registry`, set
+evaluation parameters (lookback/years/train_frac/target_vol/transaction_cost),
+and run. Loads the model(s) purely for inference (no training) and shows:
+
+- the model's recommended weights for the next (not-yet-realized) day;
+- risk-weighted portfolio baseline cumulative PnL (out-of-sample);
+- baseline vs. with-risk-overlay cumulative PnL, overlaid;
+- return histograms for baseline and with-risk-overlay;
+- with-risk-overlay cumulative PnL, gross vs. net of transaction costs.
+
+See `api/server.py`'s module docstring for the full endpoint list
+(`GET /api/pairs`, `POST /api/quotes/refresh`, `GET /api/models`,
+`POST /api/train` + `GET /api/train/{job_id}`, `POST /api/evaluate`).

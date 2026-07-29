@@ -92,11 +92,14 @@ def run_portfolio_only(args: Namespace) -> None:
     result = run_portfolio_pipeline(args)
 
     if not args.load_portfolio:
-        result.model.save_model(x_mean=result.x_mean, x_std=result.x_std)
+        result.model.save_model(
+            x_mean=result.x_mean, x_std=result.x_std, pairs=result.pairs, lookback=result.lookback,
+        )
     if args.save_db:
         name = portfolio_model_name(args)
         result.model.save_to_db(
-            name, x_mean=result.x_mean, x_std=result.x_std, description=args.model_description,
+            name, x_mean=result.x_mean, x_std=result.x_std, pairs=result.pairs, lookback=result.lookback,
+            description=args.model_description,
         )
         print(f"Persisted portfolio model to database as {name!r}")
 
@@ -116,6 +119,8 @@ def run_with_risk_overlay(args: Namespace) -> None:
     from models.risk_postprocess import (
         plot_pnl as plot_risk_pnl,
         plot_position_and_scaling,
+        plot_return_histograms,
+        plot_transaction_cost_pnl,
         plot_vol_matched_pnl,
         print_sharpe_ratios as print_risk_sharpe_ratios,
     )
@@ -125,18 +130,22 @@ def run_with_risk_overlay(args: Namespace) -> None:
     if not args.load_portfolio:
         result.portfolio_result.model.save_model(
             x_mean=result.portfolio_result.x_mean, x_std=result.portfolio_result.x_std,
+            pairs=result.portfolio_result.pairs, lookback=result.portfolio_result.lookback,
         )
     if not args.load_risk:
-        result.risk_model.save_model()
+        result.risk_model.save_model(pairs=result.portfolio_result.pairs)
     if args.save_db:
         portfolio_name = portfolio_model_name(args)
         result.portfolio_result.model.save_to_db(
             portfolio_name,
             x_mean=result.portfolio_result.x_mean, x_std=result.portfolio_result.x_std,
+            pairs=result.portfolio_result.pairs, lookback=result.portfolio_result.lookback,
             description=args.model_description,
         )
         risk_name = risk_model_name(args)
-        result.risk_model.save_to_db(risk_name, description=args.model_description)
+        result.risk_model.save_to_db(
+            risk_name, pairs=result.portfolio_result.pairs, description=args.model_description,
+        )
         print(f"Persisted portfolio model to database as {portfolio_name!r}")
         print(f"Persisted risk model to database as {risk_name!r}")
 
@@ -144,6 +153,8 @@ def run_with_risk_overlay(args: Namespace) -> None:
     plot_risk_pnl(result, args.output)
     plot_position_and_scaling(result, args.position_output)
     plot_vol_matched_pnl(result, args.vol_matched_output, target_vol=args.target_vol)
+    plot_return_histograms(result, args.histogram_output)
+    plot_transaction_cost_pnl(result, args.transaction_cost_output, transaction_cost_bps=args.transaction_cost)
 
 
 def main() -> None:
