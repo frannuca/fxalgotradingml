@@ -1,6 +1,10 @@
 # fx-forecasting
 
-LSTM forecasting of FX pair log returns.
+LSTM portfolio allocator for FX pairs, trained end-to-end to maximize
+Sharpe ratio, with an optional risk-attenuation overlay and volatility
+targeting. One JSON-driven entry point (`main.py`) runs the whole thing -
+data loading, training (or loading a saved model), volatility targeting,
+the risk overlay, multi-seed restarts, saving, printing, and plotting.
 
 ## 1. Install dependencies
 
@@ -10,9 +14,8 @@ uv sync
 
 ## 2. Configure Postgres
 
-All scripts read/write price history through `data/db.py`, which expects
-these environment variables (a `.env` file in the project root is loaded
-automatically):
+All data access goes through `data/db.py`, which expects these environment
+variables (a `.env` file in the project root is loaded automatically):
 
 ```
 POSTGRES_HOST=localhost
@@ -22,366 +25,281 @@ POSTGRES_USER=<your user>
 POSTGRES_PASSWORD=<your password>
 ```
 
-The database must already have the `quant.quote_keys`, `quant.market_data`
-and `quant.metrics` tables that `data/db.py` reads and writes.
+The database must have the `quant.quote_keys`, `quant.market_data` and
+`quant.metrics` tables that `data/db.py` reads/writes for price history,
+plus `quant.model_registry` for saved models - create it with:
+
+```bash
+psql "$DATABASE_URL" -f data/sql/create_model_registry.sql
+```
+
+(safe to re-run - uses `CREATE SCHEMA/TABLE IF NOT EXISTS`.)
 
 ## 3. (Optional) Pre-populate FX price history
 
-`models/lstm_forecaster.py` will auto-download and upsert any symbol that
-isn't in Postgres yet the first time it's asked for it, so this step isn't
-strictly required. Run it up front if you'd rather control the download
-(e.g. to fetch more years of history, or every major pair at once):
+The pipeline auto-downloads and upserts any symbol that isn't in Postgres
+yet the first time it's asked for, so this step isn't strictly required.
+Run it up front if you'd rather control the download (e.g. more years of
+history, or every major pair at once):
 
 ```bash
 python -m data.fx_downloader --pairs EURUSD GBPUSD USDJPY --years 8 --upload
 ```
 
-`--upload` is what upserts the downloaded closes into Postgres via
-`data/db.py`. Omit `--pairs` to fetch all seven major pairs.
+`--upload` is what upserts the downloaded closes into Postgres. Omit
+`--pairs` to fetch all seven major pairs.
 
-## 4. (Optional) Download interest-rate series
-
-Only needed if a model/feature you're building uses the FX carry (rate
-differential) feature; the LSTM forecaster below doesn't require it.
+## 4. Run the pipeline
 
 ```bash
-python -m data.rates_downloader --currencies USD EUR JPY --upload
+python main.py path/to/config.json
 ```
 
-## 5. Train the LSTM and check out-of-sample metrics
+The JSON file is the **only** input. Every option - data, architecture,
+regularization, volatility targeting, the risk overlay, multi-seed
+restarts, save/load, plot output paths - is a key in it. Any key left out
+falls back to `models/portfolio_lstm.py`'s `DEFAULT_CONFIG`. Only `pairs`
+has no default and must always be provided.
 
-```bash
-python -m models.lstm_forecaster \
-    --pairs EURUSD GBPUSD USDJPY \
-    --target EURUSD \
-    --lookback 30 --horizon 5 --epochs 100
+Minimal config (everything else takes its default):
+
+```json
+{"pairs": ["EURUSD", "GBPUSD", "USDJPY"]}
 ```
 
-- `--pairs`: input FX pairs (log returns fed to the LSTM as features).
-- `--target`: the pair being forecast (auto-added to `--pairs` if missing).
-- `--lookback`: days of history per input window.
-- `--horizon`: N days ahead to forecast.
+Full config showing every option and its default:
 
-Data is loaded from Postgres (falling back to download+upsert if a symbol
-isn't cached there yet, as in step 3). Prints training progress, then
-in-sample (train) and out-of-sample (validation) MSE and hit rate, plus a
-forecast for the next `--horizon` days.
+```json
+{
+    "pairs": ["EURUSD", "GBPUSD", "USDJPY"],
 
-## 6. Plot forecast vs actual and print the hit rate
+    "lookback": 30,
+    "years": 8,
+    "train_frac": 0.8,
 
-```bash
-python -m models.postprocess \
-    --pairs EURUSD GBPUSD USDJPY \
-    --target EURUSD \
-    --lookback 30 --horizon 5 --epochs 100 \
-    --output models/forecast_plot.png
+    "weight_scheme": "softmax",
+    "hidden_size": 32,
+    "epochs": 300,
+    "lr": 0.001,
+    "dropout": 0.1,
+    "weight_decay": 0.0001,
+    "noise_std": 0.05,
+    "target_vol": 0.20,
+
+    "n_seeds": 1,
+    "restart_strategy": "best",
+
+    "risk_overlay": false,
+    "risk_hidden_size": 16,
+    "risk_epochs": 200,
+    "risk_lr": 0.001,
+    "max_attenuation": 0.33,
+    "risk_rolling_window": 10,
+
+    "load_portfolio": null,
+    "load_risk": null,
+    "save_db": false,
+    "model_description": "",
+
+    "output": "models/portfolio_pnl.png",
+    "position_output": "models/risk_position.png",
+    "vol_matched_output": "models/risk_vol_matched_pnl.png"
+}
 ```
 
-Same arguments and pipeline as step 5 (it retrains the model the same way,
-so keep the arguments consistent), plus `--output` for the saved plots.
-Prints in-sample and out-of-sample hit rate, and saves two separate charts
-of next-day forecast vs actual log return (each with its own hit rate in
-the title) derived from `--output`, e.g. `models/forecast_plot.png` ->
+### What happens, in order
 
-- `models/forecast_plot_insample.png` (train period)
-- `models/forecast_plot_outsample.png` (validation period)
+1. Load the config, merge over defaults, validate `pairs` is present.
+2. If `risk_overlay` is `true`: train (or load) PortfolioLSTM and RiskLSTM
+   **together** (see below). Otherwise: train (or load) PortfolioLSTM alone.
+3. Save whatever was freshly trained to a local `.pt` file, and, if
+   `save_db` is `true`, also to Postgres (see step 7) under a name derived
+   from the config's characteristics - printed so you can reuse it later
+   in another config's `load_portfolio`/`load_risk`.
+4. Print Sharpe ratios (raw / vol-targeted / attenuated, as applicable).
+5. Save plots: cumulative PnL always; with `risk_overlay`, also
+   position-vs-attenuation and the out-of-sample vol-matched comparison.
 
-## 7. Train the portfolio allocator (Sharpe ratio optimization)
+## 5. PortfolioLSTM: the allocator (Sharpe ratio optimization)
 
-`models/portfolio_lstm.py` is a different model from step 5: instead of
-forecasting a return value, its output IS the trading decision - a weight
-per FX pair - and it's trained end-to-end to maximize the Sharpe ratio of
-the resulting portfolio, not to minimize forecast error.
+Instead of forecasting a return value, PortfolioLSTM's output **is** the
+trading decision - a weight per FX pair - trained end-to-end via
+full-batch gradient descent to maximize the Sharpe ratio of the resulting
+portfolio.
 
-```bash
-python -m models.portfolio_lstm \
-    --pairs EURUSD GBPUSD USDJPY \
-    --lookback 30 --weight-scheme softmax --epochs 300
-```
+- `weight_scheme`:
+  - `"softmax"` (default) - long-only; weights in (0, 1) summing to 1.
+  - `"tanh_norm"` - long/short; weights in (-1, 1), L1-normalized so the
+    book is fully invested (sum of `|weight|` == 1); the signed sum floats
+    freely in [-1, 1] since allowing shorts rules out also pinning it to 1.
 
-- `--pairs`: the FX pairs in the portfolio (inputs and allocation targets).
-- `--weight-scheme`:
-  - `softmax` (default) - long-only; weights in (0, 1) and always sum to
-    exactly 1.
-  - `tanh_norm` - long/short; weights in (-1, 1), L1-normalized so the book
-    is fully invested (sum of `|weight|` == 1); the signed sum floats
-    freely in [-1, 1] since allowing shorts rules out also pinning the
-    signed sum to 1.
+**Volatility targeting** (`target_vol`, default `0.20` = 20% annualized):
+right after PortfolioLSTM computes its raw weights, they're uniformly
+rescaled per day so the portfolio's annualized volatility - estimated from
+the realized covariance of the same lookback window - matches this target.
+FX portfolios are naturally low-vol (a few percent annualized), so hitting
+20% usually means leveraging weights up (`sum(weights)` can end up well
+above 1) - that's the intended effect, not a bug. This scaling is baked
+into training itself (the Sharpe objective is computed on the vol-targeted
+returns) and into evaluation; the risk overlay only ever reduces these
+already-scaled weights further, it never re-scales them. Set `target_vol`
+to something tiny (e.g. `1e-6`) to effectively disable it.
 
-Data is loaded via `data/db.py` exactly as in step 5. Trains with full-batch
-gradient descent on the (negated) Sharpe ratio of the whole train-period
-return path, then prints in-sample (train) and out-of-sample (validation)
-Sharpe ratio and cumulative PnL.
+**Regularization** (this model overfits easily: full-batch training for
+hundreds of epochs on a noisy Sharpe objective will happily memorize the
+training period) - three training-time regularizers, on by default (`0`
+disables each):
 
-**Volatility targeting** (`--target-vol`, default `0.20` = 20% annualized):
-right after PortfolioLSTM computes its raw weights (softmax/tanh_norm),
-they're uniformly rescaled per day so the portfolio's ANNUALIZED
-volatility - estimated from the realized covariance of the same lookback
-window - matches this target. FX portfolios are naturally low-vol (a few
-percent annualized), so hitting 20% usually means leveraging weights up
-(`sum(weights)` can end up well above 1) - that's the intended effect, not
-a bug. This scaling is baked into training itself (the Sharpe objective is
-computed on the vol-targeted returns, so the model directly optimizes
-for them) and into evaluation; the risk overlay (`--risk-overlay`, below)
-only ever reduces these already-scaled weights further, it never
-re-scales them. Set `--target-vol` to something tiny (e.g. `1e-6`) to
-effectively disable it and get the old raw-weight behavior back.
-
-Add `--risk-overlay` to also train the risk-attenuation network from step
-9 on top, in the same run:
-
-```bash
-python -m models.portfolio_lstm \
-    --pairs EURUSD GBPUSD USDJPY \
-    --lookback 30 --weight-scheme softmax --epochs 300 \
-    --risk-overlay --risk-hidden-size 16 --risk-epochs 200
-```
-
-Without `--risk-overlay`, behavior is unchanged. With it, after training
-PortfolioLSTM as usual, it's frozen and a RiskLSTM is trained on top (see
-step 9), and raw vs attenuated Sharpe ratio is printed for both splits.
-
-This model overfits easily (full-batch training for hundreds of epochs on
-a noisy Sharpe objective will happily memorize the training period), so
-three training-time regularizers are on by default:
-
-- `--noise-std` (default 0.05): fresh Gaussian noise added to the
+- `noise_std` (default 0.05): fresh Gaussian noise added to the
   standardized input window every epoch, so the model can't fit the exact
   training sequence, only patterns that survive small perturbations of it.
-- `--dropout` (default 0.1): dropout on the LSTM's final hidden state,
+- `dropout` (default 0.1): dropout on the LSTM's final hidden state,
   before the linear head.
-- `--weight-decay` (default 1e-5): L2 penalty on the model weights (Adam's
+- `weight_decay` (default 0.0001): L2 penalty on the model weights (Adam's
   `weight_decay`).
 
-Set any of them to `0` to disable. Other techniques worth trying if
-overfitting is still a problem (not implemented here, to keep the
-pipeline simple):
+Other techniques worth trying if overfitting is still a problem (not
+implemented, to keep the pipeline simple): early stopping on a third
+held-out dev split; a turnover penalty (`-|weights[t]-weights[t-1]|`) to
+discourage chasing noisy day-to-day signals; a smaller model / shorter
+`lookback`; walk-forward cross-validation instead of one fixed split.
 
-- **Early stopping** on a third held-out dev split (stop training once
-  dev-set Sharpe stops improving) - the cleanest lever, but needs a
-  train/dev/test split instead of train/validation.
-- **Turnover penalty**: subtract a cost proportional to
-  `|weights[t] - weights[t-1]|` from the Sharpe objective, so the model is
-  discouraged from chasing noisy day-to-day signals.
-- **Smaller model**: fewer hidden units / a shorter `--lookback` reduces
-  capacity relative to how much data there is.
-- **Walk-forward cross-validation**: retrain on a rolling window instead
-  of one fixed train/validation split, to check the Sharpe estimate is
-  stable across different time periods.
+**Multi-seed restarts**: the Sharpe-ratio objective is non-convex in the
+LSTM's parameters, so different random initializations can land in
+meaningfully different local optima. `n_seeds > 1` trains that many
+independent restarts on the same data and combines them via
+`restart_strategy`:
 
-The Sharpe-ratio training objective is also non-convex in the LSTM's
-parameters (that's the LSTM/softmax nonlinearity, not the Sharpe ratio
-itself - true of any neural net regardless of loss function), so different
-random initializations can land in meaningfully different local optima.
-`--n-seeds` trains that many independent restarts on the same data and
-combines them via `--restart-strategy`:
+- `"best"` (default): keeps the single restart with the highest
+  validation Sharpe.
+- `"ensemble"`: averages every restart's predicted weights (re-normalized
+  to keep the weight-scheme invariant - a no-op for `softmax`, a real
+  renormalization for `tanh_norm` since restarts can disagree on sign per
+  asset). Averaging tends to cancel out each restart's idiosyncratic
+  overfitting.
 
-```bash
-python -m models.portfolio_lstm \
-    --pairs EURUSD GBPUSD USDJPY \
-    --lookback 30 --weight-scheme softmax --epochs 300 \
-    --n-seeds 5 --restart-strategy best
-```
+`n_seeds: 1` (the default) skips all of this. Data is loaded once and
+reused across every restart, so the cost of `n_seeds: N` is roughly N
+training runs, not N full pipelines.
 
-```bash
-python -m models.portfolio_lstm \
-    --pairs EURUSD GBPUSD USDJPY \
-    --lookback 30 --weight-scheme softmax --epochs 300 \
-    --n-seeds 5 --restart-strategy ensemble
-```
+## 6. RiskLSTM: the risk-attenuation overlay (`risk_overlay: true`)
 
-- `--restart-strategy best` (default): keeps the single restart with the
-  highest validation Sharpe - model selection.
-- `--restart-strategy ensemble`: averages every restart's predicted
-  weights (re-normalized to keep the same weight-scheme invariant - a
-  no-op for `softmax`, since an average of simplex points stays on the
-  simplex; a real renormalization for `tanh_norm`, since restarts can
-  disagree on sign per asset). Averaging tends to cancel out each
-  individual restart's idiosyncratic overfitting.
+PortfolioLSTM only ever decides *which* assets to hold and in what
+proportion - it has no notion of "I'm not confident right now". RiskLSTM's
+job is to say *how much* of each proposed position to actually take - one
+attenuation factor **per asset**, in `[max_attenuation, 1]`: close to 1 for
+an asset in a normal, tradeable period, down towards `max_attenuation` when
+that asset's recent behavior looks directionless - so the strategy can
+de-risk one pair without necessarily touching the others, and never
+zeroes any asset out entirely.
 
-`--n-seeds 1` (the default) skips all of this and behaves exactly as
-before. Data is loaded once and reused across every restart, so the cost
-of `--n-seeds N` is roughly N training runs, not N full pipelines.
-
-## 8. Plot cumulative PnL and print the Sharpe ratio
-
-```bash
-python -m models.portfolio_postprocess \
-    --pairs EURUSD GBPUSD USDJPY \
-    --lookback 30 --weight-scheme softmax --epochs 300 \
-    --output models/portfolio_pnl.png
-```
-
-Same arguments and pipeline as step 7 (including `--n-seeds`/`--restart-strategy`),
-plus `--output` for the saved plots. Prints in-sample and out-of-sample
-Sharpe ratio and cumulative PnL, and saves two separate cumulative-PnL
-charts (each with its Sharpe ratio in the title) derived from `--output`,
-e.g. `models/portfolio_pnl.png` ->
-
-- `models/portfolio_pnl_insample.png` (train period)
-- `models/portfolio_pnl_outsample.png` (validation period)
-
-Passing `--risk-overlay` here also works, and switches this script's
-output to the full risk pipeline (identical to running
-`models.risk_postprocess` - step 10 below): it trains RiskLSTM on top,
-skips the plain 2-plot output above, and instead saves the same 4 plots
-step 10 describes (raw-vs-attenuated PnL + position-vs-scaling, both
-splits) to `--output`/`--position-output`.
-
-## 9. Train the risk-attenuation overlay
-
-`models/risk_lstm.py` adds a second, independent network on top of
-PortfolioLSTM. PortfolioLSTM only ever decides *which* assets to hold and
-in what proportion - it has no notion of "I'm not confident right now".
-RiskLSTM's job is to say *how much* of each proposed position to actually
-take - one attenuation factor **per asset**, in `[max_attenuation, 1]`:
-close to 1 for an asset in a normal, tradeable period, down towards
-`max_attenuation` when that asset's recent log returns look
-directionless - so the strategy can de-risk one pair without necessarily
-touching the others, and never zeroes any asset out entirely.
-
-PortfolioLSTM and RiskLSTM are trained **TOGETHER**, end-to-end, on one
+PortfolioLSTM and RiskLSTM are trained **together**, end-to-end, on one
 shared objective (not frozen/sequential):
 
-1. PortfolioLSTM proposes raw weights; volatility targeting (step 7)
-   rescales them to `--target-vol`.
+1. PortfolioLSTM proposes raw weights; volatility targeting rescales them
+   to `target_vol`.
 2. RiskLSTM does NOT read raw log returns. For every trailing
-   `--risk-rolling-window` days inside the lookback window, it computes
-   each asset's rolling **standard deviation, skewness, and excess
-   kurtosis** - the moments a risk manager actually looks at (vol =
-   realized risk, skewness = asymmetric tail risk, kurtosis = fat-tail /
-   regime instability) - feeds that rolling-moment sequence through its
-   own LSTM, concatenates the final hidden state with the (vol-targeted)
-   weights, and maps to one attenuation factor per asset.
+   `risk_rolling_window` days inside the lookback window, it computes each
+   asset's rolling **standard deviation, skewness, and excess kurtosis** -
+   the moments a risk manager actually looks at (vol = realized risk,
+   skewness = asymmetric tail risk, kurtosis = fat-tail/regime
+   instability) - feeds that rolling-moment sequence through its own LSTM,
+   concatenates the final hidden state with the (vol-targeted) weights,
+   and maps to one attenuation factor per asset.
 3. `final_weights = vol_targeted_weights * attenuation` (elementwise);
    `portfolio_return = dot(final_weights, next_returns)`.
-4. **ONE optimizer updates both networks' parameters** from the gradient
+4. **One optimizer** updates both networks' parameters from the gradient
    of the same (negated) Sharpe ratio of that final return series - so
-   RiskLSTM's attenuation can shape what PortfolioLSTM learns to propose
-   (e.g. favoring positions that are easier to de-risk cleanly), and
-   PortfolioLSTM's weights adapt knowing they'll be attenuated downstream.
-   `--n-seeds`/`--restart-strategy` (step 7) reseed and retrain **both**
+   RiskLSTM's attenuation can shape what PortfolioLSTM learns to propose,
+   and PortfolioLSTM's weights adapt knowing they'll be attenuated
+   downstream. `n_seeds`/`restart_strategy` reseed and retrain **both**
    networks together per restart - a restart's seed affects RiskLSTM's
    initialization too, not just PortfolioLSTM's.
 
-```bash
-python -m models.risk_lstm \
-    --pairs EURUSD GBPUSD USDJPY \
-    --lookback 30 --weight-scheme softmax --epochs 300 \
-    --risk-hidden-size 16 --risk-epochs 200
-```
-
-(Equivalent to step 7's `python -m models.portfolio_lstm ... --risk-overlay`
-- both delegate to the same `run_pipeline_multi_seed()`. Use whichever
-entry point is more convenient; this one exists mainly so
-`models/risk_postprocess.py` below has a plain function to call.)
-
-**Exception**: if `--load-portfolio` is given, that PortfolioLSTM is fixed
+**Exception**: if `load_portfolio` is given, that PortfolioLSTM is fixed
 (loaded explicitly for inference), so joint training doesn't apply -
-`--n-seeds` is ignored and RiskLSTM is instead trained alone on top of the
-frozen portfolio (or loaded too, via `--load-risk`) - the old two-stage
-behavior, kept specifically for this case.
+`n_seeds` is ignored and RiskLSTM is instead trained alone on top of the
+frozen portfolio (or loaded too, via `load_risk`).
 
-Accepts every `models/portfolio_lstm.py` argument (for stage 1) plus:
+- `risk_hidden_size` (default 16): RiskLSTM's hidden size - attenuation is
+  a simpler task than picking the portfolio, so this defaults smaller
+  than `hidden_size`.
+- `risk_epochs`/`risk_lr`: RiskLSTM's own training length/rate, when
+  trained jointly these still control the SHARED optimizer's epoch count/rate.
+- `max_attenuation` (default 0.33): a hard **floor**, not a ceiling, on
+  each asset's attenuation factor, in (0, 1]. Even at minimum confidence
+  that asset is never de-risked below this fraction of its proposed
+  weight; 1 means no attenuation at all (full-size position).
+- `risk_rolling_window` (default 10, must be `< lookback`): the trailing
+  window (in days) the rolling volatility/skewness/kurtosis features are
+  computed over.
 
-- `--risk-hidden-size` (default 16): RiskLSTM's hidden size - attenuation
-  is a simpler task than picking the portfolio, so this defaults smaller
-  than `--hidden-size`.
-- `--risk-epochs` (default 200), `--risk-lr` (default 1e-3): RiskLSTM's
-  own training length/rate, independent of PortfolioLSTM's `--epochs`/`--lr`.
-- `--max-attenuation` (default 0.33): a hard **floor**, not a ceiling, on
-  each asset's attenuation factor, in (0, 1]. Each asset's sigmoid output
-  is rescaled into `[max_attenuation, 1]` rather than the full `(0, 1)`,
-  so even at minimum confidence that asset is never de-risked below this
-  fraction of its proposed weight, and 1 means no attenuation at all
-  (full-size position) - a limit that holds regardless of what the
-  network learns, not just a training-time preference for smaller bets.
-- `--risk-rolling-window` (default 10, must be `< --lookback`): the
-  trailing window (in days) the rolling volatility/skewness/kurtosis
-  features above are computed over.
+`dropout`/`weight_decay`/`noise_std` are shared between both networks'
+training.
 
-`--dropout`/`--weight-decay`/`--noise-std` are shared between both
-networks' training stages. Prints raw (unattenuated) vs attenuated Sharpe
-ratio and mean attenuation, for both the train and validation splits.
+## 7. Model persistence: local files or Postgres, by name
 
-## 10. Plot raw vs attenuated PnL and print the Sharpe ratio
+Every trained model is saved locally after training:
 
-This single command runs the entire positions + risk process end to end -
-trains PortfolioLSTM (optionally with `--n-seeds`/`--restart-strategy`
-restarts), trains RiskLSTM on top, prints both Sharpe ratios, and saves
-all four plots from steps 9-10 in one go - nothing else needs to be run
-separately:
+- `models/portfolio_lstm.pt` (or `models/portfolio_lstm_ensemble.pt` if
+  `restart_strategy: "ensemble"` was used)
+- `models/risk_lstm.pt` (or `models/risk_lstm_ensemble.pt`) with
+  `risk_overlay: true`
 
-```bash
-python -m models.risk_postprocess \
-    --pairs EURUSD GBPUSD USDJPY \
-    --lookback 30 --weight-scheme softmax --epochs 300 \
-    --n-seeds 5 --restart-strategy best \
-    --risk-hidden-size 16 --risk-epochs 200 \
-    --output models/risk_pnl.png
+Each checkpoint is self-contained: architecture config, weights, and (for
+the portfolio model) the exact input standardization stats it was trained
+with.
+
+**Database persistence** (`quant.model_registry` - see step 2): set
+`"save_db": true` to ALSO persist the trained model(s) to Postgres, under
+a name deterministically derived from the config's characteristics (e.g.
+`portfolio_hidden_size=32_lookback=30_pairs=EURUSD-GBPUSD-USDJPY_target_vol=0.2_weight_scheme=softmax`)
+- printed to the console so you can copy it into another config. The same
+training configuration always maps to the same name, so re-saving under
+it is a natural update, not a collision.
+
+**Loading**: set `load_portfolio` (and/or `load_risk`) to either
+
+- a local `.pt` file path, or
+- a name previously saved with `save_db: true`
+
+`main.py` tries the local file first, then falls back to the database.
+Loading skips training entirely for that model (all of
+`n_seeds`/`restart_strategy`/`epochs`/architecture options are ignored for
+it) and just uses it for inference; it auto-detects whether a checkpoint
+holds a single model or an ensemble.
+
+Example - load a previously-trained pair purely by name and just re-plot:
+
+```json
+{
+    "pairs": ["EURUSD", "GBPUSD", "USDJPY"],
+    "lookback": 30,
+    "risk_overlay": true,
+    "load_portfolio": "portfolio_hidden_size=32_lookback=30_pairs=EURUSD-GBPUSD-USDJPY_target_vol=0.2_weight_scheme=softmax",
+    "load_risk": "risk_lookback=30_max_attenuation=0.33_pairs=EURUSD-GBPUSD-USDJPY_risk_hidden_size=16_risk_rolling_window=10"
+}
 ```
 
-Same arguments and pipeline as step 9, plus `--output` for the saved
-plots. Prints raw vs attenuated Sharpe ratio and mean attenuation for both
-splits, and saves two separate charts - each overlaying the raw and
-attenuated cumulative PnL curves so the risk overlay's effect (smaller
-drawdowns, usually a smaller but steadier curve) is visible directly -
-derived from `--output`, e.g. `models/risk_pnl.png` ->
+`pairs`/`lookback`/`years`/`train_frac` still need to be supplied (they
+control what data is fetched and how it's split for evaluation); everything
+architecture-related is ignored in favor of what's baked into the checkpoint.
 
-- `models/risk_pnl_insample.png` (train period)
-- `models/risk_pnl_outsample.png` (validation period)
+## 8. Plots
 
-It also saves a second pair of charts (`--position-output`, default
-`models/risk_position.png`) overlaying each pair's raw position (portfolio
-weight, solid line, left y-axis) with that SAME pair's attenuation (dashed
-line, same color, right y-axis fixed to [0, 1]) - since attenuation is now
-per asset rather than one global scaling factor, each pair gets a matched
-position/attenuation line pair, so you can see e.g. one pair being
-de-risked while another stays near full size ->
+Cumulative PnL is always saved (`output`, two files: `<name>_insample.png`
+/ `<name>_outsample.png`, each with its Sharpe ratio in the title).
 
-- `models/risk_position_insample.png`
-- `models/risk_position_outsample.png`
+With `risk_overlay: true`, two more are saved:
 
-It also saves a third, OUT-OF-SAMPLE-ONLY chart (`--vol-matched-output`,
-default `models/risk_vol_matched_pnl.png`) overlaying three cumulative-PnL
-curves - raw (pre `--target-vol`), risk-weighted (post `--target-vol`,
-pre risk overlay), and attenuated (post risk overlay) - each
-**independently rescaled by its own realized volatility** to the same
-target (`--target-vol`, default 20%), so differences between the curves
-reflect differences in shape/skill (drawdowns, smoothness) rather than
-just how much risk each one happened to run.
-
-## 11. Inference only - load saved models instead of retraining
-
-Every script above saves its model(s) after training (`models/portfolio_lstm.pt`,
-or `models/portfolio_lstm_ensemble.pt` when `--restart-strategy ensemble` was
-used, plus `models/risk_lstm.pt` with `--risk-overlay` - or
-`models/risk_lstm_ensemble.pt` if the joint training's `--restart-strategy
-ensemble` was used, since a restart's seed reseeds and retrains RiskLSTM
-too now). Each checkpoint is self-contained: architecture config, weights,
-and (for the portfolio model) the exact input standardization stats
-(`x_mean`/`x_std`) it was trained with - so `--load-portfolio`/`--load-risk`
-reload it without needing to know which flags originally trained it.
-
-`--load-portfolio <path>` skips PortfolioLSTM training entirely (all of
-`--n-seeds`/`--restart-strategy`/`--epochs`/etc. are ignored) and just
-loads it for inference; it auto-detects whether the file holds a single
-model or an ensemble, and if an ensemble, loads every member and averages
-their responses exactly as it did at training time. Works with any script
-above, e.g. to just re-plot from saved models without retraining:
-
-```bash
-python -m models.risk_postprocess \
-    --pairs EURUSD GBPUSD USDJPY --lookback 30 \
-    --load-portfolio models/portfolio_lstm.pt \
-    --load-risk models/risk_lstm.pt \
-    --output models/risk_pnl.png
-```
-
-`--pairs`/`--lookback`/`--years`/`--train-frac` still need to be supplied
-(they control what data is fetched and how it's split for evaluation);
-everything architecture-related (`--hidden-size`, `--weight-scheme`,
-`--dropout`, etc.) is ignored in favor of what's baked into the checkpoint.
-`--load-portfolio` alone (without `--risk-overlay`/`--load-risk`) also
-works with `models/portfolio_lstm.py`/`models/portfolio_postprocess.py`
-for positions-only inference.
+- `position_output`: per-pair position (portfolio weight, solid line) vs.
+  that same pair's attenuation (dashed line, same color, right y-axis
+  fixed to [0, 1]) - since attenuation is per-asset, each pair gets a
+  matched line pair, so you can see e.g. one pair being de-risked while
+  another stays near full size.
+- `vol_matched_output`: **out-of-sample only**, three cumulative-PnL
+  curves - raw (pre `target_vol`), risk-weighted (post `target_vol`, pre
+  risk overlay), and attenuated (post risk overlay) - each independently
+  rescaled by its own realized volatility to `target_vol`, so differences
+  between the curves reflect differences in shape/skill (drawdowns,
+  smoothness) rather than just how much risk each one happened to run.

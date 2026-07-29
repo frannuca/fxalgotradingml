@@ -2,19 +2,12 @@
 cumulative PnL and print the Sharpe ratio of both, for the in-sample
 (train) and out-of-sample (validation) periods.
 
-Kept in its own file, mirroring models/portfolio_postprocess.py. Reuses
-`run_pipeline_multi_seed()` from risk_lstm.py (which now trains
-PortfolioLSTM and RiskLSTM TOGETHER, end-to-end - see that module's
-docstring), so the plot and metrics always reflect the exact same trained
-pair.
-
-Usage
------
-    python -m models.risk_postprocess \
-        --pairs EURUSD GBPUSD USDJPY \
-        --lookback 30 --weight-scheme softmax --epochs 300 \
-        --risk-hidden-size 16 --risk-epochs 200 \
-        --output models/risk_pnl.png
+Kept in its own file, mirroring models/portfolio_postprocess.py. This
+module is a LIBRARY - it has no CLI of its own; main.py at the repo root
+calls these functions after running models/risk_lstm.py's
+run_pipeline_multi_seed() (which trains PortfolioLSTM and RiskLSTM
+TOGETHER, end-to-end - see that module's docstring), so the plot and
+metrics always reflect the exact same trained pair.
 """
 
 from __future__ import annotations
@@ -27,7 +20,7 @@ import numpy as np
 import torch
 
 from models.portfolio_lstm import sharpe_ratio
-from models.risk_lstm import RiskResult, build_arg_parser, run_pipeline_multi_seed
+from models.risk_lstm import RiskResult
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -233,27 +226,3 @@ def plot_pnl(result: RiskResult, output_path: str) -> None:
     )
 
 
-def main() -> None:
-    parser = build_arg_parser("Plot raw vs risk-attenuated portfolio PnL and print the Sharpe ratio.")
-    parser.add_argument("--output", default="models/risk_pnl.png", help="Path to save the PnL plot images")
-    parser.add_argument(
-        "--position-output", default="models/risk_position.png",
-        help="Path to save the position-vs-scaling plot images",
-    )
-    parser.add_argument(
-        "--vol-matched-output", default="models/risk_vol_matched_pnl.png",
-        help="Path to save the out-of-sample raw/risk-weighted/attenuated PnL plot, "
-             "all rescaled to match --target-vol",
-    )
-    args = parser.parse_args()
-
-    result = run_pipeline_multi_seed(args)
-
-    print_sharpe_ratios(result)
-    plot_pnl(result, args.output)
-    plot_position_and_scaling(result, args.position_output)
-    plot_vol_matched_pnl(result, args.vol_matched_output, target_vol=args.target_vol)
-
-
-if __name__ == "__main__":
-    main()

@@ -3,25 +3,11 @@ print the Sharpe ratio, for both the in-sample (train) and out-of-sample
 (validation) periods.
 
 Kept in its own file so training/data logic (models/portfolio_lstm.py)
-stays separate from presentation (matplotlib, printouts), mirroring
-models/postprocess.py for the return-forecasting model. Reuses
-`run_pipeline_multi_seed()` from portfolio_lstm.py, so the plot and Sharpe
-ratio always reflect the exact same train/validation split (and, if
-`--n-seeds` > 1, the same restart-combination) the model was trained with.
-
-`--risk-overlay` is also honored here (not just in models/risk_lstm.py /
-models/risk_postprocess.py): passing it trains RiskLSTM on top and
-produces the full 4-plot risk output instead of the plain 2-plot one -
-this script and models/risk_postprocess.py both end up calling the exact
-same underlying functions either way, so which one you run is just a
-matter of preference.
-
-Usage
------
-    python -m models.portfolio_postprocess \
-        --pairs EURUSD GBPUSD USDJPY \
-        --lookback 30 --weight-scheme softmax --epochs 300 \
-        --output models/portfolio_pnl.png
+stays separate from presentation (matplotlib, printouts). This module is a
+LIBRARY - it has no CLI of its own; main.py at the repo root calls these
+functions after running models/portfolio_lstm.py's or models/risk_lstm.py's
+pipeline, so the plot and Sharpe ratio always reflect the exact model that
+was just trained/loaded.
 """
 
 from __future__ import annotations
@@ -33,7 +19,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from models.portfolio_lstm import PortfolioResult, build_arg_parser, run_pipeline_multi_seed, sharpe_ratio
+from models.portfolio_lstm import PortfolioResult, sharpe_ratio
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -91,57 +77,3 @@ def plot_pnl(result: PortfolioResult, output_path: str) -> None:
     )
 
 
-def main() -> None:
-    parser = build_arg_parser("Plot LSTM portfolio cumulative PnL and print the Sharpe ratio.")
-    parser.add_argument("--output", default="models/portfolio_pnl.png", help="Path to save the plot images")
-    parser.add_argument(
-        "--position-output", default="models/risk_position.png",
-        help="Only used with --risk-overlay: path to save the position-vs-scaling plot images",
-    )
-    parser.add_argument(
-        "--vol-matched-output", default="models/risk_vol_matched_pnl.png",
-        help="Only used with --risk-overlay: path to save the out-of-sample "
-             "raw/risk-weighted/attenuated PnL plot, all rescaled to match --target-vol",
-    )
-    args = parser.parse_args()
-
-    if args.risk_overlay:
-        # --risk-overlay trains PortfolioLSTM and RiskLSTM TOGETHER (joint
-        # training - see models/risk_lstm.py), so this delegates the ENTIRE
-        # pipeline to risk_lstm.py's run_pipeline_multi_seed rather than
-        # training a portfolio-only model here first and attaching a risk
-        # overlay after the fact - there is no separate portfolio-only
-        # training step to run in that case. Deferred import: risk_lstm.py
-        # imports from this module at load time, so importing it back at
-        # module level here would be a circular import.
-        from models.risk_lstm import run_pipeline_multi_seed as run_joint_pipeline
-        from models.risk_postprocess import (
-            plot_pnl as plot_risk_pnl,
-            plot_position_and_scaling,
-            plot_vol_matched_pnl,
-            print_sharpe_ratios as print_risk_sharpe_ratios,
-        )
-
-        risk_result = run_joint_pipeline(args)
-        if not args.load_portfolio:
-            risk_result.portfolio_result.model.save_model(
-                x_mean=risk_result.portfolio_result.x_mean, x_std=risk_result.portfolio_result.x_std,
-            )
-        if not args.load_risk:
-            risk_result.risk_model.save_model()
-        print_risk_sharpe_ratios(risk_result)
-        plot_risk_pnl(risk_result, args.output)
-        plot_position_and_scaling(risk_result, args.position_output)
-        plot_vol_matched_pnl(risk_result, args.vol_matched_output, target_vol=args.target_vol)
-        return
-
-    result = run_pipeline_multi_seed(args)
-    if args.save_portfolio:
-        result.model.save_model(x_mean=result.x_mean, x_std=result.x_std)
-
-    print_sharpe_ratios(result)
-    plot_pnl(result, args.output)
-
-
-if __name__ == "__main__":
-    main()

@@ -53,18 +53,18 @@ joint training doesn't apply, so RiskLSTM is instead trained alone on top
 of it, frozen (see add_risk_overlay()/train_risk_model() below) - this is
 the same two-stage behavior as before.
 
-Usage
------
-    python -m models.risk_lstm \
-        --pairs EURUSD GBPUSD USDJPY \
-        --lookback 30 --weight-scheme softmax --epochs 300 \
-        --risk-hidden-size 16 --risk-epochs 200
+This module is a LIBRARY - it has no CLI of its own. The single entry
+point for the whole project is main.py at the repo root, which reads a
+JSON config file and orchestrates training/evaluation by calling the
+functions here (and in models/portfolio_lstm.py) directly.
 """
 
 from __future__ import annotations
 
 import argparse
+import io
 import logging
+import os
 from dataclasses import dataclass
 
 import numpy as np
@@ -78,7 +78,6 @@ from models.portfolio_lstm import (
     PortfolioResult,
     _PreparedData,
     _prepare_data,
-    build_arg_parser as build_portfolio_arg_parser,
     evaluate_portfolio_model,
     load_pipeline as load_portfolio_pipeline,
     scale_weights_to_target_vol,
@@ -222,36 +221,63 @@ class RiskLSTM(nn.Module):
         # this), sigmoid=1 -> 1 (no attenuation - full-size position).
         return self.max_attenuation + (1.0 - self.max_attenuation) * attenuation_logit
 
-    def save_model(self, path: str = "models/risk_lstm.pt") -> None:
-        """Persist trained weights and the architecture config needed to
-        reconstruct this model. Unlike PortfolioLSTM, no standardization
-        stats are needed here - RiskLSTM consumes the same already-standardized
-        X the (separately saved/loaded) PortfolioLSTM does.
+    def _checkpoint_dict(self) -> dict:
+        """Build the checkpoint dict shared by save_model() (-> local file)
+        and save_to_db() (-> quant.model_registry blob). Unlike
+        PortfolioLSTM, no standardization stats are needed here - RiskLSTM
+        consumes the same already-standardized X the (separately
+        saved/loaded) PortfolioLSTM does.
         """
-        torch.save(
-            {
-                "config": {
-                    "n_assets": self.n_assets,
-                    "hidden_size": self.hidden_size,
-                    "num_layers": self.num_layers,
-                    "dropout": self.dropout_p,
-                    "max_attenuation": self.max_attenuation,
-                    "rolling_window": self.rolling_window,
-                },
-                "state_dict": self.state_dict(),
+        return {
+            "config": {
+                "n_assets": self.n_assets,
+                "hidden_size": self.hidden_size,
+                "num_layers": self.num_layers,
+                "dropout": self.dropout_p,
+                "max_attenuation": self.max_attenuation,
+                "rolling_window": self.rolling_window,
             },
-            path,
-        )
+            "state_dict": self.state_dict(),
+        }
+
+    @classmethod
+    def _from_checkpoint(cls, checkpoint: dict) -> "RiskLSTM":
+        """Reconstruct a RiskLSTM from a checkpoint dict (however it was
+        loaded - from a local file or a DB blob)."""
+        model = cls(**checkpoint["config"])
+        model.load_state_dict(checkpoint["state_dict"])
+        model.eval()
+        return model
+
+    def save_model(self, path: str = "models/risk_lstm.pt") -> None:
+        """Persist trained weights and the architecture config needed to reconstruct this model."""
+        torch.save(self._checkpoint_dict(), path)
         logger.info("Saved model weights to %s", path)
+
+    def save_to_db(self, name: str, description: str = "") -> None:
+        """Serialize the same checkpoint save_model() would write, and
+        upsert it into quant.model_registry under `name` instead of a
+        local file.
+        """
+        from data.model_registry import save_model_blob
+
+        buffer = io.BytesIO()
+        torch.save(self._checkpoint_dict(), buffer)
+        save_model_blob(name, buffer.getvalue(), model_type="risk", description=description)
 
     @classmethod
     def load_model(cls, path: str) -> "RiskLSTM":
         """Reconstruct a RiskLSTM from a checkpoint saved by save_model()."""
         checkpoint = torch.load(path, map_location="cpu", weights_only=True)
-        model = cls(**checkpoint["config"])
-        model.load_state_dict(checkpoint["state_dict"])
-        model.eval()
-        return model
+        return cls._from_checkpoint(checkpoint)
+
+    @classmethod
+    def load_from_db(cls, name: str) -> "RiskLSTM":
+        """Reconstruct a RiskLSTM from a checkpoint saved by save_to_db()."""
+        from data.model_registry import load_model_blob
+
+        checkpoint = torch.load(io.BytesIO(load_model_blob(name)), map_location="cpu", weights_only=True)
+        return cls._from_checkpoint(checkpoint)
 
 
 class EnsembleRiskLSTM(nn.Module):
@@ -275,33 +301,30 @@ class EnsembleRiskLSTM(nn.Module):
         attenuations = torch.stack([m(x, portfolio_weights) for m in self.models], dim=0)
         return attenuations.mean(dim=0)
 
-    def save_model(self, path: str = "models/risk_lstm_ensemble.pt") -> None:
-        """Persist every member's config + weights so the ensemble can be reloaded without retraining."""
-        torch.save(
-            {
-                "members": [
-                    {
-                        "config": {
-                            "n_assets": m.n_assets,
-                            "hidden_size": m.hidden_size,
-                            "num_layers": m.num_layers,
-                            "dropout": m.dropout_p,
-                            "max_attenuation": m.max_attenuation,
-                            "rolling_window": m.rolling_window,
-                        },
-                        "state_dict": m.state_dict(),
-                    }
-                    for m in self.models
-                ],
-            },
-            path,
-        )
-        logger.info("Saved ensemble risk weights (%d members) to %s", len(self.models), path)
+    def _checkpoint_dict(self) -> dict:
+        """Build the checkpoint dict shared by save_model() (-> local file)
+        and save_to_db() (-> quant.model_registry blob)."""
+        return {
+            "members": [
+                {
+                    "config": {
+                        "n_assets": m.n_assets,
+                        "hidden_size": m.hidden_size,
+                        "num_layers": m.num_layers,
+                        "dropout": m.dropout_p,
+                        "max_attenuation": m.max_attenuation,
+                        "rolling_window": m.rolling_window,
+                    },
+                    "state_dict": m.state_dict(),
+                }
+                for m in self.models
+            ],
+        }
 
     @classmethod
-    def load_model(cls, path: str) -> "EnsembleRiskLSTM":
-        """Reconstruct every member from a checkpoint saved by save_model()."""
-        checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+    def _from_checkpoint(cls, checkpoint: dict) -> "EnsembleRiskLSTM":
+        """Reconstruct every member from a checkpoint dict (however it was
+        loaded - from a local file or a DB blob)."""
         members = []
         for member_checkpoint in checkpoint["members"]:
             member = RiskLSTM(**member_checkpoint["config"])
@@ -312,16 +335,60 @@ class EnsembleRiskLSTM(nn.Module):
         ensemble.eval()
         return ensemble
 
+    def save_model(self, path: str = "models/risk_lstm_ensemble.pt") -> None:
+        """Persist every member's config + weights so the ensemble can be reloaded without retraining."""
+        torch.save(self._checkpoint_dict(), path)
+        logger.info("Saved ensemble risk weights (%d members) to %s", len(self.models), path)
+
+    def save_to_db(self, name: str, description: str = "") -> None:
+        """Serialize the same checkpoint save_model() would write, and
+        upsert it into quant.model_registry under `name` instead of a
+        local file.
+        """
+        from data.model_registry import save_model_blob
+
+        buffer = io.BytesIO()
+        torch.save(self._checkpoint_dict(), buffer)
+        save_model_blob(name, buffer.getvalue(), model_type="risk_ensemble", description=description)
+
+    @classmethod
+    def load_model(cls, path: str) -> "EnsembleRiskLSTM":
+        """Reconstruct every member from a checkpoint saved by save_model()."""
+        checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+        return cls._from_checkpoint(checkpoint)
+
+    @classmethod
+    def load_from_db(cls, name: str) -> "EnsembleRiskLSTM":
+        """Reconstruct every member from a checkpoint saved by save_to_db()."""
+        from data.model_registry import load_model_blob
+
+        checkpoint = torch.load(io.BytesIO(load_model_blob(name)), map_location="cpu", weights_only=True)
+        return cls._from_checkpoint(checkpoint)
+
 
 def load_risk_model(path: str) -> nn.Module:
-    """Load a RiskLSTM or EnsembleRiskLSTM checkpoint, auto-detecting which
-    kind it is from the file's structure - mirrors
+    """Load a RiskLSTM or EnsembleRiskLSTM checkpoint from a local file,
+    auto-detecting which kind it is from the file's structure - mirrors
     models/portfolio_lstm.py's load_portfolio_model.
     """
     checkpoint = torch.load(path, map_location="cpu", weights_only=True)
     if "members" in checkpoint:
         return EnsembleRiskLSTM.load_model(path)
     return RiskLSTM.load_model(path)
+
+
+def load_risk_model_from_db(name: str) -> nn.Module:
+    """Load a RiskLSTM or EnsembleRiskLSTM checkpoint from
+    quant.model_registry by name, auto-detecting single vs. ensemble the
+    same way load_risk_model() does for local files.
+    """
+    from data.model_registry import load_model_blob
+
+    blob = load_model_blob(name)
+    checkpoint = torch.load(io.BytesIO(blob), map_location="cpu", weights_only=True)
+    if "members" in checkpoint:
+        return EnsembleRiskLSTM._from_checkpoint(checkpoint)
+    return RiskLSTM._from_checkpoint(checkpoint)
 
 
 # --------------------------------------------------------------------------
@@ -457,12 +524,33 @@ class RiskResult:
     returns_val_scaled: np.ndarray
 
 
-def build_arg_parser(description: str) -> argparse.ArgumentParser:
-    """Reuses every models/portfolio_lstm.py argument as-is - that parser
-    already defines --risk-overlay/--risk-hidden-size/--risk-epochs/--risk-lr
-    (RiskLSTM is a much simpler task than picking the portfolio itself, so
-    those default to a smaller network and fewer epochs than PortfolioLSTM's)."""
-    return build_portfolio_arg_parser(description)
+def risk_model_name(args: argparse.Namespace) -> str:
+    """Deterministic quant.model_registry name for a RiskLSTM/-ensemble
+    trained with `args` - mirrors models/portfolio_lstm.py's
+    portfolio_model_name(), built from the characteristics that actually
+    change the trained risk network.
+    """
+    from data.model_registry import build_model_name
+
+    is_ensemble = args.n_seeds > 1 and args.restart_strategy == "ensemble"
+    return build_model_name(
+        "risk_ensemble" if is_ensemble else "risk",
+        pairs=sorted(args.pairs),
+        lookback=args.lookback,
+        risk_hidden_size=args.risk_hidden_size,
+        risk_rolling_window=args.risk_rolling_window,
+        max_attenuation=args.max_attenuation,
+    )
+
+
+def load_risk_model_auto(value: str) -> nn.Module:
+    """Load a RiskLSTM/-ensemble from either a local file path or a
+    quant.model_registry name - mirrors
+    models/portfolio_lstm.py's load_portfolio_model_auto.
+    """
+    if os.path.exists(value):
+        return load_risk_model(value)
+    return load_risk_model_from_db(value)
 
 
 def _build_risk_result(portfolio_result: PortfolioResult, risk_model: nn.Module) -> RiskResult:
@@ -524,7 +612,7 @@ def add_risk_overlay(portfolio_result: PortfolioResult, args: argparse.Namespace
     weights_train = torch.tensor(portfolio_result.weights_train)  # (n_train, n_assets)
 
     if args.load_risk:
-        risk_model = load_risk_model(args.load_risk)
+        risk_model = load_risk_model_auto(args.load_risk)
     else:
         next_returns_train = torch.tensor(portfolio_result.next_returns_train)
         risk_model = RiskLSTM(
@@ -559,7 +647,7 @@ def _train_and_evaluate_joint(data: _PreparedData, args: argparse.Namespace) -> 
 
     freeze_risk = bool(args.load_risk)
     if freeze_risk:
-        risk_model = load_risk_model(args.load_risk)
+        risk_model = load_risk_model_auto(args.load_risk)
     else:
         risk_model = RiskLSTM(
             n_assets=len(data.pairs),
@@ -639,23 +727,10 @@ def run_pipeline_multi_seed(args: argparse.Namespace) -> RiskResult:
     return ensemble_result
 
 
-def main(args: argparse.Namespace | None = None) -> None:
-    """CLI entry point. Accepts an optional pre-parsed `args` so
-    models/portfolio_lstm.py's own main() can delegate here directly
-    (when --risk-overlay is set) without re-parsing argv a second time.
-    """
-    if args is None:
-        parser = build_arg_parser("Train PortfolioLSTM and RiskLSTM together (or a risk overlay on a loaded portfolio).")
-        args = parser.parse_args()
-
-    result = run_pipeline_multi_seed(args)
-    if not args.load_portfolio:
-        result.portfolio_result.model.save_model(
-            x_mean=result.portfolio_result.x_mean, x_std=result.portfolio_result.x_std,
-        )
-    if not args.load_risk:
-        result.risk_model.save_model()
-
+def print_risk_sharpe(result: RiskResult) -> None:
+    """Log raw (pre-vol-targeting) -> vol-targeted -> attenuated Sharpe
+    ratio and mean attenuation, for both splits. Used by main.py after
+    training/loading."""
     unscaled_train_sharpe = float(sharpe_ratio(torch.tensor(result.portfolio_result.returns_train_unscaled)))
     unscaled_val_sharpe = float(sharpe_ratio(torch.tensor(result.portfolio_result.returns_val_unscaled)))
     raw_train_sharpe = float(sharpe_ratio(torch.tensor(result.returns_train_raw)))
@@ -673,7 +748,3 @@ def main(args: argparse.Namespace | None = None) -> None:
         "| mean attenuation %.3f",
         unscaled_val_sharpe, raw_val_sharpe, scaled_val_sharpe, result.attenuation_val.mean(),
     )
-
-
-if __name__ == "__main__":
-    main()

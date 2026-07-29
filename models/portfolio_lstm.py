@@ -1,19 +1,24 @@
 """LSTM portfolio allocator: learns weights that directly maximize Sharpe ratio.
 
-Unlike models/lstm_forecaster.py (which predicts a return value and is
-trained to minimize forecast error), this model's output IS a trading
-decision: at each day it looks at the last `lookback` days of log returns
-for every pair in the portfolio and outputs a weight per pair for the
-following day. It is trained end-to-end to maximize the Sharpe ratio of
-the resulting portfolio, not to predict returns accurately - Sharpe ratio
-(mean return / return volatility) is what a portfolio manager actually
-cares about, and it is differentiable, so we can optimize it directly with
-gradient descent instead of using a proxy loss like MSE.
+This module is a LIBRARY - it has no CLI of its own. The single entry
+point for the whole project is main.py at the repo root, which reads a
+JSON config file and orchestrates training/evaluation by calling the
+functions here (and in models/risk_lstm.py) directly. See main.py's
+module docstring for the JSON schema.
+
+This model's output IS a trading decision: at each day it looks at the
+last `lookback` days of log returns for every pair in the portfolio and
+outputs a weight per pair for the following day. It is trained end-to-end
+to maximize the Sharpe ratio of the resulting portfolio, not to predict
+returns accurately - Sharpe ratio (mean return / return volatility) is
+what a portfolio manager actually cares about, and it is differentiable,
+so we can optimize it directly with gradient descent instead of using a
+proxy loss like MSE.
 
 Data flow
 ---------
 1. Load daily close prices for the portfolio's FX pairs via data/db.py
-   (see load_close_prices in models/lstm_forecaster.py - reused here).
+   (see load_close_prices below).
 2. Convert to log returns.
 3. Slide a window over the returns:
        X[i]            = log returns of every pair over `lookback` days
@@ -21,7 +26,8 @@ Data flow
                          after the window - i.e. what a weight decided at
                          the end of the window would actually earn.
 4. Split by time into TRAIN (earliest) and VALIDATION (most recent, held
-   out) - exactly as in lstm_forecaster.py.
+   out) - never shuffle a time series, that would leak future information
+   into training.
 5. The LSTM maps each X[i] window to a weight vector w[i] (one weight per
    pair). Two weight schemes are supported (--weight-scheme):
      - "softmax":   long-only. w = softmax(logits): every weight in (0, 1)
@@ -45,43 +51,81 @@ noisy Sharpe objective for hundreds of epochs will happily memorize the
 training period's noise). Three purely training-time regularizers are
 applied, none of which touch the validation split - it stays a clean
 blind holdout:
-  - `--noise-std`: Gaussian noise added to the (standardized) input
+  - `noise_std`: Gaussian noise added to the (standardized) input
     window on every training epoch, regenerated fresh each time. This is
     the standard "add noise to the input" regularizer: the model can no
     longer fit the exact training sequence of returns, only patterns
     robust to small perturbations of it.
-  - `--dropout`: dropout on the LSTM's final hidden state before the
+  - `dropout`: dropout on the LSTM's final hidden state before the
     linear head, so the head can't rely on any single hidden unit.
-  - `--weight-decay`: L2 penalty on the model weights (Adam's
+  - `weight_decay`: L2 penalty on the model weights (Adam's
     `weight_decay`), shrinking the model towards simpler solutions.
-
-Usage
------
-    python -m models.portfolio_lstm \
-        --pairs EURUSD GBPUSD USDJPY \
-        --lookback 30 --weight-scheme softmax --epochs 300
 """
 
 from __future__ import annotations
 
 import argparse
+import io
 import logging
+import os
 from dataclasses import dataclass
+from datetime import date, timedelta
 
 import numpy as np
 import pandas as pd
 import torch
 from torch import nn
 
-from models.lstm_forecaster import load_close_prices, standardize, to_log_returns
+from data.db import get_time_series, upsert_pairs
+from data.fx_downloader import FXDownloader, MAJOR_FX_PAIRS
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
 
 # --------------------------------------------------------------------------
-# Data preparation
+# Data sourcing + preparation
 # --------------------------------------------------------------------------
+
+def load_close_prices(symbols: list[str], years: int) -> pd.DataFrame:
+    """Load daily close prices for `symbols` from Postgres via db.py.
+
+    db.py's `get_time_series` is the single source of truth here. If a
+    symbol has no rows in Postgres yet (e.g. the very first run), it is
+    downloaded via FXDownloader and upserted (`upsert_pairs`), then the
+    Postgres read is repeated - so the model always ends up training on
+    whatever is in the database, not on a one-off in-memory download.
+    Returns a wide DataFrame: date index, one column per symbol.
+    """
+    end = date.today()
+    start = end - timedelta(days=365 * years)
+
+    prices = get_time_series(symbols, start, end)
+
+    missing = [s for s in symbols if s not in prices.columns or prices[s].dropna().empty]
+    if missing:
+        logger.info("Postgres has no history for %s yet - downloading and upserting", missing)
+        downloader = FXDownloader(years=years)
+        fresh = {
+            symbol: downloader.download_pair(symbol, MAJOR_FX_PAIRS.get(symbol, f"{symbol}=X"))
+            for symbol in missing
+        }
+        upsert_pairs(fresh)
+        prices = get_time_series(symbols, start, end)
+
+    # Inner-join on date: only keep days where every pair has a quote.
+    return prices.dropna()
+
+
+def to_log_returns(prices: pd.DataFrame) -> pd.DataFrame:
+    """Convert a price DataFrame to log returns: r_t = log(p_t / p_t-1)."""
+    return np.log(prices / prices.shift(1)).dropna()
+
+
+def standardize(values: np.ndarray, axis) -> tuple[np.ndarray, np.ndarray]:
+    """Mean/std computed over `axis`, with a small epsilon to avoid /0."""
+    return values.mean(axis=axis), values.std(axis=axis) + 1e-8
+
 
 def make_portfolio_sequences(
     returns: pd.DataFrame, lookback: int
@@ -114,11 +158,16 @@ def make_portfolio_sequences(
         raise ValueError(f"Not enough history ({len(values)} rows) for lookback={lookback}.")
 
     X, next_returns = np.stack(X), np.stack(next_returns)
-    # Guard the no-look-ahead invariant: every window must be exactly
-    # `lookback` long, and the day it predicts must never be one of the
-    # rows fed into the model.
+    # Every window must be exactly `lookback` long. The no-look-ahead
+    # invariant itself (day_t_plus_1's row is never one of X[i]'s rows) is
+    # already guaranteed structurally above by slicing disjoint index
+    # ranges (values[start:day_t+1] vs values[day_t_plus_1]) - it does NOT
+    # need a runtime value-equality check. Real FX data legitimately
+    # contains repeated/flat return values (e.g. holidays or stale closes
+    # producing a return of exactly 0.0 on more than one day within the
+    # same window), so comparing by VALUE would raise false positives on
+    # perfectly valid data.
     assert X.shape[1] == lookback
-    assert not np.any(np.all(X == next_returns[:, None, :], axis=2))
     return X, next_returns, pd.DatetimeIndex(dates)
 
 
@@ -178,6 +227,38 @@ class PortfolioLSTM(nn.Module):
         raw = torch.tanh(logits)
         return raw / (raw.abs().sum(dim=-1, keepdim=True) + 1e-8)
 
+    def _checkpoint_dict(self, x_mean: np.ndarray, x_std: np.ndarray) -> dict:
+        """Build the checkpoint dict shared by save_model() (-> local file)
+        and save_to_db() (-> quant.model_registry blob) - one definition of
+        what a PortfolioLSTM checkpoint contains, serialized to either target.
+        """
+        return {
+            "config": {
+                "n_assets": self.n_assets,
+                "hidden_size": self.hidden_size,
+                "num_layers": self.num_layers,
+                "weight_scheme": self.weight_scheme,
+                "dropout": self.dropout_p,
+            },
+            "state_dict": self.state_dict(),
+            "x_mean": torch.as_tensor(x_mean),
+            "x_std": torch.as_tensor(x_std),
+        }
+
+    @classmethod
+    def _from_checkpoint(cls, checkpoint: dict) -> "PortfolioLSTM":
+        """Reconstruct a PortfolioLSTM from a checkpoint dict (however it was
+        loaded - from a local file or a DB blob). The returned model also
+        carries `.x_mean`/`.x_std` (as numpy arrays) so callers can
+        standardize new input windows identically to training.
+        """
+        model = cls(**checkpoint["config"])
+        model.load_state_dict(checkpoint["state_dict"])
+        model.eval()
+        model.x_mean = checkpoint["x_mean"].numpy()
+        model.x_std = checkpoint["x_std"].numpy()
+        return model
+
     def save_model(self, path: str = "models/portfolio_lstm.pt", *, x_mean: np.ndarray, x_std: np.ndarray) -> None:
         """Persist trained weights, the architecture config, and the input
         standardization stats (x_mean/x_std) this model was trained with -
@@ -185,35 +266,33 @@ class PortfolioLSTM(nn.Module):
         inference from without retraining or needing a fresh training split
         to re-derive x_mean/x_std.
         """
-        torch.save(
-            {
-                "config": {
-                    "n_assets": self.n_assets,
-                    "hidden_size": self.hidden_size,
-                    "num_layers": self.num_layers,
-                    "weight_scheme": self.weight_scheme,
-                    "dropout": self.dropout_p,
-                },
-                "state_dict": self.state_dict(),
-                "x_mean": torch.as_tensor(x_mean),
-                "x_std": torch.as_tensor(x_std),
-            },
-            path,
-        )
+        torch.save(self._checkpoint_dict(x_mean, x_std), path)
         logger.info("Saved model weights to %s", path)
+
+    def save_to_db(self, name: str, *, x_mean: np.ndarray, x_std: np.ndarray, description: str = "") -> None:
+        """Serialize the same checkpoint save_model() would write, and
+        upsert it into quant.model_registry under `name` instead of a
+        local file - see data/model_registry.py.
+        """
+        from data.model_registry import save_model_blob
+
+        buffer = io.BytesIO()
+        torch.save(self._checkpoint_dict(x_mean, x_std), buffer)
+        save_model_blob(name, buffer.getvalue(), model_type="portfolio", description=description)
 
     @classmethod
     def load_model(cls, path: str) -> "PortfolioLSTM":
-        """Reconstruct a PortfolioLSTM from a checkpoint saved by save_model().
-        The returned model also carries `.x_mean`/`.x_std` (as numpy arrays)
-        so callers can standardize new input windows identically to training."""
+        """Reconstruct a PortfolioLSTM from a checkpoint saved by save_model()."""
         checkpoint = torch.load(path, map_location="cpu", weights_only=True)
-        model = cls(**checkpoint["config"])
-        model.load_state_dict(checkpoint["state_dict"])
-        model.eval()
-        model.x_mean = checkpoint["x_mean"].numpy()
-        model.x_std = checkpoint["x_std"].numpy()
-        return model
+        return cls._from_checkpoint(checkpoint)
+
+    @classmethod
+    def load_from_db(cls, name: str) -> "PortfolioLSTM":
+        """Reconstruct a PortfolioLSTM from a checkpoint saved by save_to_db()."""
+        from data.model_registry import load_model_blob
+
+        checkpoint = torch.load(io.BytesIO(load_model_blob(name)), map_location="cpu", weights_only=True)
+        return cls._from_checkpoint(checkpoint)
 
 
 class EnsemblePortfolioLSTM(nn.Module):
@@ -247,41 +326,36 @@ class EnsemblePortfolioLSTM(nn.Module):
         # invested" invariant each individual model already satisfies.
         return averaged / (averaged.abs().sum(dim=-1, keepdim=True) + 1e-8)
 
-    def save_model(
-        self, path: str = "models/portfolio_lstm_ensemble.pt", *, x_mean: np.ndarray, x_std: np.ndarray
-    ) -> None:
-        """Persist every member's config + weights (all restarts were trained
-        on the same standardized data, so one x_mean/x_std pair covers the
-        whole ensemble) so it can be reloaded without retraining any of them.
+    def _checkpoint_dict(self, x_mean: np.ndarray, x_std: np.ndarray) -> dict:
+        """Build the checkpoint dict shared by save_model() (-> local file)
+        and save_to_db() (-> quant.model_registry blob). All restarts were
+        trained on the same standardized data, so one x_mean/x_std pair
+        covers the whole ensemble.
         """
-        torch.save(
-            {
-                "members": [
-                    {
-                        "config": {
-                            "n_assets": m.n_assets,
-                            "hidden_size": m.hidden_size,
-                            "num_layers": m.num_layers,
-                            "weight_scheme": m.weight_scheme,
-                            "dropout": m.dropout_p,
-                        },
-                        "state_dict": m.state_dict(),
-                    }
-                    for m in self.models
-                ],
-                "x_mean": torch.as_tensor(x_mean),
-                "x_std": torch.as_tensor(x_std),
-            },
-            path,
-        )
-        logger.info("Saved ensemble weights (%d members) to %s", len(self.models), path)
+        return {
+            "members": [
+                {
+                    "config": {
+                        "n_assets": m.n_assets,
+                        "hidden_size": m.hidden_size,
+                        "num_layers": m.num_layers,
+                        "weight_scheme": m.weight_scheme,
+                        "dropout": m.dropout_p,
+                    },
+                    "state_dict": m.state_dict(),
+                }
+                for m in self.models
+            ],
+            "x_mean": torch.as_tensor(x_mean),
+            "x_std": torch.as_tensor(x_std),
+        }
 
     @classmethod
-    def load_model(cls, path: str) -> "EnsemblePortfolioLSTM":
-        """Reconstruct every member from a checkpoint saved by save_model().
-        The returned ensemble also carries `.x_mean`/`.x_std` (as numpy
-        arrays), same as PortfolioLSTM.load_model()."""
-        checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+    def _from_checkpoint(cls, checkpoint: dict) -> "EnsemblePortfolioLSTM":
+        """Reconstruct every member from a checkpoint dict (however it was
+        loaded - from a local file or a DB blob). The returned ensemble
+        also carries `.x_mean`/`.x_std` (as numpy arrays), same as
+        PortfolioLSTM._from_checkpoint()."""
         members = []
         for member_checkpoint in checkpoint["members"]:
             member = PortfolioLSTM(**member_checkpoint["config"])
@@ -294,18 +368,65 @@ class EnsemblePortfolioLSTM(nn.Module):
         ensemble.x_std = checkpoint["x_std"].numpy()
         return ensemble
 
+    def save_model(
+        self, path: str = "models/portfolio_lstm_ensemble.pt", *, x_mean: np.ndarray, x_std: np.ndarray
+    ) -> None:
+        """Persist every member's config + weights so the ensemble can be reloaded without retraining any of them."""
+        torch.save(self._checkpoint_dict(x_mean, x_std), path)
+        logger.info("Saved ensemble weights (%d members) to %s", len(self.models), path)
+
+    def save_to_db(self, name: str, *, x_mean: np.ndarray, x_std: np.ndarray, description: str = "") -> None:
+        """Serialize the same checkpoint save_model() would write, and
+        upsert it into quant.model_registry under `name` instead of a
+        local file.
+        """
+        from data.model_registry import save_model_blob
+
+        buffer = io.BytesIO()
+        torch.save(self._checkpoint_dict(x_mean, x_std), buffer)
+        save_model_blob(name, buffer.getvalue(), model_type="portfolio_ensemble", description=description)
+
+    @classmethod
+    def load_model(cls, path: str) -> "EnsemblePortfolioLSTM":
+        """Reconstruct every member from a checkpoint saved by save_model()."""
+        checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+        return cls._from_checkpoint(checkpoint)
+
+    @classmethod
+    def load_from_db(cls, name: str) -> "EnsemblePortfolioLSTM":
+        """Reconstruct every member from a checkpoint saved by save_to_db()."""
+        from data.model_registry import load_model_blob
+
+        checkpoint = torch.load(io.BytesIO(load_model_blob(name)), map_location="cpu", weights_only=True)
+        return cls._from_checkpoint(checkpoint)
+
 
 def load_portfolio_model(path: str) -> nn.Module:
-    """Load a PortfolioLSTM or EnsemblePortfolioLSTM checkpoint, auto-detecting
-    which kind it is from the file's structure - callers (e.g. load_pipeline()
-    below) don't need to know in advance whether `path` holds a single model
-    (saved with --restart-strategy best or --n-seeds 1) or an ensemble
-    (saved with --restart-strategy ensemble).
+    """Load a PortfolioLSTM or EnsemblePortfolioLSTM checkpoint from a local
+    file, auto-detecting which kind it is from the file's structure -
+    callers (e.g. load_pipeline() below) don't need to know in advance
+    whether `path` holds a single model (saved with --restart-strategy
+    best or --n-seeds 1) or an ensemble (saved with --restart-strategy
+    ensemble).
     """
     checkpoint = torch.load(path, map_location="cpu", weights_only=True)
     if "members" in checkpoint:
         return EnsemblePortfolioLSTM.load_model(path)
     return PortfolioLSTM.load_model(path)
+
+
+def load_portfolio_model_from_db(name: str) -> nn.Module:
+    """Load a PortfolioLSTM or EnsemblePortfolioLSTM checkpoint from
+    quant.model_registry by name, auto-detecting single vs. ensemble the
+    same way load_portfolio_model() does for local files.
+    """
+    from data.model_registry import load_model_blob
+
+    blob = load_model_blob(name)
+    checkpoint = torch.load(io.BytesIO(blob), map_location="cpu", weights_only=True)
+    if "members" in checkpoint:
+        return EnsemblePortfolioLSTM._from_checkpoint(checkpoint)
+    return PortfolioLSTM._from_checkpoint(checkpoint)
 
 
 # --------------------------------------------------------------------------
@@ -472,94 +593,81 @@ class PortfolioResult:
     x_std: np.ndarray
 
 
-def build_arg_parser(description: str) -> argparse.ArgumentParser:
-    """CLI arguments shared by this script and models/portfolio_postprocess.py."""
-    parser = argparse.ArgumentParser(description=description)
-    parser.add_argument("--pairs", nargs="+", required=True, help="FX pairs in the portfolio, e.g. EURUSD GBPUSD USDJPY")
-    parser.add_argument("--lookback", type=int, default=30, help="Days of history fed to the LSTM")
-    parser.add_argument("--years", type=int, default=8, help="Years of history to load")
-    parser.add_argument(
-        "--train-frac", type=float, default=0.8,
-        help="Fraction of sequences used for training; the rest is the out-of-sample validation set",
-    )
-    parser.add_argument(
-        "--weight-scheme", choices=["softmax", "tanh_norm"], default="softmax",
-        help="softmax = long-only, weights in (0,1) summing to 1. "
-             "tanh_norm = long/short, weights in (-1,1), normalized so sum(|w|)=1",
-    )
-    parser.add_argument("--hidden-size", type=int, default=32)
-    parser.add_argument("--epochs", type=int, default=300)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument(
-        "--dropout", type=float, default=0.1,
-        help="Dropout applied to the LSTM's final hidden state, before the linear head (0 disables it)",
-    )
-    parser.add_argument(
-        "--weight-decay", type=float, default=1e-4,
-        help="L2 penalty on the model weights, passed to Adam (0 disables it)",
-    )
-    parser.add_argument(
-        "--noise-std", type=float, default=0.05,
-        help="Std-dev of Gaussian noise added to the standardized training inputs each epoch (0 disables it)",
-    )
-    parser.add_argument(
-        "--target-vol", type=float, default=0.20,
-        help="Target ANNUALIZED portfolio volatility, e.g. 0.20 = 20%%. Applied right after "
-             "PortfolioLSTM's own weight computation (in training and at evaluation time): weights "
-             "are uniformly rescaled per day so the portfolio's estimated volatility - from the "
-             "realized covariance of the same lookback window - matches this target. FX portfolios "
-             "are typically low-vol, so this usually means scaling weights UP (real leverage); "
-             "nothing downstream (the risk overlay included) scales them again afterwards.",
-    )
-    parser.add_argument(
-        "--n-seeds", type=int, default=1,
-        help="Train this many independent random restarts (different seeds) and combine them via "
-             "--restart-strategy, instead of trusting a single non-convex training run",
-    )
-    parser.add_argument(
-        "--restart-strategy", choices=["best", "ensemble"], default="best",
-        help="Only used when --n-seeds > 1. 'best' keeps the single restart with the highest "
-             "validation Sharpe. 'ensemble' averages all restarts' predicted weights.",
-    )
-    parser.add_argument(
-        "--risk-overlay", action="store_true",
-        help="Also train a RiskLSTM on top (see models/risk_lstm.py) that attenuates these weights "
-             "in (0,1) to de-risk periods with no clear trend, and report raw vs attenuated results",
-    )
-    parser.add_argument("--risk-hidden-size", type=int, default=16, help="Only used with --risk-overlay")
-    parser.add_argument("--risk-epochs", type=int, default=200, help="Only used with --risk-overlay")
-    parser.add_argument("--risk-lr", type=float, default=1e-3, help="Only used with --risk-overlay")
-    parser.add_argument(
-        "--max-attenuation", type=float, default=0.33,
-        help="Only used with --risk-overlay. Hard FLOOR on each asset's attenuation factor, in (0, 1]: "
-             "even at minimum confidence that asset is never de-risked below this fraction of its "
-             "(already vol-targeted) weight; 1 means no attenuation at all (full-size position).",
-    )
-    parser.add_argument(
-        "--risk-rolling-window", type=int, default=10,
-        help="Only used with --risk-overlay. Trailing window (in days, must be < --lookback) the risk "
-             "overlay computes each asset's rolling volatility, skewness, and excess kurtosis over - "
-             "these moments, not raw returns, are what the risk overlay's LSTM actually reads.",
-    )
-    parser.add_argument(
-        "--load-portfolio", default=None,
-        help="Path to a PortfolioLSTM/-ensemble checkpoint saved by --n-seeds/--restart-strategy. "
-             "If given, skips training entirely and just loads it for inference (positions only).",
+#: Default configuration - main.py (the project's single entry point) reads
+#: a JSON file and merges it on top of this dict before wrapping the result
+#: in an argparse.Namespace, so a JSON config only needs to specify keys
+#: that differ from these defaults. "pairs" has no sensible default and
+#: must always be provided by the caller.
+DEFAULT_CONFIG: dict = {
+    # Data
+    "pairs": None,  # REQUIRED - e.g. ["EURUSD", "GBPUSD", "USDJPY"]
+    "lookback": 30,
+    "years": 8,
+    "train_frac": 0.8,
+    # PortfolioLSTM architecture / training
+    "weight_scheme": "softmax",  # "softmax" (long-only) or "tanh_norm" (long/short)
+    "hidden_size": 32,
+    "epochs": 300,
+    "lr": 1e-3,
+    "dropout": 0.1,
+    "weight_decay": 1e-4,
+    "noise_std": 0.05,
+    "target_vol": 0.20,
+    # Multi-seed restarts (see run_pipeline_multi_seed)
+    "n_seeds": 1,
+    "restart_strategy": "best",  # "best" or "ensemble"
+    # Risk overlay (see models/risk_lstm.py)
+    "risk_overlay": False,
+    "risk_hidden_size": 16,
+    "risk_epochs": 200,
+    "risk_lr": 1e-3,
+    "max_attenuation": 0.33,
+    "risk_rolling_window": 10,
+    # Persistence: each of load_portfolio/load_risk accepts EITHER a local
+    # .pt file path OR a quant.model_registry name (see
+    # load_portfolio_model_auto below); save_db additionally persists
+    # whatever gets trained/loaded to Postgres under a deterministic name.
+    "load_portfolio": None,
+    "load_risk": None,
+    "save_db": False,
+    "model_description": "",
+    # Plot output paths (main.py always saves cumulative PnL; the other
+    # two are only used when risk_overlay is true).
+    "output": "models/portfolio_pnl.png",
+    "position_output": "models/risk_position.png",
+    "vol_matched_output": "models/risk_vol_matched_pnl.png",
+}
+
+
+def portfolio_model_name(args: argparse.Namespace) -> str:
+    """Deterministic quant.model_registry name for a PortfolioLSTM/-ensemble
+    trained with `args` - built from the characteristics that actually
+    change the trained model (pairs, weight scheme, lookback, hidden size,
+    target vol), so the same configuration always maps to the same name
+    and re-saving under it is a natural update.
+    """
+    from data.model_registry import build_model_name
+
+    is_ensemble = args.n_seeds > 1 and args.restart_strategy == "ensemble"
+    return build_model_name(
+        "portfolio_ensemble" if is_ensemble else "portfolio",
+        pairs=sorted(args.pairs),
+        weight_scheme=args.weight_scheme,
+        lookback=args.lookback,
+        hidden_size=args.hidden_size,
+        target_vol=args.target_vol,
     )
 
-    parser.add_argument(
-        "--save-portfolio", action="store_true",
-        help="Used by models/portfolio_postprocess.py: save the trained PortfolioLSTM/-ensemble "
-             "checkpoint after plotting (models/portfolio_lstm.py's own CLI always saves by default; "
-             "this flag opts postprocess's plotting run into saving too).",
-    )
-    parser.add_argument(
-        "--load-risk", default=None,
-        help="Path to a RiskLSTM checkpoint (only used with --risk-overlay). If given alongside "
-             "--load-portfolio, skips training the risk overlay too and just loads it.",
-    )
 
-    return parser
+def load_portfolio_model_auto(value: str) -> nn.Module:
+    """Load a PortfolioLSTM/-ensemble from either a local file path or a
+    quant.model_registry name - tries the local file first (so an existing
+    "load_portfolio": "<path>.pt" config keeps working unchanged), and
+    falls back to the database if no such file exists.
+    """
+    if os.path.exists(value):
+        return load_portfolio_model(value)
+    return load_portfolio_model_from_db(value)
 
 
 @dataclass
@@ -699,12 +807,14 @@ def _train_and_evaluate(data: _PreparedData, args: argparse.Namespace) -> Portfo
 
 def load_pipeline(args: argparse.Namespace) -> PortfolioResult:
     """Load a previously-trained PortfolioLSTM (or ensemble) from
-    --load-portfolio and evaluate it on freshly-loaded data - no training
-    happens at all. The checkpoint carries its own x_mean/x_std (fit during
-    its original training run), so new data is standardized identically
-    without needing to reconstruct the original training split.
+    `args.load_portfolio` (a local file path OR a quant.model_registry
+    name - see load_portfolio_model_auto) and evaluate it on freshly-loaded
+    data - no training happens at all. The checkpoint carries its own
+    x_mean/x_std (fit during its original training run), so new data is
+    standardized identically without needing to reconstruct the original
+    training split.
     """
-    model = load_portfolio_model(args.load_portfolio)
+    model = load_portfolio_model_auto(args.load_portfolio)
     data = _prepare_data(args, x_mean=model.x_mean, x_std=model.x_std)
     return evaluate_portfolio_model(model, data, args.weight_scheme, args.target_vol)
 
@@ -772,28 +882,9 @@ def run_pipeline_multi_seed(args: argparse.Namespace) -> PortfolioResult:
     return ensemble_result
 
 
-def main() -> None:
-    parser = build_arg_parser("Train an LSTM portfolio allocator that maximizes Sharpe ratio.")
-    args = parser.parse_args()
-
-    if args.risk_overlay:
-        # --risk-overlay trains PortfolioLSTM and RiskLSTM TOGETHER (joint
-        # training - see models/risk_lstm.py's train_joint_model), so this
-        # delegates the ENTIRE pipeline (data, training, --n-seeds restarts)
-        # to risk_lstm.py rather than training a portfolio-only model here
-        # first - there is no separate "train portfolio alone, then attach
-        # risk" step to run in that case. Deferred import: risk_lstm.py
-        # imports from this module at load time, so importing it back at
-        # module level here would be a circular import.
-        from models.risk_lstm import main as risk_main
-
-        risk_main(args)
-        return
-
-    result = run_pipeline_multi_seed(args)
-    if not args.load_portfolio:
-        result.model.save_model(x_mean=result.x_mean, x_std=result.x_std)
-
+def print_portfolio_sharpe(result: PortfolioResult) -> None:
+    """Log raw (pre-vol-targeting) vs vol-targeted Sharpe ratio and
+    cumulative PnL, for both splits. Used by main.py after training/loading."""
     unscaled_train_sharpe = float(sharpe_ratio(torch.tensor(result.returns_train_unscaled)))
     unscaled_val_sharpe = float(sharpe_ratio(torch.tensor(result.returns_val_unscaled)))
     train_sharpe = float(sharpe_ratio(torch.tensor(result.returns_train)))
@@ -806,7 +897,3 @@ def main() -> None:
         "Out-of-sample (val): raw Sharpe %.3f -> vol-targeted (%.0f%%) Sharpe %.3f | cumulative PnL %.4f",
         unscaled_val_sharpe, result.target_vol * 100, val_sharpe, float(result.returns_val.sum()),
     )
-
-
-if __name__ == "__main__":
-    main()
