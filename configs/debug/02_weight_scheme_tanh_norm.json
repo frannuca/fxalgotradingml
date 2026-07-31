@@ -1,0 +1,15 @@
+{
+  "pairs": [
+    "EURUSD",
+    "GBPUSD",
+    "USDJPY"
+  ],
+  "lookback": 15,
+  "years": 3,
+  "hidden_size": 8,
+  "epochs": 5,
+  "save_db": false,
+  "weight_scheme": "tanh_norm",
+  "output": "configs/debug/output/02_weight_scheme_tanh_norm",
+  "model_description": "Long/short book: tanh(logits) then L1-normalized instead of softmax."
+}

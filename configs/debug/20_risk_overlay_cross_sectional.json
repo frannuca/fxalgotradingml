@@ -1,0 +1,23 @@
+{
+  "pairs": [
+    "EURUSD",
+    "GBPUSD",
+    "USDJPY"
+  ],
+  "lookback": 15,
+  "years": 3,
+  "hidden_size": 8,
+  "epochs": 5,
+  "save_db": false,
+  "risk_overlay": true,
+  "risk_hidden_size": 4,
+  "risk_epochs": 5,
+  "risk_rolling_window": 5,
+  "use_cross_sectional": true,
+  "output": "configs/debug/output/20_risk_overlay_cross_sectional",
+  "position_output": "configs/debug/output/20_risk_overlay_cross_sectional_position.png",
+  "vol_matched_output": "configs/debug/output/20_risk_overlay_cross_sectional_vol_matched.png",
+  "histogram_output": "configs/debug/output/20_risk_overlay_cross_sectional_histogram.png",
+  "transaction_cost_output": "configs/debug/output/20_risk_overlay_cross_sectional_txcost.png",
+  "model_description": "RiskLSTM also sees 3 portfolio-wide channels: average pairwise correlation, correlation dispersion, and top-eigenvalue share of the rolling cross-asset correlation matrix."
+}

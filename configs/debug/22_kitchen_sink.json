@@ -1,0 +1,38 @@
+{
+  "pairs": [
+    "EURUSD",
+    "GBPUSD",
+    "USDJPY"
+  ],
+  "lookback": 15,
+  "years": 3,
+  "hidden_size": 8,
+  "epochs": 5,
+  "save_db": false,
+  "risk_overlay": true,
+  "risk_hidden_size": 4,
+  "risk_epochs": 5,
+  "risk_rolling_window": 5,
+  "has_cash": true,
+  "use_carry": true,
+  "vol_horizons": [
+    5,
+    20
+  ],
+  "use_prev_weight": true,
+  "noisy_head": true,
+  "encoder_type": "per_asset",
+  "asset_combiner": "attention",
+  "pooling": "attention",
+  "covariance_estimator": "ledoit_wolf",
+  "train_frac": 0.7,
+  "test_frac": 0.15,
+  "transaction_cost": 5.0,
+  "use_cross_sectional": true,
+  "output": "configs/debug/output/22_kitchen_sink",
+  "position_output": "configs/debug/output/22_kitchen_sink_position.png",
+  "vol_matched_output": "configs/debug/output/22_kitchen_sink_vol_matched.png",
+  "histogram_output": "configs/debug/output/22_kitchen_sink_histogram.png",
+  "transaction_cost_output": "configs/debug/output/22_kitchen_sink_txcost.png",
+  "model_description": "Everything from this session's feature list turned on at once - a full-integration smoke test."
+}

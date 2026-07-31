@@ -1,0 +1,15 @@
+{
+  "pairs": [
+    "EURUSD",
+    "GBPUSD",
+    "USDJPY"
+  ],
+  "lookback": 15,
+  "years": 3,
+  "hidden_size": 8,
+  "epochs": 5,
+  "save_db": false,
+  "objective": "kelly",
+  "output": "configs/debug/output/13_objective_kelly",
+  "model_description": "Training objective: negative expected log-wealth growth (Kelly criterion) instead of the rolling-window Sharpe/Sortino ratio."
+}

@@ -1,0 +1,16 @@
+{
+  "pairs": [
+    "EURUSD",
+    "GBPUSD",
+    "USDJPY"
+  ],
+  "lookback": 15,
+  "years": 3,
+  "hidden_size": 8,
+  "epochs": 5,
+  "save_db": false,
+  "covariance_estimator": "ewma",
+  "ewma_lambda": 0.94,
+  "output": "configs/debug/output/11_covariance_ewma",
+  "model_description": "Volatility targeting uses an exponentially-weighted (RiskMetrics-style) covariance estimate instead of the plain sample covariance."
+}

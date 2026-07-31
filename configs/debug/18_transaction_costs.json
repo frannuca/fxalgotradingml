@@ -1,0 +1,15 @@
+{
+  "pairs": [
+    "EURUSD",
+    "GBPUSD",
+    "USDJPY"
+  ],
+  "lookback": 15,
+  "years": 3,
+  "hidden_size": 8,
+  "epochs": 5,
+  "save_db": false,
+  "transaction_cost": 10.0,
+  "output": "configs/debug/output/18_transaction_costs",
+  "model_description": "Turnover-based transaction costs (10 bps) subtracted INSIDE the training loss, not just applied post-hoc for reporting."
+}

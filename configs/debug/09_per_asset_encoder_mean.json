@@ -1,0 +1,16 @@
+{
+  "pairs": [
+    "EURUSD",
+    "GBPUSD",
+    "USDJPY"
+  ],
+  "lookback": 15,
+  "years": 3,
+  "hidden_size": 8,
+  "epochs": 5,
+  "save_db": false,
+  "encoder_type": "per_asset",
+  "asset_combiner": "mean",
+  "output": "configs/debug/output/09_per_asset_encoder_mean",
+  "model_description": "Same shared per-asset encoder, but assets are combined via a plain mean-pool instead of attention."
+}

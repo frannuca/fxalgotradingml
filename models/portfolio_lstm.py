@@ -1924,6 +1924,14 @@ DEFAULT_CONFIG: dict = {
     #   "cvar"   - mean return net of a fixed-weight CVaR tail-risk penalty
     #              (`cvar_kappa`). Convex, at the cost of that fixed weight.
     "objective": "sharpe",
+    # Also reused by RiskLSTM's own training loss (train_risk_model) - it
+    # scores the SAME rolling-window ratio, regardless of PortfolioLSTM's
+    # own `objective` choice, rather than a single whole-period Sharpe: a
+    # single aggregate scalar over the whole training period is a very
+    # weak gradient signal for genuinely DAY-TO-DAY attenuation, and
+    # empirically converges toward an attenuation that's nearly constant
+    # per asset over time - directly undermining the point of a risk
+    # overlay that's supposed to react to changing conditions.
     "sharpe_window": 60,
     "cvar_alpha": 0.95,  # confidence level for CVaR - the worst (1 - alpha) fraction of days
     "cvar_kappa": 1.0,   # fixed risk-aversion weight on CVaR in the "cvar" objective

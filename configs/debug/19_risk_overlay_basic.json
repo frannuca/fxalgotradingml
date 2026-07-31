@@ -1,0 +1,22 @@
+{
+  "pairs": [
+    "EURUSD",
+    "GBPUSD",
+    "USDJPY"
+  ],
+  "lookback": 15,
+  "years": 3,
+  "hidden_size": 8,
+  "epochs": 5,
+  "save_db": false,
+  "risk_overlay": true,
+  "risk_hidden_size": 4,
+  "risk_epochs": 5,
+  "risk_rolling_window": 5,
+  "output": "configs/debug/output/19_risk_overlay_basic",
+  "position_output": "configs/debug/output/19_risk_overlay_basic_position.png",
+  "vol_matched_output": "configs/debug/output/19_risk_overlay_basic_vol_matched.png",
+  "histogram_output": "configs/debug/output/19_risk_overlay_basic_histogram.png",
+  "transaction_cost_output": "configs/debug/output/19_risk_overlay_basic_txcost.png",
+  "model_description": "RiskLSTM overlay with its defaults: per-asset rolling std/skew/kurtosis of the weighted PnL path, no cross-sectional features, last-hidden-state pooling."
+}

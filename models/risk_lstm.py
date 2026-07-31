@@ -79,6 +79,7 @@ from models.portfolio_lstm import (
     _check_stop,
     _report_epoch,
     apply_transaction_costs_torch,
+    rolling_window_ratio,
     run_pipeline_multi_seed as run_portfolio_pipeline,
     sharpe_ratio,
 )
@@ -655,6 +656,7 @@ def train_risk_model(
     weight_decay: float = 0.0,
     noise_std: float = 0.0,
     transaction_cost: float = 0.0,
+    sharpe_window: int = 60,
     features_val: torch.Tensor | None = None,
     portfolio_weights_val: torch.Tensor | None = None,
     next_returns_val: torch.Tensor | None = None,
@@ -679,6 +681,20 @@ def train_risk_model(
     (of the FINAL, attenuated weights) before computing Sharpe - see
     apply_transaction_costs_torch in portfolio_lstm.py - so RiskLSTM learns
     to avoid attenuation patterns that cause abrupt, costly weight swings.
+
+    The TRAINING loss is the same rolling-window (`sharpe_window`-day
+    sub-window, Sortino-style downside) ratio PortfolioLSTM's own default
+    "sharpe" objective uses (see rolling_window_ratio) - NOT the plain
+    whole-period Sharpe. A single whole-period scalar is a very weak
+    gradient signal for genuinely DAY-TO-DAY reactivity: empirically (a
+    controlled before/after test on identical data/seed), training against
+    it alone converges to an attenuation that's nearly CONSTANT per asset
+    over time - directly undermining RiskLSTM's whole purpose, which is to
+    size positions down specifically during locally unstable windows, not
+    to apply one fixed per-asset derating. Scoring many overlapping
+    sub-windows instead measurably increased attenuation's realized
+    day-to-day variance (3-10x in that test) with everything else held
+    fixed.
 
     `noise_std` > 0 perturbs `features_train` directly each epoch (not the
     raw returns underneath it, since those are no longer recomputed inside
@@ -716,7 +732,7 @@ def train_risk_model(
             scaled_weights = portfolio_weights_train * attenuation                  # elementwise, per asset
             portfolio_returns = (scaled_weights * next_returns_train).sum(dim=-1)   # (n_train,)
             portfolio_returns = apply_transaction_costs_torch(scaled_weights, portfolio_returns, transaction_cost)
-            loss = -sharpe_ratio(portfolio_returns)
+            loss = -rolling_window_ratio(portfolio_returns, window=sharpe_window, downside=True)
             loss.backward()
             optimizer.step()
 
@@ -741,7 +757,7 @@ def train_risk_model(
                             )
                     risk_model.train()
                 logger.info(
-                    "epoch %d/%d - train Sharpe (attenuated, net of costs) %.4f | mean attenuation %.3f%s",
+                    "epoch %d/%d - train loss (rolling-window ratio, attenuated, net of costs) %.4f | mean attenuation %.3f%s",
                     epoch, epochs, -loss.item(), attenuation.mean().item(), val_msg,
                 )
                 _report_epoch("risk_overlay", epoch, epochs, portfolio_returns, val_returns, test_returns)
@@ -1029,6 +1045,7 @@ def _train_one_risk_model(portfolio_result: PortfolioResult, args: argparse.Name
         epochs=args.risk_epochs, lr=args.risk_lr,
         weight_decay=args.weight_decay, noise_std=args.noise_std,
         transaction_cost=args.transaction_cost,
+        sharpe_window=getattr(args, "sharpe_window", 60),
         features_val=features_val, portfolio_weights_val=weights_val, next_returns_val=next_returns_val,
         features_test=features_test, portfolio_weights_test=weights_test, next_returns_test=next_returns_test,
     )
