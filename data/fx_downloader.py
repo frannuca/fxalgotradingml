@@ -108,7 +108,7 @@ def main() -> None:
     parser.add_argument(
         "--output-dir", type=Path, default=Path("data/raw"), help="Directory to store CSV files."
     )
-    parser.add_argument("--years", type=int, default=20, help="Years of history to fetch.")
+    parser.add_argument("--years", type=int, default=60, help="Years of history to fetch.")
     parser.add_argument(
         "--pairs",
         nargs="+",
@@ -127,8 +127,7 @@ def main() -> None:
     data = downloader.download_and_save_all(selected)
 
     if args.upload:
-        from fx_forecasting.data.db import upsert_pairs
-
+        from db import upsert_pairs
         upsert_pairs(data)
 
 

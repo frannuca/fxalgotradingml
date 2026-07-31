@@ -1,0 +1,1619 @@
+\documentclass[11pt]{article}
+
+% ---------------------------------------------------------------------------
+% Packages
+% ---------------------------------------------------------------------------
+\usepackage[a4paper,margin=2.4cm]{geometry}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{caption}
+\usepackage{listings}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,fit,backgrounds,shapes.geometric,calc}
+\usepackage{fancyhdr}
+\usepackage{titlesec}
+\usepackage[colorlinks=true,linkcolor=blue!50!black,citecolor=blue!50!black,urlcolor=blue!50!black,bookmarksopen=true]{hyperref}
+\usepackage{parskip}
+\usepackage{float}
+\usepackage[framemethod=default]{mdframed}
+
+% ---------------------------------------------------------------------------
+% Colors
+% ---------------------------------------------------------------------------
+\definecolor{codebg}{RGB}{246,248,250}
+\definecolor{codeframe}{RGB}{210,214,220}
+\definecolor{kwcolor}{RGB}{175,40,40}
+\definecolor{strcolor}{RGB}{30,110,40}
+\definecolor{cmtcolor}{RGB}{110,110,110}
+\definecolor{numcolor}{RGB}{30,80,160}
+\definecolor{boxblue}{RGB}{235,242,250}
+\definecolor{boxgreen}{RGB}{233,246,238}
+\definecolor{boxamber}{RGB}{252,244,228}
+\definecolor{boxgray}{RGB}{240,240,240}
+\definecolor{boxviolet}{RGB}{240,235,250}
+
+% ---------------------------------------------------------------------------
+% Listings style (Python)
+% ---------------------------------------------------------------------------
+\lstdefinestyle{py}{
+  language=Python,
+  backgroundcolor=\color{codebg},
+  rulecolor=\color{codeframe},
+  frame=single,
+  framerule=0.4pt,
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{kwcolor}\bfseries,
+  stringstyle=\color{strcolor},
+  commentstyle=\color{cmtcolor}\itshape,
+  numberstyle=\tiny\color{numcolor},
+  numbers=left,
+  numbersep=8pt,
+  showstringspaces=false,
+  breaklines=true,
+  breakatwhitespace=false,
+  tabsize=4,
+  columns=fullflexible,
+  captionpos=b,
+  xleftmargin=1.2em,
+  xrightmargin=0.2em,
+  aboveskip=8pt,
+  belowskip=6pt,
+}
+\lstset{style=py}
+
+\newcommand{\srcref}[1]{\hfill\textcolor{cmtcolor}{\footnotesize\texttt{#1}}}
+\newcommand{\code}[1]{\texttt{\small #1}}
+
+% ---------------------------------------------------------------------------
+% Rationale / decision boxes (mdframed - properly balanced environments)
+% ---------------------------------------------------------------------------
+\mdfdefinestyle{calloutbase}{
+  linewidth=0pt, innertopmargin=6pt, innerbottommargin=6pt,
+  innerleftmargin=8pt, innerrightmargin=8pt,
+  skipabove=8pt, skipbelow=8pt, roundcorner=3pt,
+}
+\newmdenv[style=calloutbase, backgroundcolor=boxblue]{rationale}
+\newmdenv[style=calloutbase, backgroundcolor=boxgray]{dims}
+\newmdenv[style=calloutbase, backgroundcolor=boxamber]{optional}
+\newmdenv[style=calloutbase, backgroundcolor=boxviolet]{fixnote}
+
+\newcommand{\rationalelabel}{\small\textbf{Rationale.}~}
+\newcommand{\dimslabel}{\small\textbf{Tensor shapes.}~}
+\newcommand{\optionallabel}{\small\textbf{Optional component (opt-in, default off).}~}
+\newcommand{\fixnotelabel}{\small\textbf{Implementation note.}~}
+
+% ---------------------------------------------------------------------------
+% Header/footer
+% ---------------------------------------------------------------------------
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small FX Portfolio Allocation \& Risk Overlay --- Methodology}
+\fancyhead[R]{\small\thepage}
+\renewcommand{\headrulewidth}{0.3pt}
+
+\titleformat{\section}{\normalfont\Large\bfseries}{\thesection}{0.6em}{}
+\titleformat{\subsection}{\normalfont\large\bfseries}{\thesubsection}{0.6em}{}
+\titleformat{\subsubsection}{\normalfont\bfseries}{\thesubsubsection}{0.6em}{}
+
+\title{\vspace{-1.5cm}\textbf{Methodology: A Sequential LSTM Portfolio Allocator\\ with a Learned Risk-Attenuation Overlay}\\[6pt]
+\large Architecture, Mathematical Formulation, and Implementation Reference}
+\author{Repository: \texttt{mlforecasting} \\ Modules: \texttt{models/portfolio\_lstm.py}, \texttt{models/risk\_lstm.py}, \texttt{api/server.py}}
+\date{\today}
+
+\begin{document}
+\maketitle
+\thispagestyle{empty}
+
+\begin{abstract}
+\noindent
+This document describes, in full mathematical and implementation detail, an FX portfolio
+allocation system consisting of two independently-trained neural networks applied
+\emph{sequentially}: (1) \textbf{PortfolioLSTM}, which maps a rolling window of multi-asset
+FX log returns (optionally augmented with interest-rate carry and vol-normalized momentum
+features) to a portfolio weight vector, followed by a volatility-targeting rescaling step;
+and (2) \textbf{RiskLSTM}, an optional overlay trained \emph{on top of} the frozen portfolio
+decisions, which learns a per-asset attenuation factor in $[\text{max\_attenuation}, 1]$ that
+scales down positions when an asset's recent (marginal) and portfolio-wide (cross-sectional)
+risk statistics look unstable. Every architectural choice is presented alongside its
+rationale, the exact tensor shapes at each stage, the governing mathematical expression, the
+source file and line range implementing it, and -- where relevant -- the optional variants
+that can be toggled via configuration. Two full architecture diagrams and a data-flow diagram
+are included. The document closes with a complete configuration reference and a summary
+table of every design decision and its motivation.
+\end{abstract}
+
+\vspace{0.3cm}
+\tableofcontents
+\newpage
+
+% =============================================================================
+\section{Notation and Conventions}
+% =============================================================================
+
+Throughout this document, matrix and tensor dimensions are written using the following
+symbols, matching the variable names used in code wherever possible:
+
+\begin{center}
+\renewcommand{\arraystretch}{1.25}
+\begin{tabular}{@{}cll@{}}
+\toprule
+\textbf{Symbol} & \textbf{Code name} & \textbf{Meaning} \\
+\midrule
+$B$ & \texttt{batch} / \texttt{n\_samples} & Number of decision samples in a batch (a full training split, in full-batch training) \\
+$L$ & \texttt{lookback} & Sequence length: number of trailing days in one input window \\
+$N$ & \texttt{n\_assets} & Number of tradable assets (FX pairs, plus \texttt{CASH} if enabled) \\
+$C$ & \texttt{n\_channels} & Feature channels per asset (1 = raw return only; $>1$ with carry/vol-norm features) \\
+$H$ & \texttt{hidden\_size} & LSTM hidden state width \\
+$W$ & \texttt{rolling\_window} (risk) & Trailing window (days) for RiskLSTM's rolling statistics \\
+$K$ & \texttt{risk\_rolling\_window}$-1$ & Samples dropped from each split when building RiskLSTM sequences \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+A raw daily log-return vector is $r_t \in \mathbb{R}^N$, so an input window for one decision
+sample is $X_i \in \mathbb{R}^{L \times NC}$ (flattened as $L \times NC$ in the asset-major
+layout described in \S\ref{sec:features}), a full split's worth of input windows is a rank-3
+tensor $X \in \mathbb{R}^{B \times L \times NC}$, and the portfolio weight vector for sample
+$i$ is $w_i \in \mathbb{R}^N$. Superscript ``raw'' denotes the pre-standardization / pre-vol-targeting
+quantity; a hat ($\hat{\cdot}$) denotes a model estimate. All neural network code is
+PyTorch; \code{nn.LSTM} is always instantiated with \code{batch\_first=True}, so its own
+input/output convention is $(\text{batch}, \text{time}, \text{features})$, matching the
+convention used throughout this document.
+
+Every feature described below is a \textbf{configuration flag with a documented default} --
+Section~\ref{sec:config} tabulates the full set. Features whose default is \emph{off} are
+marked with an \textbf{Optional component} box; enabling them changes the effective network
+input/output width, which is always noted explicitly.
+
+% =============================================================================
+\section{System Overview}
+% =============================================================================
+
+The system trains two networks \emph{sequentially and independently} -- never jointly.
+Figure~\ref{fig:pipeline} shows the full data flow, from raw prices to reported PnL.
+
+\begin{enumerate}[label=\textbf{Stage \arabic*.}, leftmargin=2.2cm]
+  \item \textbf{Data \& features} (\S\ref{sec:data}): daily close prices $\to$ log returns
+    $\to$ optional carry / vol-normalized-momentum channels $\to$ rolling windows $\to$
+    chronological train/validation/test split $\to$ per-feature standardization.
+  \item \textbf{PortfolioLSTM} (\S\ref{sec:portfolio}): maps each window to a raw weight
+    vector $\hat w_i^{\text{raw}}$, trained end-to-end (full-batch, over the whole training
+    period at once) against a chosen risk-adjusted objective (\S\ref{sec:objectives}), net of
+    transaction costs (\S\ref{sec:txcost}).
+  \item \textbf{Volatility targeting} (\S\ref{sec:voltarget}): $\hat w_i^{\text{raw}}$ is
+    rescaled so the portfolio's \emph{estimated} annualized volatility matches a target (e.g.\
+    20\%), using one of three covariance estimators.
+  \item \textbf{RiskLSTM overlay} (\S\ref{sec:risklstm}, \textbf{optional}): frozen
+    PortfolioLSTM output is fed, together with rolling per-asset risk statistics and
+    (optionally) cross-sectional market-structure statistics, to a second network that
+    outputs a per-asset attenuation factor in $[\text{max\_attenuation},1]$.
+  \item \textbf{Reporting} (\S\ref{sec:benchmark}): realized PnL, Sharpe ratios, and an
+    inverse-volatility benchmark (vol-matched to the model) are computed on all three splits.
+\end{enumerate}
+
+\begin{figure}[H]
+\centering
+\resizebox{\textwidth}{!}{%
+\begin{tikzpicture}[
+  node distance=7mm and 11mm,
+  every node/.style={font=\small},
+  box/.style={draw, rounded corners=2pt, minimum height=9mm, align=center, inner sep=4pt, line width=0.6pt},
+  data/.style={box, fill=boxgray},
+  net/.style={box, fill=boxblue},
+  risk/.style={box, fill=boxamber},
+  bench/.style={box, fill=boxviolet},
+  opt/.style={dashed},
+  arr/.style={-Latex, line width=0.7pt}
+]
+\node[data] (prices) {Close prices\\ \texttt{load\_close\_prices}};
+\node[data, right=of prices] (returns) {Log returns\\ $r_t = \log(p_t/p_{t-1})$};
+\node[data, right=of returns] (features) {Features\\ ret / carry / vol-norm\\ \texttt{build\_feature\_dataframe}};
+\node[data, right=of features] (windows) {Rolling windows\\ $X\!\in\!\mathbb{R}^{B\times L\times NC}$\\ \texttt{make\_portfolio\_sequences}};
+\node[data, below=of windows] (split) {3-way chronological split\\ train / val / test\\ \texttt{\_prepare\_data}};
+
+\node[net, below=of features] (plstm) {\textbf{PortfolioLSTM}\\ concat- or per-asset encoder\\ $\to \hat w^{\text{raw}}$};
+\node[net, below=of returns] (voltarget) {Volatility targeting\\ $\hat\Sigma \in \{$sample, EWMA, LW$\}$\\ $\hat w = \hat w^{\text{raw}}\!\cdot\!\min(\text{target}/\hat\sigma,\,\text{max\_lev})$};
+
+\node[risk, below=of prices, xshift=-0mm] (risklstm) {\textbf{RiskLSTM} (optional)\\ marginal + cross-sectional risk\\ $\to$ attenuation $a\in[\text{maxatt},1]^N$};
+\node[net, below=of risklstm, yshift=-2mm] (final) {Final weights\\ $w^{\text{final}} = \hat w \odot a$\\ (or $\hat w$ if no overlay)};
+
+\node[bench, below=of voltarget, yshift=-8mm] (txcost) {Transaction costs\\ \texttt{apply\_transaction\_costs}};
+\node[bench, below=of txcost] (pnl) {Realized PnL, Sharpe\\ vs.\ inverse-vol benchmark};
+
+\draw[arr] (prices) -- (returns);
+\draw[arr] (returns) -- (features);
+\draw[arr] (features) -- (windows);
+\draw[arr] (windows) -- (split);
+\draw[arr] (split.west) -| (plstm.north);
+\draw[arr] (plstm) -- (voltarget);
+\draw[arr] (voltarget.south) |- (risklstm.east);
+\draw[arr, opt] (voltarget.south) |- ([yshift=6mm]final.east) -- (final.east);
+\draw[arr] (risklstm) -- (final);
+\draw[arr] (final) |- (txcost);
+\draw[arr] (txcost) -- (pnl);
+\end{tikzpicture}%
+}
+\caption{End-to-end pipeline. Dashed arrow: when the risk overlay is disabled, vol-targeted
+weights flow directly to the final-weights stage with $a\equiv 1$. Grey = data/feature
+engineering, blue = PortfolioLSTM \& volatility targeting, amber = RiskLSTM overlay, violet =
+reporting.}
+\label{fig:pipeline}
+\end{figure}
+
+\begin{rationale}\rationalelabel
+The two networks are trained \emph{sequentially}, not jointly: PortfolioLSTM is trained (or
+loaded) to completion first, with \emph{no notion} that a risk overlay might follow;
+RiskLSTM is then trained on the frozen, already-decided portfolio purely to improve its
+realized Sharpe ratio by learning \emph{when to size it down}. This separation keeps each
+network's optimization problem well-posed and interpretable: PortfolioLSTM's gradient
+signal is entirely about \emph{which assets to hold}, while RiskLSTM's gradient signal is
+entirely about \emph{how much of the already-chosen book to actually take}. A joint
+objective would conflate the two and make it impossible to attribute a Sharpe improvement to
+either network individually.
+\end{rationale}
+
+% =============================================================================
+\section{Data Pipeline and Feature Engineering}
+\label{sec:data}
+% =============================================================================
+
+\subsection{Price loading and log returns}
+
+\begin{lstlisting}[caption={Log-return conversion.}, label=lst:logret]
+def to_log_returns(prices: pd.DataFrame) -> pd.DataFrame:
+    """Convert a price DataFrame to log returns: r_t = log(p_t / p_t-1)."""
+    return np.log(prices / prices.shift(1)).dropna()
+\end{lstlisting}
+\srcref{models/portfolio\_lstm.py:189--191}
+
+For close price $p_t$, the log return is
+\begin{equation}
+  r_t = \log\!\left(\frac{p_t}{p_{t-1}}\right), \qquad r_t \in \mathbb{R}^{N_{\text{real}}}
+  \label{eq:logret}
+\end{equation}
+where $N_{\text{real}}$ is the number of \emph{real} (non-\texttt{CASH}) tradable pairs.
+\code{load\_close\_prices} (lines 165--192) fetches an inner-joined (dropna'd), wide
+price DataFrame -- one column per pair, indexed by date -- via \code{data/db.py}, downloading
+and upserting any missing pair through \code{FXDownloader} on demand.
+
+\begin{rationale}\rationalelabel
+Log returns (rather than simple returns) are used because they are additive across time
+($\sum_t r_t = \log(p_T/p_0)$) and because standard deviation/variance formulas for
+volatility targeting and risk-factor decomposition assume additivity of the underlying
+process.
+\end{rationale}
+
+\subsection{Feature engineering: carry and vol-normalized momentum}
+\label{sec:features}
+
+\begin{optional}\optionallabel
+Two additional per-asset feature channels can be enabled independently: FX \textbf{carry}
+(\texttt{use\_carry}) and \textbf{vol-normalized momentum} at one or more horizons
+(\texttt{vol\_horizons}). Both default to \emph{off} ($C=1$: raw return only).
+\end{optional}
+
+\paragraph{Carry.} For a pair with base currency $b$ and quote currency $q$ (e.g.\
+\texttt{EURUSD} $\Rightarrow b=$EUR, $q=$USD), carry is the interest-rate differential:
+\begin{equation}
+  \text{carry}_t^{(b,q)} = \frac{\rho_t^{(b)} - \rho_t^{(q)}}{100}
+  \label{eq:carry}
+\end{equation}
+where $\rho_t^{(c)}$ is currency $c$'s short-term policy rate (percentage points, from FRED,
+monthly frequency) at time $t$, divided by 100 to bring it to the same order of magnitude as
+a log return. Reindexed onto the daily returns index with \textbf{forward-fill only}
+(never back-filled) so that no future rate print ever leaks into an earlier day; any day
+before the first available print is set to a neutral $0$.
+
+\begin{lstlisting}[caption={Carry construction (forward-fill only -- no look-ahead).}, label=lst:carry]
+diff = (rates[base] - rates[quote]) / 100.0   # percentage points -> decimal
+carry[pair] = diff.reindex(carry.index, method="ffill").fillna(0.0)
+\end{lstlisting}
+\srcref{models/portfolio\_lstm.py:207--241 (function \texttt{load\_carry})}
+
+\paragraph{Vol-normalized momentum.} For horizon $h$ (days),
+\begin{equation}
+  \text{volnorm}_t^{(h)} = \frac{\sum_{k=0}^{h-1} r_{t-k}}{\sigma_h(r)_t + \epsilon}, \qquad
+  \sigma_h(r)_t = \mathrm{std}\big(r_{t-h+1},\dots,r_t\big),\quad \epsilon=10^{-8}
+  \label{eq:volnorm}
+\end{equation}
+i.e.\ the trailing $h$-day cumulative return divided by the trailing $h$-day realized
+volatility -- a standard risk-adjusted momentum/reversal signal, comparable across assets
+and volatility regimes.
+
+\begin{lstlisting}[caption={Vol-normalized return at horizon $h$.}, label=lst:volnorm]
+cum_return = returns.rolling(h).sum()
+vol = returns.rolling(h).std() + eps
+normalized = cum_return / vol
+\end{lstlisting}
+\srcref{models/portfolio\_lstm.py:244--265 (function \texttt{vol\_normalized\_returns})}
+
+\paragraph{Asset-major channel layout.} When either optional feature is enabled, $C =
+1 + \mathbb{1}[\texttt{use\_carry}] + |\texttt{vol\_horizons}|$, and the feature tensor is
+laid out \textbf{asset-major}: all of one asset's $C$ channels are contiguous, then the next
+asset's:
+\begin{equation}
+  \text{features} = \big[\,
+    \underbrace{r^{(1)}, \text{carry}^{(1)}, \text{volnorm}^{(1,h_1)}, \dots}_{\text{asset }1,\ C\text{ channels}},\;
+    \underbrace{r^{(2)}, \dots}_{\text{asset }2},\; \dots
+  \,\big] \in \mathbb{R}^{T \times NC}
+  \label{eq:assetmajor}
+\end{equation}
+with \textbf{channel 0 of every asset's block always the raw return} -- this invariant is
+relied on later to recover a raw-returns-only view (channel-stride slicing
+$X[:,:,0::C]$) for volatility targeting and for RiskLSTM's input reconstruction, without
+carrying a separate copy of the raw series.
+
+\begin{lstlisting}[caption={Asset-major feature assembly.}, label=lst:buildfeat]
+def build_feature_dataframe(returns, pairs, use_carry, vol_horizons, years):
+    n_channels = 1 + int(use_carry) + len(vol_horizons)
+    ...
+    for pair in pairs:
+        features[f"{pair}_ret"] = returns[pair]
+        if use_carry:
+            features[f"{pair}_carry"] = carry[pair]
+        for h in vol_horizons:
+            features[f"{pair}_vol{h}"] = vol_norm[f"{pair}_vol{h}"]
+    features = features.ffill().fillna(0.0)   # never back-filled
+    assert features.shape[1] == n_channels * len(pairs)
+\end{lstlisting}
+\srcref{models/portfolio\_lstm.py:268--306}
+
+\begin{rationale}\rationalelabel
+Asset-major (rather than channel-major, i.e.\ all returns then all carries) ordering is
+chosen deliberately so that a \emph{contiguous slice} of the feature axis always belongs to
+exactly one asset -- this is exactly what the per-asset shared encoder
+(\S\ref{sec:perasset}) needs to slice out each asset's own window with a single reshape, and
+what the raw-return-recovery stride trick needs.
+\end{rationale}
+
+\subsection{Rolling window construction}
+
+\begin{lstlisting}[caption={Building lookback windows and next-day targets.}, label=lst:seq]
+def make_portfolio_sequences(returns, lookback, feature_returns=None):
+    values = returns.to_numpy(dtype=np.float32)            # (T, N)
+    feature_values = feature_returns.to_numpy(...) if feature_returns is not None else values
+    for start in range(max(len(values) - lookback, 0)):
+        day_t = start + lookback - 1
+        X.append(feature_values[start : day_t + 1])          # (L, N*C)
+        next_returns.append(values[day_t + 1])                # (N,)
+        dates.append(index[day_t + 1])
+\end{lstlisting}
+\srcref{models/portfolio\_lstm.py:314--364}
+
+For each decision day $t$ (indexed by sample $i$), the window
+\begin{equation}
+  X_i = \big[\,\text{features}_{t-L+1},\ \dots,\ \text{features}_{t}\,\big] \in \mathbb{R}^{L\times NC}
+\end{equation}
+is the model's input, and the realized \emph{next-day} return $r_{t+1}\in\mathbb{R}^N$ (raw,
+un-featurized -- always the plain log return, regardless of $C$) is the target used to
+compute realized PnL: $\text{pnl}_i = w_i^\top r_{t+1}$.
+
+\begin{dims}\dimslabel
+$X \in \mathbb{R}^{B\times L \times NC}$ where $B = T - L$ ($T$ = number of usable days of
+history); \code{next\_returns} $\in \mathbb{R}^{B\times N}$.
+\end{dims}
+
+\subsection{Standardization}
+
+Per-feature mean/std are fit \textbf{only on the training split} and reused, unchanged, for
+validation and test (and, when loading a saved model, restored from its checkpoint rather
+than refit):
+\begin{equation}
+  \mu = \mathrm{mean}_{(B,L)}\big(X^{\text{train,raw}}\big),\qquad
+  \sigma = \mathrm{std}_{(B,L)}\big(X^{\text{train,raw}}\big) + 10^{-8},\qquad
+  \mu,\sigma \in \mathbb{R}^{NC}
+\end{equation}
+\begin{equation}
+  X^{\text{split}} = \frac{X^{\text{split,raw}} - \mu}{\sigma}, \qquad \text{split}\in\{\text{train},\text{val},\text{test}\}
+\end{equation}
+\srcref{models/portfolio\_lstm.py:2150--2158 (in \texttt{\_prepare\_data})}
+
+\begin{rationale}\rationalelabel
+Standardizing with train-only statistics (never refit on validation/test) prevents any
+information about the held-out splits' scale from leaking into what the network sees as
+``normal.'' The $+10^{-8}$ epsilon safely handles a zero-variance channel -- e.g.\ a
+constant-return \texttt{CASH} column, or \texttt{carry} for a currency pair FRED has no rate
+data for -- without a division-by-zero.
+\end{rationale}
+
+% =============================================================================
+\section{Chronological Train / Validation / Test Split}
+\label{sec:split}
+% =============================================================================
+
+\begin{lstlisting}[caption={3-way chronological split.}, label=lst:split]
+test_frac = getattr(args, "test_frac", 0.0) or 0.0
+n_total = len(X)
+n_test = int(n_total * test_frac)
+n_remaining = n_total - n_test
+n_train = int(n_remaining * args.train_frac)
+
+X_full_train_raw = X[:n_train]
+X_full_val_raw   = X[n_train:n_remaining]
+X_full_test_raw  = X[n_remaining:]
+\end{lstlisting}
+\srcref{models/portfolio\_lstm.py:2131--2148 (\texttt{\_prepare\_data})}
+
+The split is strictly \textbf{chronological}: the most recent $\texttt{test\_frac}$ fraction
+of \emph{all} samples is carved off \emph{first} as the test set, and \texttt{train\_frac} is
+then applied to whatever remains:
+\begin{align}
+  n_{\text{test}} &= \lfloor n_{\text{total}} \cdot \texttt{test\_frac} \rfloor \\
+  n_{\text{remaining}} &= n_{\text{total}} - n_{\text{test}} \\
+  n_{\text{train}} &= \lfloor n_{\text{remaining}} \cdot \texttt{train\_frac} \rfloor \\
+  n_{\text{val}} &= n_{\text{remaining}} - n_{\text{train}}
+\end{align}
+With defaults $\texttt{train\_frac}=0.8,\ \texttt{test\_frac}=0.1$: the oldest 72\% of history
+is train, the next 18\% is validation, and the most recent 10\% is test.
+$\texttt{test\_frac}=0$ recovers the original 2-way split exactly ($n_{\text{test}}=0$).
+
+\begin{rationale}\rationalelabel
+\textbf{The test set is held out from every training and model-selection decision} --
+unlike validation, whose Sharpe ratio \emph{does} drive best-epoch checkpoint selection
+(\S\ref{sec:trainloop}), the test split's returns are computed every epoch purely for live
+\emph{display} and never influence which epoch's weights get kept. This is what makes test
+performance a genuinely unbiased read on generalization: a model that overfits validation by
+sheer trial-and-error across many configurations would still be caught by test, since test
+was never available to that selection process at all. Carving test off \emph{before}
+train/val (rather than, say, taking a random subset) preserves the temporal ordering assumed
+by a real backtest -- the model never trains on data from \emph{after} the days it is
+ultimately evaluated on.
+\end{rationale}
+
+% =============================================================================
+\section{PortfolioLSTM}
+\label{sec:portfolio}
+% =============================================================================
+
+PortfolioLSTM maps an input window $X_i \in \mathbb{R}^{L\times NC}$ to a portfolio weight
+vector $\hat w_i \in \mathbb{R}^N$. Two encoder architectures are available
+(\texttt{encoder\_type}), sharing everything downstream of the encoder (temporal pooling,
+weight scheme, previous-weight feedback).
+
+\begin{figure}[H]
+\centering
+\resizebox{\textwidth}{!}{%
+\begin{tikzpicture}[
+  node distance=6mm and 9mm,
+  every node/.style={font=\small},
+  box/.style={draw, rounded corners=2pt, minimum height=8mm, align=center, inner sep=4pt, line width=0.6pt},
+  inbox/.style={box, fill=boxgray},
+  lstmbox/.style={box, fill=boxblue},
+  attn/.style={box, fill=boxviolet},
+  headbox/.style={box, fill=boxamber},
+  arr/.style={-Latex, line width=0.7pt}
+]
+% Concat branch
+\node[inbox] (xc) {$X_i \in \mathbb{R}^{L\times NC}$};
+\node[lstmbox, right=of xc] (lstmc) {Shared LSTM\\ input size $NC$\\ hidden size $H$};
+\node[attn, right=of lstmc] (poolc) {Pooling\\ $h_n[-1]$ or\\ attention pool};
+\node[headbox, right=of poolc] (headc) {Head\\ $\mathbb{R}^{H(+N)}\!\to\!\mathbb{R}^N$};
+
+% Per-asset branch (below)
+\node[inbox, below=16mm of xc] (xp) {$X_i$ reshaped\\ $\to (N,\,L,\,C)$};
+\node[lstmbox, right=of xp] (lstmp) {\textbf{Shared} per-asset LSTM\\ input size $C$, batched $N\!\times$\\ hidden size $H$};
+\node[attn, right=of lstmp] (poolp) {Pooling (per asset)\\ $\to (N,H)$};
+\node[attn, right=of poolp] (cross) {Cross-asset combiner\\ self-attn or mean-pool\\ $\to$ context $(N,H)$};
+\node[headbox, right=of cross] (headp) {\textbf{Shared} per-asset head\\ $\mathbb{R}^{2H(+1)}\!\to\!\mathbb{R}$};
+
+\node[box, fill=boxgreen, right=15mm of headc, yshift=-8mm] (softmax) {Weight scheme\\ softmax or tanh-L1};
+\node[box, fill=boxgreen, below=6mm of softmax] (out) {$\hat w_i^{\text{raw}} \in \mathbb{R}^N$};
+
+\draw[arr] (xc) -- (lstmc);
+\draw[arr] (lstmc) -- (poolc);
+\draw[arr] (poolc) -- (headc);
+\draw[arr] (headc.east) -| (softmax.north);
+
+\draw[arr] (xp) -- (lstmp);
+\draw[arr] (lstmp) -- (poolp);
+\draw[arr] (poolp) -- (cross);
+\draw[arr] (cross) -- (headp);
+\draw[arr] (headp.east) -| (softmax.south);
+
+\node[align=left, font=\scriptsize, below=1mm of xc, xshift=8mm] {\texttt{encoder\_type="concat"}};
+\node[align=left, font=\scriptsize, below=1mm of xp, xshift=8mm] {\texttt{encoder\_type="per\_asset"}};
+
+\draw[arr] (softmax) -- (out);
+\end{tikzpicture}%
+}
+\caption{PortfolioLSTM's two interchangeable encoders. Both feed the same downstream weight
+scheme; \texttt{prev\_weight} feedback (\S\ref{sec:prevweight}) concatenates into the head's
+input in both branches (the whole vector $w_{i-1}\in\mathbb{R}^N$ for ``concat'', only the
+asset's own scalar $w_{i-1}^{(k)}$ for ``per\_asset'').}
+\label{fig:portfoliolstm}
+\end{figure}
+
+\subsection{Encoder A: concatenated input}
+\label{sec:concat}
+
+\begin{lstlisting}[caption={Concatenated-input encoder (default).}, label=lst:concat]
+self.lstm = nn.LSTM(input_size=n_assets * n_channels, hidden_size=hidden_size,
+                     num_layers=num_layers, batch_first=True)
+head_input_size = hidden_size + n_assets if use_prev_weight else hidden_size
+self.head = NoisyLinear(head_input_size, n_assets) if noisy_head else nn.Linear(head_input_size, n_assets)
+\end{lstlisting}
+\srcref{models/portfolio\_lstm.py:592--607 (\texttt{PortfolioLSTM.\_\_init\_\_})}
+
+One LSTM consumes every asset's features concatenated into a single per-timestep vector:
+\begin{equation}
+  \text{LSTM}: \mathbb{R}^{B\times L \times NC} \to \big(\text{lstm\_out}\in\mathbb{R}^{B\times L\times H},\ h_n \in \mathbb{R}^{1\times B\times H}\big)
+\end{equation}
+followed by pooling over time (\S\ref{sec:pooling}) to a single $\mathbb{R}^{B\times H}$
+summary, then the head (a single \code{Linear}/\code{NoisyLinear} layer):
+\begin{equation}
+  \hat{\text{logits}}_i = \text{Head}\big([\,\text{pooled}_i \,;\, w_{i-1}\,]\big) \in \mathbb{R}^N
+  \qquad (\text{concatenation omitted when } \texttt{use\_prev\_weight}=\text{False})
+\end{equation}
+
+\begin{rationale}\rationalelabel
+This is the simplest, fastest architecture and the historical default. Its weakness: every
+learned weight is tied to a \emph{fixed asset order and count} -- the LSTM's input weight
+matrix has one column block per specific asset, and the head's output has one fixed neuron
+per specific asset. Changing the universe (adding/removing/reordering pairs) requires
+retraining from scratch; this motivated the per-asset encoder below.
+\end{rationale}
+
+\subsection{Encoder B: shared per-asset encoder with cross-asset attention}
+\label{sec:perasset}
+
+\begin{lstlisting}[caption={Per-asset encoder + cross-asset combiner.}, label=lst:perasset]
+self.asset_lstm = nn.LSTM(input_size=n_channels, hidden_size=hidden_size,
+                           num_layers=num_layers, batch_first=True)
+if asset_combiner == "attention":
+    self.asset_attn = nn.MultiheadAttention(embed_dim=hidden_size, num_heads=n_attn_heads, batch_first=True)
+head_input_size = 2 * hidden_size + (1 if use_prev_weight else 0)
+self.head = NoisyLinear(head_input_size, 1) if noisy_head else nn.Linear(head_input_size, 1)
+\end{lstlisting}
+\srcref{models/portfolio\_lstm.py:608--633}
+
+\begin{lstlisting}[caption={Per-asset encoder forward pass.}, label=lst:perassetfwd]
+batch, lookback, _ = x.shape
+x_per_asset = x.view(batch, lookback, self.n_assets, self.n_channels).permute(0, 2, 1, 3)
+x_flat = x_per_asset.reshape(batch * self.n_assets, lookback, self.n_channels)
+lstm_out, (h_n, _) = self.asset_lstm(x_flat)
+pooled = self.temporal_pool(lstm_out) if self.pooling == "attention" else h_n[-1]
+h = self.dropout(pooled).view(batch, self.n_assets, self.hidden_size)          # (B, N, H)
+
+if self.asset_combiner == "attention":
+    context, _ = self.asset_attn(h, h, h, need_weights=False)                  # (B, N, H)
+else:
+    context = h.mean(dim=1, keepdim=True).expand(-1, self.n_assets, -1)        # (B, N, H)
+
+combined = torch.cat([h, context], dim=-1)                                     # (B, N, 2H)
+if self.use_prev_weight:
+    combined = torch.cat([combined, prev_weight.unsqueeze(-1)], dim=-1)        # (B, N, 2H+1)
+logits = self.head(combined).squeeze(-1)                                       # (B, N)
+\end{lstlisting}
+\srcref{models/portfolio\_lstm.py:669--693}
+
+\textbf{One LSTM, with parameters shared across every asset}, is applied independently to
+each asset's own $C$-channel window, by folding the asset dimension into the batch
+dimension:
+\begin{equation}
+  X_i \in \mathbb{R}^{L\times NC} \;\to\; \tilde X_i \in \mathbb{R}^{N\times L\times C}
+  \;\to\; \tilde X_i^{\text{flat}} \in \mathbb{R}^{(BN)\times L\times C}
+\end{equation}
+\begin{equation}
+  \text{LSTM}_{\text{shared}}: \mathbb{R}^{(BN)\times L\times C} \to h \in \mathbb{R}^{B\times N\times H}
+  \qquad(\text{after pooling and reshape})
+\end{equation}
+Every asset's own hidden state $h^{(k)}_i \in \mathbb{R}^H$ then either \textbf{attends to}
+or is \textbf{mean-pooled with} every other asset's hidden state, producing a cross-asset
+context $c^{(k)}_i \in \mathbb{R}^H$ (\texttt{asset\_combiner}):
+\begin{align}
+  \text{attention: } &\;\; c_i = \text{MultiheadAttention}(Q\!=\!h_i, K\!=\!h_i, V\!=\!h_i) \in \mathbb{R}^{N\times H} \label{eq:crossattn}\\
+  \text{mean: } &\;\; c^{(k)}_i = \frac{1}{N}\sum_{j=1}^N h^{(j)}_i \quad \forall k \label{eq:crossmean}
+\end{align}
+A \textbf{single, shared} per-asset head then maps each asset's own
+$[\,h^{(k)}_i \,;\, c^{(k)}_i\,]\in\mathbb{R}^{2H}$ (optionally $+1$ for
+$w_{i-1}^{(k)}$, that asset's \emph{own} previous weight, a scalar) to \emph{one} logit:
+\begin{equation}
+  \hat{\text{logit}}_i^{(k)} = \text{Head}_{\text{shared}}\big([\,h^{(k)}_i\,;\,c^{(k)}_i\,(;\,w_{i-1}^{(k)})\,]\big) \in \mathbb{R}
+\end{equation}
+stacked over $k=1,\dots,N$ to form $\hat{\text{logits}}_i \in \mathbb{R}^N$, exactly as in
+the concatenated encoder.
+
+\begin{rationale}\rationalelabel
+Because \emph{every} learned weight (the shared LSTM, the attention/mean combiner, the
+shared head) is reused across assets rather than tied to one specific asset index, this
+architecture is \textbf{permutation-equivariant}: reordering the input pairs reorders the
+output weights identically (verified empirically -- \S\ref{sec:verification}). It is also,
+in principle, \textbf{universe-size invariant}: nothing in the forward pass depends on a
+fixed value of $N$ except bookkeeping (reshape targets, zero-initialization width), so the
+same trained weights could in principle score a different \emph{number} of assets than
+trained on (not currently exposed as a supported workflow, but architecturally unconstrained).
+Self-attention across assets additionally lets the network learn genuine \emph{pairwise}
+relationships (e.g.\ two correlated pairs, or a natural hedge) rather than only a
+symmetric market-wide average, which is what the simpler \texttt{"mean"} combiner provides
+as a cheaper, more stable alternative when there are few assets or little training history.
+\end{rationale}
+
+\begin{dims}\dimslabel
+$x \in \mathbb{R}^{B\times L\times NC} \to$ view $\to (B,L,N,C) \to$ permute $\to (B,N,L,C)
+\to$ reshape $\to (BN, L, C)$; asset-LSTM output pooled to $(BN,H) \to$ view $\to (B,N,H)$;
+context $(B,N,H)$; \code{combined} $(B,N,2H)$ or $(B,N,2H{+}1)$; \code{logits} after
+\code{squeeze(-1)}: $(B,N)$.
+\end{dims}
+
+\subsection{Temporal pooling: last hidden state vs.\ attention pooling}
+\label{sec:pooling}
+
+\begin{optional}\optionallabel
+\texttt{pooling="last"} (default) uses $h_n[-1]$, the LSTM's final hidden state, as the whole
+window's summary. \texttt{pooling="attention"} instead uses a learned attention pool over
+\emph{every} timestep's hidden state. Applies identically to both PortfolioLSTM encoders and
+to RiskLSTM.
+\end{optional}
+
+\begin{lstlisting}[caption={Learned attention pooling over the full LSTM output sequence.}, label=lst:temporalpool]
+class TemporalAttentionPool(nn.Module):
+    def __init__(self, hidden_size):
+        self.score = nn.Sequential(nn.Linear(hidden_size, hidden_size), nn.Tanh(),
+                                    nn.Linear(hidden_size, 1))
+    def forward(self, lstm_out):                    # (*, T, H) -> (*, H)
+        scores = self.score(lstm_out)                # (*, T, 1)
+        weights = torch.softmax(scores, dim=-2)       # (*, T, 1)
+        return (weights * lstm_out).sum(dim=-2)       # (*, H)
+\end{lstlisting}
+\srcref{models/portfolio\_lstm.py:458--492}
+
+For an LSTM output sequence $h_1,\dots,h_T \in \mathbb{R}^H$ (the standard additive/Bahdanau
+attention pool):
+\begin{equation}
+  s_t = v^\top \tanh(W h_t), \qquad \alpha_t = \frac{\exp(s_t)}{\sum_{\tau=1}^T \exp(s_\tau)},
+  \qquad \text{pooled} = \sum_{t=1}^T \alpha_t\, h_t
+  \label{eq:attnpool}
+\end{equation}
+where $W\in\mathbb{R}^{H\times H}$, $v \in \mathbb{R}^{H}$ are learned (\code{self.score}'s
+two \code{Linear} layers). The leading dimension is generic: for PortfolioLSTM's per-asset
+encoder, pooling is applied to a $(BN, T, H)$ tensor (each asset-sample row pooled
+independently); for the concatenated encoder and for RiskLSTM, to a $(B,T,H)$ tensor.
+
+\begin{rationale}\rationalelabel
+$h_n[-1]$ forces the LSTM to compress everything relevant about the whole window into
+whatever it happens to be carrying at the very \emph{last} timestep -- a real limitation for
+longer lookbacks where the most decision-relevant days (e.g.\ a vol spike) might sit in the
+middle rather than at the end. Attention pooling instead lets the network learn, per
+timestep, how relevant that day's hidden state is to the current decision, and combines all
+of them into one summary vector.
+\end{rationale}
+
+\subsection{Weight schemes}
+\label{sec:weightschemes}
+
+\begin{equation}
+  \text{softmax (long-only): } \quad \hat w_i = \mathrm{softmax}(\text{logits}_i),
+  \quad \hat w_i \succeq 0,\ \; \mathbf{1}^\top \hat w_i = 1
+  \label{eq:softmax}
+\end{equation}
+\begin{equation}
+  \text{tanh\_norm (long/short): } \quad
+  \tilde w_i = \tanh(\text{logits}_i), \quad
+  \hat w_i = \frac{\tilde w_i}{\lVert \tilde w_i \rVert_1 + \epsilon}, \quad
+  \lVert \hat w_i \rVert_1 = 1
+  \label{eq:tanhnorm}
+\end{equation}
+\srcref{models/portfolio\_lstm.py:635--642 (\texttt{\_weights\_from\_logits})}
+
+\begin{rationale}\rationalelabel
+\texttt{softmax} guarantees a valid long-only book (non-negative, fully invested) by
+construction -- convenient when short positions are undesirable or unavailable.
+\texttt{tanh\_norm} allows each asset's weight to be positive \emph{or} negative (a genuine
+long/short book), normalized so the book's gross exposure ($\sum_k |\hat w_i^{(k)}|$) is
+exactly 1, matching softmax's ``fully invested'' property in gross-exposure terms while
+allowing sign flexibility.
+\end{rationale}
+
+\subsection{Recurrent-policy feedback: feeding the previous weight into the head}
+\label{sec:prevweight}
+
+\begin{optional}\optionallabel
+\texttt{use\_prev\_weight} (default \texttt{False}) concatenates the previously realized
+weight $w_{i-1}$ into the head's input, following the classic Moody \& Saffell
+recurrent-policy trick, so the network can reason about whether a rebalance is worth its
+transaction cost rather than deciding each window as if starting from flat.
+\end{optional}
+
+\begin{lstlisting}[caption={The sequential recurrent-policy loop (\texttt{forward\_sequence}).}, label=lst:fseq]
+def forward_sequence(self, X, initial_weight=None):
+    if not self.use_prev_weight:
+        return self.forward(X)              # ordinary vectorized batch call
+
+    n = X.shape[0]
+    prev = initial_weight.detach() if initial_weight is not None else torch.zeros(self.n_assets, ...)
+    freeze = self.noisy_head and self.training
+    if freeze:
+        self.head.resample_noise(); self.head.freeze_noise(True)
+    try:
+        weights = []
+        for i in range(n):
+            w = self.forward(X[i:i+1], prev.unsqueeze(0)).squeeze(0)
+            weights.append(w)
+            prev = w.detach()                # DETACHED - not full BPTT
+        return torch.stack(weights, dim=0)
+    finally:
+        if freeze: self.head.freeze_noise(False)
+\end{lstlisting}
+\srcref{models/portfolio\_lstm.py:695--755}
+
+When \texttt{use\_prev\_weight=False}, sample $i$'s decision is independent of sample
+$i{-}1$'s, so $B$ samples are processed in one ordinary vectorized batch call -- identical
+speed to a model without this feature. When \texttt{use\_prev\_weight=True}, sample $i$'s
+\emph{input} genuinely depends on sample $i{-}1$'s \emph{output}, forcing a sequential
+Python loop over $i=1,\dots,B$:
+\begin{equation}
+  w_i = f_\theta(X_i,\, w_{i-1}), \qquad w_{i-1} \leftarrow \text{sg}(w_{i-1})
+  \label{eq:recurrentpolicy}
+\end{equation}
+where $\text{sg}(\cdot)$ (``stop-gradient'', i.e.\ \code{.detach()}) means $w_{i-1}$ is
+\textbf{detached} before being fed forward as input to step $i$: gradients flow normally
+through \emph{each step's own local computation} (all steps share the same LSTM/head
+parameters $\theta$, and a loss summed over the whole path trains $\theta$ using every
+step's signal), but this is \textbf{not} full backpropagation-through-time -- unrolling
+gradients through hundreds or thousands of sequential steps would be both computationally
+intractable and numerically unstable. This is a deliberate simplification: the network
+observes its own last action as part of its state (a genuine recurrent policy), but is not
+asked to reason about how today's decision causally shapes next week's gradient.
+
+\begin{fixnote}\fixnotelabel
+\textbf{NoisyLinear in-place-mutation fix.} \code{NoisyLinear} resamples its noise buffers
+(\code{weight\_epsilon}, \code{bias\_epsilon}) \emph{in place} on every \code{forward()} call
+while training (\S\ref{sec:noisynet}). The sequential loop above calls
+\code{self.forward()} once \emph{per day} in the training period -- without intervention,
+every one of those $B$ calls would overwrite the \emph{same} buffer in place, corrupting an
+earlier step's saved value before the eventual single \code{loss.backward()} over the whole
+period could use it (a real \code{RuntimeError}: \emph{``one of the variables needed for
+gradient computation has been modified by an in-place operation''}). The fix:
+\code{resample\_noise()} is called \textbf{once} before the loop (one fresh noise draw for
+this whole sequential pass, matching what one ordinary \code{forward()} call would get), then
+\code{freeze\_noise(True)} holds it fixed for the loop's duration, and
+\code{freeze\_noise(False)} in a \code{finally} block restores normal per-call resampling
+afterward. \textbf{Design constraint this reveals:} enabling \texttt{noisy\_head} together
+with \texttt{use\_prev\_weight} forces one shared noise draw per training epoch (rather than
+per day) -- a strictly coarser noise schedule than the non-recurrent path, but the only one
+compatible with a single backward pass over the whole trajectory.
+\end{fixnote}
+
+\begin{rationale}\rationalelabel
+\code{initial\_weight} lets a caller continue a position \emph{across} a split boundary
+(e.g.\ validation continues from training's last decided weight, test continues from
+validation's) rather than restarting from flat at each boundary -- a real portfolio does not
+reset to cash at the end of a backtest period.
+\end{rationale}
+
+\subsection{NoisyNet: parameter-space exploration noise}
+\label{sec:noisynet}
+
+\begin{optional}\optionallabel
+\texttt{noisy\_head} (default \texttt{False}) replaces the head's plain \code{nn.Linear}
+with \code{NoisyLinear} (Fortunato et al., 2017), whose weight/bias are themselves stochastic.
+\end{optional}
+
+\begin{lstlisting}[caption={NoisyLinear: independent Gaussian parameter noise.}, label=lst:noisy]
+class NoisyLinear(nn.Module):
+    def __init__(self, in_features, out_features, sigma_init=0.5):
+        self.weight_mu    = nn.Parameter(torch.empty(out_features, in_features))
+        self.weight_sigma = nn.Parameter(torch.empty(out_features, in_features))
+        self.bias_mu      = nn.Parameter(torch.empty(out_features))
+        self.bias_sigma   = nn.Parameter(torch.empty(out_features))
+        self.register_buffer("weight_epsilon", torch.empty(out_features, in_features))
+        self.register_buffer("bias_epsilon",   torch.empty(out_features))
+
+    def forward(self, x):
+        if self.training:
+            if not self._frozen: self._reset_noise()     # epsilon ~ N(0,1), in place
+            weight = self.weight_mu + self.weight_sigma * self.weight_epsilon
+            bias   = self.bias_mu   + self.bias_sigma   * self.bias_epsilon
+        else:
+            weight, bias = self.weight_mu, self.bias_mu   # deterministic at inference
+        return F.linear(x, weight, bias)
+\end{lstlisting}
+\srcref{models/portfolio\_lstm.py:371--455}
+
+\begin{equation}
+  W = \mu_W + \sigma_W \odot \varepsilon_W,\quad \varepsilon_W \sim \mathcal{N}(0,1)^{d_{\text{out}}\times d_{\text{in}}},
+  \qquad
+  b = \mu_b + \sigma_b \odot \varepsilon_b,\quad \varepsilon_b \sim \mathcal{N}(0,1)^{d_{\text{out}}}
+\end{equation}
+with $\sigma_W,\sigma_b$ initialized to $\texttt{sigma\_init}/\sqrt{d_{\text{in}}}$
+(\texttt{sigma\_init}$=0.5$ default) and \emph{learned} via gradient descent like any other
+parameter, so the model can shrink the noise magnitude over training if it stops helping. At
+inference (\code{model.eval()}), $\mu$ alone is used -- deterministic, mirroring how dropout
+also disables itself outside training.
+
+\begin{rationale}\rationalelabel
+This is the ``noisy cell'' analogue of \code{noise\_std} (which perturbs the \emph{input}
+window instead, \S\ref{sec:trainloop}): rather than the model seeing a slightly different
+input each epoch, it must produce a good Sharpe ratio under a slightly different version of
+its \emph{own decision boundary} each epoch, making it harder to lock onto one razor-sharp
+weight configuration that happens to maximize Sharpe on the exact training sequence but does
+not generalize. The two noise sources compose (both may be enabled simultaneously) rather
+than substitute for each other. \code{RiskLSTM} applies the \emph{same} noisy-linear
+treatment to \textbf{both} of its head layers (\S\ref{sec:risklstm}), for full NoisyNet
+coverage of its decision path.
+\end{rationale}
+
+\subsection{The \texttt{CASH} pseudo-asset}
+\label{sec:cash}
+
+\begin{optional}\optionallabel
+\texttt{has\_cash} (default \texttt{False}) adds one more holdable ``asset'' with a constant
+daily return \texttt{cash\_return} (default $0.0$).
+\end{optional}
+
+\begin{lstlisting}[caption={CASH is a data-layer pseudo-pair, not a model-layer special case.}, label=lst:cash]
+if has_cash:
+    returns = returns.copy()
+    returns["CASH"] = cash_return
+    pairs = real_pairs + ["CASH"]
+\end{lstlisting}
+\srcref{models/portfolio\_lstm.py:1936--1956 (\texttt{\_prepare\_data})}
+
+\begin{rationale}\rationalelabel
+\texttt{CASH} is implemented \emph{not} as a model-level output-dimension special case, but
+as a \textbf{data-level pseudo-pair} appended to \texttt{pairs} and to the \texttt{returns}
+DataFrame \emph{before} windowing. This means it is treated as ``just another asset''
+everywhere downstream (vol-targeting, transaction costs, per-asset reporting, the risk
+overlay) with \textbf{zero special-casing} required elsewhere: a constant-return column has
+exactly zero realized variance, which the covariance-based vol-targeting formula
+(\S\ref{sec:voltarget}) already handles correctly (a risk-free asset contributes no variance,
+exactly as it should), and $N \leftarrow N+1$ propagates automatically through every shape
+computed from \code{len(pairs)}.
+\end{rationale}
+
+% =============================================================================
+\section{Volatility Targeting}
+\label{sec:voltarget}
+% =============================================================================
+
+PortfolioLSTM's raw weights $\hat w_i^{\text{raw}}$ are rescaled so the portfolio's
+\emph{estimated} annualized volatility matches a target (e.g.\ 20\%):
+\begin{equation}
+  \hat\sigma_i = \sqrt{\hat w_i^{\text{raw}\top} \hat\Sigma_i\, \hat w_i^{\text{raw}}} \cdot \sqrt{252},
+  \qquad
+  \hat w_i = \hat w_i^{\text{raw}} \cdot \min\!\left(\frac{\texttt{target\_vol}}{\max(\hat\sigma_i, 10^{-8})},\ \texttt{max\_leverage}\right)
+  \label{eq:voltarget}
+\end{equation}
+\srcref{models/portfolio\_lstm.py:1384--1453 (\texttt{portfolio\_volatility}, \texttt{scale\_weights\_to\_target\_vol})}
+
+\begin{dims}\dimslabel
+$\hat\Sigma_i \in \mathbb{R}^{N\times N}$ per sample; $\hat w_i^{\text{raw}} \in \mathbb{R}^N$;
+$\hat\sigma_i \in \mathbb{R}$ (scalar per sample); batched over $B$ samples via
+\code{torch.einsum}.
+\end{dims}
+
+\subsection{Three covariance estimators}
+
+\begin{optional}\optionallabel
+\texttt{covariance\_estimator} (default \texttt{"sample"}) selects among three estimators of
+$\hat\Sigma_i$ from the same-sample raw-return window $X_i^{\text{raw}} \in \mathbb{R}^{L\times N}$
+(channel-0-only, i.e.\ raw returns, never carry or vol-normalized channels).
+\end{optional}
+
+\paragraph{(a) Sample covariance (default).}
+\begin{equation}
+  \bar r_i = \frac{1}{L}\sum_{t=1}^{L} X_i^{(t)}, \qquad
+  \hat\Sigma_i^{\text{sample}} = \frac{1}{L-1}\sum_{t=1}^{L} (X_i^{(t)} - \bar r_i)(X_i^{(t)} - \bar r_i)^\top
+  \label{eq:samplecov}
+\end{equation}
+
+\paragraph{(b) EWMA (RiskMetrics-style).} Day $t$ ($t{=}0$ oldest, $t{=}L{-}1$ newest) is
+weighted $\propto \lambda^{L-1-t}$, renormalized to sum to 1 (a finite window truncates the
+infinite geometric series):
+\begin{equation}
+  \omega_t = (1-\lambda)\lambda^{L-1-t} \Big/ \sum_{\tau} (1-\lambda)\lambda^{L-1-\tau},
+  \qquad
+  \bar r_i^{\text{ewma}} = \sum_t \omega_t X_i^{(t)}
+\end{equation}
+\begin{equation}
+  \hat\Sigma_i^{\text{ewma}} = \sum_{t=1}^L \omega_t\,(X_i^{(t)} - \bar r_i^{\text{ewma}})(X_i^{(t)} - \bar r_i^{\text{ewma}})^\top
+  \label{eq:ewmacov}
+\end{equation}
+with $\lambda = \texttt{ewma\_lambda}$ (default $0.94$, the RiskMetrics daily default,
+$\approx$11-day half-life).
+
+\paragraph{(c) Ledoit-Wolf shrinkage (Ledoit \& Wolf, 2004).} Shrinks the sample covariance
+toward a well-conditioned scaled-identity target $F = \bar\mu I$, $\bar\mu = \frac{1}{N}\mathrm{tr}(\hat\Sigma^{\text{sample}})$,
+using the analytically optimal (not fixed/hand-tuned) shrinkage intensity:
+\begin{align}
+  \hat\pi &= \frac{1}{L-1}\sum_{t=1}^L \big\lVert X_i^{(t)}X_i^{(t)\top} - \hat\Sigma_i^{\text{sample}} \big\rVert_F^2
+    \quad \text{(estimator noise)} \\
+  \hat\gamma &= \big\lVert \hat\Sigma_i^{\text{sample}} - F \big\rVert_F^2 \quad \text{(target misspecification)} \\
+  \delta^\ast &= \mathrm{clip}\!\left(\frac{\hat\pi}{\max(\hat\gamma, 10^{-12})},\, 0,\, 1\right) \\
+  \hat\Sigma_i^{\text{LW}} &= \delta^\ast F + (1-\delta^\ast)\, \hat\Sigma_i^{\text{sample}}
+  \label{eq:ledoitwolf}
+\end{align}
+\srcref{models/portfolio\_lstm.py:1297--1381 (\texttt{estimate\_covariance})}
+
+\begin{lstlisting}[caption={Ledoit-Wolf shrinkage intensity (batched, vectorized).}, label=lst:lw]
+outer = torch.einsum("bti,btj->btij", centered, centered)            # per-day outer products
+deviation = outer - sample_cov.unsqueeze(1)
+pi_hat = (deviation ** 2).sum(dim=(-1, -2)).mean(dim=1) / max(lookback - 1, 1)
+gamma_hat = ((sample_cov - target) ** 2).sum(dim=(-1, -2))
+delta = (pi_hat / gamma_hat.clamp(min=1e-12)).clamp(min=0.0, max=1.0)
+return delta * target + (1.0 - delta) * sample_cov
+\end{lstlisting}
+
+\begin{rationale}\rationalelabel
+The plain sample covariance over a short window ($L{=}30$ days by default) is noisy: a
+handful of coincidentally calm or coincidentally correlated days can swing the whole
+estimate, and if $L \le N$ it can even be exactly singular. EWMA is a strictly cheaper
+improvement -- weighting recent days more lets the estimate react faster to a genuine
+volatility regime change while still using the whole window for stability. Ledoit-Wolf goes
+further: it inflates small eigenvalues toward a well-conditioned target using an intensity
+\emph{derived}, not guessed, from how noisy the sample estimator itself is -- directly
+addressing the sample estimator's worst failure mode for vol targeting (see
+\texttt{max\_leverage} below): a near-singular covariance produces a spuriously tiny
+estimated risk and hence an enormous leverage scale-up, right before a normal-sized move can
+wipe out the position. Empirically verified (unit test): on a rank-1 (perfectly collinear)
+synthetic window, the sample estimator's smallest eigenvalue is $\approx 0$ while
+Ledoit-Wolf's is safely bounded away from zero.
+\end{rationale}
+
+\subsection{The leverage cap}
+
+\begin{lstlisting}[caption={\texttt{max\_leverage} caps the scale factor itself.}, label=lst:maxlev]
+if target_vol == 0: return weights
+vol = portfolio_volatility(window_returns, weights, ...).clamp(min=1e-8)
+scale = (target_vol / vol).clamp(max=max_leverage)
+return weights * scale.unsqueeze(-1)
+\end{lstlisting}
+\srcref{models/portfolio\_lstm.py:1409--1453}
+
+\begin{rationale}\rationalelabel
+Without a cap on \emph{the scale factor itself} (not merely a numerical-stability clamp
+buried inside the volatility estimate), a window whose ESTIMATED covariance happens to be
+near-zero can be scaled up by $1000\times$ or more (confirmed empirically on realistic
+synthetic data), and that single sample can then realize a catastrophic ($<{-}100\%$)
+return the moment the actual next-day move is not equally calm. This is especially severe for
+the \texttt{"kelly"} training objective: $\log(1+r)$ has a singularity at $r={-}1$, and the
+safety clamp used there produces an \emph{exact zero gradient} for any return at or below it
+-- the model would get no corrective signal from precisely the sample that most needs one.
+Capping leverage at a sane multiple (default $10\times$) bounds every sample's worst-case
+return and fixes this dead-gradient failure mode \emph{at its source}, rather than papering
+over the symptom independently in each loss function.
+\end{rationale}
+
+% =============================================================================
+\section{Training Objectives}
+\label{sec:objectives}
+% =============================================================================
+
+\begin{lstlisting}[caption={Objective dispatcher.}, label=lst:dispatch]
+def compute_training_loss(portfolio_returns, objective, sharpe_window=60, cvar_alpha=0.95, cvar_kappa=1.0):
+    if objective == "sharpe": return -rolling_window_ratio(portfolio_returns, window=sharpe_window, downside=True)
+    if objective == "kelly":  return kelly_loss(portfolio_returns)
+    if objective == "cvar":   return mean_cvar_loss(portfolio_returns, alpha=cvar_alpha, kappa=cvar_kappa)
+\end{lstlisting}
+\srcref{models/portfolio\_lstm.py:1264--1290}
+
+\subsection{Rolling-window Sortino-style ratio (\texttt{"sharpe"}, default)}
+
+\begin{equation}
+  \text{ratio}_j = \frac{\overline{r}_j}{\sqrt{\frac{1}{w}\sum_{t\in W_j} \min(r_t,0)^2} + \epsilon} \cdot \sqrt{252},
+  \qquad
+  \mathcal{L}_{\text{sharpe}} = -\frac{1}{J}\sum_{j=1}^J \text{ratio}_j
+  \label{eq:sortino}
+\end{equation}
+where $W_j$ ranges over all $J = B - w + 1$ overlapping $w$-day sub-windows
+(\texttt{sharpe\_window}, default 60) of the $B$-day training period, and the denominator is
+a \textbf{downside} deviation (only negative returns penalized -- the Sortino variant) rather
+than the plain standard deviation.
+\srcref{models/portfolio\_lstm.py:1131--1177 (\texttt{rolling\_window\_ratio})}
+
+\begin{rationale}\rationalelabel
+Scoring the mean ratio over many overlapping sub-windows, rather than one ratio over the
+whole training period, prevents the model from finding one weight pattern that happens to
+nail the exact historical sequence end-to-end while behaving arbitrarily badly on any
+sub-period. Downside-only risk (Sortino) does not penalize \emph{upside} volatility, which
+is a more appropriate risk definition for a return-seeking strategy than symmetric variance.
+\end{rationale}
+
+\subsection{Kelly criterion (\texttt{"kelly"})}
+
+\begin{equation}
+  \mathcal{L}_{\text{kelly}} = -\mathbb{E}\big[\log(1+r_t)\big] \approx -\frac{1}{B}\sum_{t=1}^B \log\big(\max(1+r_t,\epsilon)\big)
+  \label{eq:kelly}
+\end{equation}
+\srcref{models/portfolio\_lstm.py:1180--1202}
+
+\begin{rationale}\rationalelabel
+Maximizes expected \emph{log}-wealth growth -- the Kelly criterion -- which is convex in the
+portfolio weights (no extra tunable risk-aversion weight needed) and targets long-run
+compounded growth rather than a single-period ratio. Its numerical fragility at $r\to -1$ is
+exactly why \texttt{max\_leverage} (\S\ref{sec:voltarget}) exists.
+\end{rationale}
+
+\subsection{Mean-CVaR (\texttt{"cvar"})}
+
+\begin{equation}
+  \text{CVaR}_\alpha = \frac{1}{k}\sum_{j=1}^{k} \ell_{(j)}, \qquad \ell_t = -r_t,\quad
+  k = \max\big(1, \mathrm{round}((1-\alpha) B)\big)
+  \label{eq:cvar}
+\end{equation}
+(mean of the $k$ worst realized losses -- $\ell_{(1)}\ge\dots\ge\ell_{(k)}$ are the top-$k$
+losses via \code{torch.topk}, whose gradient flows through whichever days are currently the
+worst).
+\begin{equation}
+  \mathcal{L}_{\text{cvar}} = -\underbrace{\Big(\tfrac{1}{B}\textstyle\sum_t r_t\Big)\cdot 252}_{\text{annualized mean}}
+  \; + \; \kappa \cdot \underbrace{\text{CVaR}_\alpha \cdot \sqrt{252}}_{\text{annualized CVaR}}
+  \label{eq:meancvar}
+\end{equation}
+\srcref{models/portfolio\_lstm.py:1205--1261 (\texttt{cvar}, \texttt{mean\_cvar\_loss})}
+
+\begin{rationale}\rationalelabel
+This is the textbook convex portfolio objective (Rockafellar \& Uryasev, 2000): both the
+negative mean (affine) and CVaR (convex) are convex in the weights, so their nonnegative
+combination is convex in weight-space -- at the cost of \texttt{cvar\_kappa}, a
+\emph{fixed} (not learned) risk-aversion weight, since there is no way to combine two
+different quantities into one strictly convex scalar without such a weight (it plays the
+same structural role as mean-variance's $\lambda$, applied to CVaR instead of variance).
+\textbf{Both terms are annualized before combining} -- this was a deliberate fix: on raw
+daily FX returns the mean is tiny while CVaR (average of the worst days) is 10--30$\times$
+larger in practice, so combining them \emph{unannualized} with $\kappa{=}1.0$ made the loss
+almost entirely about minimizing CVaR, with the mean term contributing well under 10\% of
+the gradient signal -- the model barely learned to seek return at all. Annualizing first
+(mean $\times 252$, CVaR $\times\sqrt{252}$, matching how Sharpe itself annualizes) brings
+both terms to a comparable order of magnitude, making $\kappa{=}1.0$ a genuinely balanced
+default.
+\end{rationale}
+
+% =============================================================================
+\section{Transaction Costs}
+\label{sec:txcost}
+% =============================================================================
+
+\begin{equation}
+  \text{turnover}_t = \begin{cases} \lVert w_0 \rVert_1 & t=0 \\ \lVert w_t - w_{t-1} \rVert_1 & t>0 \end{cases},
+  \qquad
+  r_t^{\text{net}} = r_t - \frac{\texttt{transaction\_cost\_bps}}{10^4}\cdot \text{turnover}_t
+  \label{eq:txcost}
+\end{equation}
+\srcref{models/portfolio\_lstm.py:1514--1573 (\texttt{apply\_transaction\_costs}, and the differentiable \texttt{apply\_transaction\_costs\_torch})}
+
+\begin{rationale}\rationalelabel
+Costs are applied \textbf{net, inside the training loss itself} (via the differentiable
+\code{apply\_transaction\_costs\_torch}), not only as a post-hoc reporting adjustment -- so
+the model is trained to maximize its objective \emph{net of} trading costs directly, learning
+to avoid abrupt, expensive day-to-day weight swings whenever they are not worth their cost
+(this is precisely what motivates \texttt{use\_prev\_weight}, \S\ref{sec:prevweight}: without
+seeing its own previous position, the model cannot reason about whether a rebalance is
+worth its cost at all). The day-0 cost ($\lVert w_0\rVert_1$) charges the cost of putting the
+initial position on from flat.
+\end{rationale}
+
+% =============================================================================
+\section{Portfolio Training Loop}
+\label{sec:trainloop}
+% =============================================================================
+
+\begin{lstlisting}[caption={\texttt{train\_portfolio\_model}: one full-batch epoch.}, label=lst:trainloop]
+for epoch in range(1, epochs + 1):
+    optimizer.zero_grad()
+    noisy_X_train = X_train + randn_like(X_train) * noise_std if noise_std > 0 else X_train
+    raw_weights = model.forward_sequence(noisy_X_train)                                  # (B_train, N)
+    weights = scale_weights_to_target_vol(raw_weights, X_train_raw, target_vol, ...)
+    portfolio_returns = (weights * next_returns_train).sum(dim=-1)                        # (B_train,)
+    portfolio_returns = apply_transaction_costs_torch(weights, portfolio_returns, transaction_cost)
+    loss = compute_training_loss(portfolio_returns, objective, sharpe_window, cvar_alpha, cvar_kappa)
+    loss.backward(); optimizer.step()
+
+    if track_val:
+        model.eval()
+        val_weights = scale_weights_to_target_vol(model.forward_sequence(X_val, initial_weight=val_initial), ...)
+        val_sharpe = float(sharpe_ratio(val_returns))            # plain whole-period Sharpe
+        model.train()
+        if val_sharpe > best_val_sharpe:
+            best_val_sharpe = val_sharpe
+            best_state = copy.deepcopy(model.state_dict())        # checkpoint selection
+
+# after the loop:
+if track_val and best_state is not None:
+    model.load_state_dict(best_state)          # restore best-VALIDATION-Sharpe epoch
+\end{lstlisting}
+\srcref{models/portfolio\_lstm.py:1580--1744}
+
+Training is \textbf{full-batch}: every epoch computes weights for the \emph{entire} training
+period at once ($B_{\text{train}}$ samples in parallel, or sequentially if
+\texttt{use\_prev\_weight}), because Sharpe/Sortino/CVaR are statistics of a whole return
+\emph{distribution} and cannot be meaningfully evaluated on one sample at a time the way a
+per-sample loss (e.g.\ MSE) can.
+
+\begin{rationale}\rationalelabel
+\textbf{Checkpoint selection by validation Sharpe} (the plain whole-period metric, \emph{not}
+whatever \texttt{objective} is training against) rather than always keeping the last epoch
+directly targets an in-sample-great, out-of-sample-poor training curve: the run keeps
+whichever epoch's weights actually generalized best, a standard early-stopping /
+checkpoint-selection use of a validation split. \textbf{Test-set tracking} (when
+\texttt{test\_frac}$>0$) computes the identical quantity on the test split every epoch too,
+but \emph{purely for live display} -- it never enters \texttt{best\_state} selection,
+preserving test's status as a genuinely unbiased read (\S\ref{sec:split}). \texttt{noise\_std}
+perturbs only the \emph{standardized input}, not the clean window used for vol-targeting
+(that estimate must reflect real, not artificially noised, risk).
+\end{rationale}
+
+% =============================================================================
+\section{RiskLSTM: Risk-Attenuation Overlay}
+\label{sec:risklstm}
+% =============================================================================
+
+\begin{optional}\optionallabel
+The entire risk overlay (\texttt{risk\_overlay}, default \texttt{False}) is optional.
+PortfolioLSTM is always trained (or loaded) to completion \emph{first}, with no notion that
+an overlay might follow; RiskLSTM is then trained on the frozen result, purely to improve its
+realized Sharpe by learning \emph{when to size it down}.
+\end{optional}
+
+\begin{figure}[H]
+\centering
+\resizebox{0.92\textwidth}{!}{%
+\begin{tikzpicture}[
+  node distance=6mm and 10mm,
+  every node/.style={font=\small},
+  box/.style={draw, rounded corners=2pt, minimum height=8mm, align=center, inner sep=4pt, line width=0.6pt},
+  inbox/.style={box, fill=boxgray},
+  lstmbox/.style={box, fill=boxamber},
+  headbox/.style={box, fill=boxviolet},
+  arr/.style={-Latex, line width=0.7pt}
+]
+\node[inbox] (raw) {Frozen $\hat w_i$ (vol-targeted)\\ + raw return path};
+\node[inbox, below=of raw] (wpnl) {Per-asset weighted PnL\\ $\hat w_i^{(k)} \cdot r_t^{(k)}$};
+\node[inbox, right=of wpnl] (moments) {Rolling std / skew\\ / excess kurtosis\\ (window $W$)};
+\node[inbox, above=of moments] (xsec) {Cross-sectional features\\ (\emph{optional}): avg.\ corr,\\ dispersion, top eigenvalue share};
+
+\node[lstmbox, right=26mm of wpnl, yshift=8mm] (lstm) {RiskLSTM's own LSTM\\ input width $4N(+3)$\\ hidden size $H_r$};
+\node[headbox, right=of lstm] (pool) {Pooling\\ $h_n[-1]$ or attn.};
+\node[headbox, right=of pool] (head) {Head $\to$ LeakyReLU\\ $\to$ Head$_2$ $\to$ sigmoid};
+\node[box, fill=boxgreen, below=of head] (atten) {$a_i \in [\text{max\_att},\,1]^N$};
+\node[box, fill=boxgreen, below=of atten] (final) {$w_i^{\text{final}} = \hat w_i \odot a_i$};
+
+\draw[-Latex] (raw) -- (wpnl);
+\draw[-Latex] (wpnl) -- (moments);
+\draw[-Latex] (wpnl) |- (xsec);
+\draw[-Latex] (moments) -| (lstm.south);
+\draw[-Latex] (xsec) -| (lstm.north);
+\draw[-Latex] (wpnl) -| ([yshift=-2mm]lstm.west);
+\draw[-Latex] (lstm) -- (pool);
+\draw[-Latex] (pool) -- (head);
+\draw[-Latex] (head) -- (atten);
+\draw[-Latex] (raw.east) -| ([xshift=2mm]atten.north);
+\draw[-Latex] (atten) -- (final);
+\end{tikzpicture}%
+}
+\caption{RiskLSTM: the input feature stack (per-asset weighted PnL, marginal rolling
+moments, and optional cross-sectional features) feeds its own LSTM; the frozen portfolio
+weight vector re-enters at the head as a conditioning input, exactly as in
+PortfolioLSTM's \texttt{use\_prev\_weight}.}
+\label{fig:risklstm}
+\end{figure}
+
+\subsection{Marginal risk features: rolling moments of the weighted PnL path}
+
+\begin{lstlisting}[caption={Rolling std / skewness / excess kurtosis.}, label=lst:moments]
+def rolling_moments(x, window, eps=1e-6):                 # x: (B, L, N)
+    windows = x.unfold(dimension=1, size=window, step=1)   # (B, T', N, window)
+    mean = windows.mean(dim=-1, keepdim=True)
+    centered = windows - mean
+    variance = (centered ** 2).mean(dim=-1)
+    std = torch.sqrt(variance + eps)
+    skewness = (centered ** 3).mean(dim=-1) / (std ** 3 + eps)
+    kurtosis = (centered ** 4).mean(dim=-1) / (std ** 4 + eps) - 3.0        # excess
+    return torch.cat([std, skewness, kurtosis], dim=-1)      # (B, T', 3N)
+\end{lstlisting}
+\srcref{models/risk\_lstm.py:94--128}
+
+For each asset $k$ and trailing $W$-day sub-window ending at $t$, on the \textbf{per-asset
+weighted PnL path} $p_t^{(k)} = \hat w^{(k)}\cdot r_t^{(k)}$ (the raw return path, scaled by
+that sample's OWN decision weight -- i.e.\ statistics of the asset's \emph{actual exposure},
+which vol-targeting may have leveraged up or \texttt{tanh\_norm} may have flipped short --
+rather than of the asset's own unlevered return):
+\begin{align}
+  \mu_t^{(k)} &= \frac{1}{W}\sum_{\tau=t-W+1}^{t} p_\tau^{(k)}, \qquad
+  \sigma_t^{(k)} = \sqrt{\frac{1}{W}\sum_\tau (p_\tau^{(k)}-\mu_t^{(k)})^2 + \epsilon} \\
+  \text{skew}_t^{(k)} &= \frac{\frac{1}{W}\sum_\tau (p_\tau^{(k)}-\mu_t^{(k)})^3}{(\sigma_t^{(k)})^3 + \epsilon},
+  \qquad
+  \text{kurt}_t^{(k)} = \frac{\frac{1}{W}\sum_\tau (p_\tau^{(k)}-\mu_t^{(k)})^4}{(\sigma_t^{(k)})^4 + \epsilon} - 3
+  \label{eq:moments}
+\end{align}
+
+\begin{rationale}\rationalelabel
+Feeding these three moments \emph{directly}, rather than hoping an LSTM rediscovers them from
+raw returns, is a more direct and sample-efficient way to teach a small network ``is there a
+clear, stable trend or not'': std is realized volatility (the classic risk signal), skewness
+flags asymmetric tails (crash risk vs.\ melt-up), and excess kurtosis (0 for a Normal
+distribution) flags fat tails / regime instability. Using the \emph{weighted} PnL (not the
+raw return) means these statistics reflect the asset's actual current exposure, not its
+unlevered volatility -- a highly-levered small position can be riskier in dollar terms than
+an unlevered large one.
+\end{rationale}
+
+\subsection{Cross-sectional risk features (optional)}
+\label{sec:xsec}
+
+\begin{optional}\optionallabel
+\texttt{use\_cross\_sectional} (default \texttt{False}) appends 3 \textbf{portfolio-wide}
+(not per-asset) channels computed from the rolling cross-asset correlation structure of the
+\textbf{raw, unweighted} return path (deliberately not the weighted path -- a zero-weighted
+asset's degenerate constant series would make correlation undefined).
+\end{optional}
+
+\begin{lstlisting}[caption={Cross-sectional correlation-structure features.}, label=lst:xsec]
+def cross_sectional_features(x, window, eps=1e-6):        # x: (B, T, N) RAW returns
+    windows = x.unfold(1, window, 1)                        # (B, T', N, window)
+    normalized = (windows - windows.mean(-1,keepdim=True)) / std          # per-asset z-score
+    corr = torch.matmul(normalized, normalized.transpose(-1,-2)) / window # (B, T', N, N)
+
+    off_diag = corr * (1 - eye);  n_pairs = N * (N - 1)
+    avg_corr = off_diag.sum(dim=(-1,-2)) / n_pairs
+    corr_dispersion = sqrt(((corr - avg_corr)**2 * (1-eye)).sum(dim=(-1,-2)) / n_pairs)
+    eigenvalues = torch.linalg.eigvalsh(corr)                # ascending, real (symmetric)
+    top_eig_share = eigenvalues[..., -1] / eigenvalues.sum(dim=-1)
+    return torch.stack([avg_corr, corr_dispersion, top_eig_share], dim=-1)   # (B, T', 3)
+\end{lstlisting}
+\srcref{models/risk\_lstm.py:131--195}
+
+For the rolling $N\times N$ correlation matrix $\hat\rho_t$ (per-asset $z$-scored returns'
+Gram matrix, so diagonal $=1$ by construction):
+\begin{align}
+  \overline{\rho}_t &= \frac{1}{N(N-1)} \sum_{k\ne j} \hat\rho_t^{(k,j)} \qquad \text{[avg.\ pairwise correlation]} \label{eq:avgcorr}\\
+  s_t &= \sqrt{\frac{1}{N(N-1)}\sum_{k\ne j} \big(\hat\rho_t^{(k,j)} - \overline{\rho}_t\big)^2} \qquad\text{[correlation dispersion]} \label{eq:corrdisp}\\
+  \phi_t &= \frac{\lambda_{\max}(\hat\rho_t)}{\sum_{m=1}^N \lambda_m(\hat\rho_t)} = \frac{\lambda_{\max}(\hat\rho_t)}{N} \qquad\text{[top eigenvalue share]} \label{eq:topeig}
+\end{align}
+(the trace of a correlation matrix is always $N$, so the denominator of Eq.~\eqref{eq:topeig}
+is exactly $N$; $\phi_t \in [1/N, 1]$: close to $1/N$ means no dominant common factor, close
+to 1 means one shared risk driver is moving nearly everything). With $N<2$, pairwise
+correlation is undefined and these three channels are returned as zero.
+
+\begin{rationale}\rationalelabel
+This is the complement to the marginal moments above: an asset can look individually calm
+while the \emph{whole book} is one bad day away from moving together -- a regime the
+per-asset statistics alone cannot see. Average correlation and its dispersion distinguish a
+uniform one-factor market (high average, low dispersion) from a patchwork one (some pairs
+correlated, others not); the top-eigenvalue share is the standard PCA-based ``how much
+day-to-day covariation is explained by one common factor'' concentration measure. Computed
+on \emph{raw}, not weighted, returns so the correlation structure reflects genuine market
+co-movement, independent of the current portfolio's own (possibly zero) weights.
+\end{rationale}
+
+\subsection{Building RiskLSTM's input sequences}
+
+\begin{lstlisting}[caption={\texttt{make\_risk\_sequences}: decoupling \texttt{rolling\_window} from \texttt{lookback}.}, label=lst:mkrisk]
+n_valid = n_samples - rolling_window + 1
+full_series = torch.cat([X_raw[0], next_returns_raw], dim=0)             # reconstruct continuous series
+extended_len = lookback + rolling_window - 1
+extended_windows = full_series.unfold(0, extended_len, 1)[:n_valid]      # (n_valid, extended_len, N)
+
+weighted = extended_windows * weights[:, None, :]                       # this sample's OWN decision weight
+moments = rolling_moments(weighted, rolling_window)                     # (n_valid, lookback, 3N)
+aligned_returns = weighted[:, rolling_window - 1:, :]                   # (n_valid, lookback, N)
+features = torch.cat([aligned_returns, moments], dim=-1)                # (n_valid, lookback, 4N)
+if use_cross_sectional:
+    features = torch.cat([features, cross_sectional_features(extended_windows, rolling_window)], dim=-1)
+\end{lstlisting}
+\srcref{models/risk\_lstm.py:198--303}
+
+To let \texttt{rolling\_window} ($W$) be sized \emph{independently} of \texttt{lookback}
+($L$), the continuous raw-return series underlying $X^{\text{raw}}$ is first reconstructed
+(the first window in full, then exactly the one new day each subsequent sample adds), then,
+for each sample, an \textbf{extended} slice of length $L+W-1$ (not just $L$) is taken,
+weighted by that sample's own decision weight, and \emph{then} rolled with window $W$ --
+producing exactly $L$ output timesteps per sample regardless of how $W$ relates to $L$. The
+first $W-1$ samples of a split lack enough leading context and are \textbf{dropped} (a
+small, fixed cost, independent of $L$); \texttt{weights}/\texttt{next\_returns} are returned
+sliced to match, so every downstream consumer (training targets, reporting, plots) reuses
+the identical alignment.
+
+\begin{dims}\dimslabel
+Final feature tensor: $(n_{\text{valid}},\, L,\, 4N\ [{+}3])$, where
+$n_{\text{valid}} = n_{\text{samples}} - W + 1$.
+\end{dims}
+
+\subsection{RiskLSTM architecture and forward pass}
+
+\begin{lstlisting}[caption={RiskLSTM.\_\_init\_\_ and forward.}, label=lst:risklstm]
+n_feature_channels = 4 * n_assets + (3 if use_cross_sectional else 0)
+self.lstm = nn.LSTM(input_size=n_feature_channels, hidden_size=hidden_size, ...)
+if noisy_head:
+    self.head   = NoisyLinear(hidden_size + n_assets, hidden_size // 2)
+    self.head_2 = NoisyLinear(hidden_size // 2, n_assets)
+else:
+    self.head   = nn.Linear(hidden_size + n_assets, hidden_size // 2)
+    self.head_2 = nn.Linear(hidden_size // 2, n_assets)
+
+def forward(self, features, portfolio_weights):
+    lstm_out, (h_n, _) = self.lstm(features)
+    pooled = self.temporal_pool(lstm_out) if self.pooling == "attention" else h_n[-1]
+    hidden = self.dropout(pooled)
+    combined = torch.cat([hidden, portfolio_weights], dim=-1)             # (B, H_r + N)
+    x = self.leaky_relu(self.head(combined))                              # (B, H_r // 2)
+    attenuation_logit = torch.sigmoid(self.head_2(x))                     # (B, N)
+    return self.max_attenuation + (1.0 - self.max_attenuation) * attenuation_logit
+\end{lstlisting}
+\srcref{models/risk\_lstm.py:349--441}
+
+\begin{equation}
+  a_i = \texttt{max\_attenuation} + (1-\texttt{max\_attenuation})\cdot \sigma\big(\text{Head}_2(\mathrm{LeakyReLU}(\text{Head}([\text{pooled}_i\,;\,\hat w_i])))\big)
+  \label{eq:attenuation}
+\end{equation}
+one value per asset, $a_i \in [\texttt{max\_attenuation},\,1]^N$ (default floor $0.33$: an
+asset is de-risked, \textbf{never fully zeroed out}). The final position is
+$w_i^{\text{final}} = \hat w_i \odot a_i$ (elementwise).
+
+\begin{rationale}\rationalelabel
+The weight vector re-enters at the \emph{head}, not the LSTM's input, mirroring
+PortfolioLSTM's \texttt{use\_prev\_weight} conditioning: the LSTM branch tells the network
+whether this asset's \emph{recent behavior} looks stable, while the concatenated weight tells
+it \emph{what position is actually being considered} -- both are needed to decide how much to
+de-risk. LeakyReLU (not plain ReLU) between \code{head} and \code{head\_2} keeps a small
+gradient flowing even for units with a negative pre-activation, avoiding ``dying ReLU'' units
+that get stuck early in training and never update again. \texttt{max\_attenuation} is a
+\textbf{floor, not a ceiling}: the smooth rescaling $\texttt{max\_att} + (1-\texttt{max\_att})\sigma(\cdot)$
+has no dead zone (unlike a hard clamp), and the network can never force a position fully to
+zero regardless of how unstable an asset looks -- a deliberate risk limit on the overlay's
+own authority.
+\end{rationale}
+
+\subsection{Risk training loop}
+
+\begin{lstlisting}[caption={\texttt{train\_risk\_model}: one epoch.}, label=lst:risktrain]
+attenuation = risk_model(noisy_features_train, portfolio_weights_train)     # (B, N) - weights FIXED input
+scaled_weights = portfolio_weights_train * attenuation
+portfolio_returns = apply_transaction_costs_torch(scaled_weights, (scaled_weights * next_returns_train).sum(-1), transaction_cost)
+loss = -sharpe_ratio(portfolio_returns)          # plain whole-period Sharpe (not rolling_window_ratio)
+loss.backward(); optimizer.step()
+\end{lstlisting}
+\srcref{models/risk\_lstm.py:648--750}
+
+\begin{rationale}\rationalelabel
+\code{portfolio\_weights\_train} is a fixed, already-detached input -- gradients here only
+ever update RiskLSTM's own parameters, never PortfolioLSTM's. Unlike the portfolio training
+loop, there is \textbf{no best-checkpoint selection inside this loop}: \code{add\_risk\_overlay}'s
+restart selection (\S\ref{sec:ensembling}) picks the best restart \emph{post-hoc} by
+validation Sharpe instead, since a single restart's own epoch-by-epoch validation curve is
+far noisier for this smaller network.
+\end{rationale}
+
+% =============================================================================
+\section{Inverse-Volatility Benchmark}
+\label{sec:benchmark}
+% =============================================================================
+
+\begin{equation}
+  b_t^{\text{raw}} = \sum_{k=1}^N \frac{1/\sigma_t^{(k)}}{\sum_{j=1}^N 1/\sigma_t^{(j)}}\, r_{t+1}^{(k)},
+  \qquad \sigma_t^{(k)} = \mathrm{std}\big(X_t^{(\cdot,k)}\big) + 10^{-8}
+  \label{eq:benchmark}
+\end{equation}
+\srcref{models/portfolio\_lstm.py:1460--1485 (\texttt{inverse\_vol\_benchmark\_returns})}
+
+An un-learned, classic inverse-volatility (``naive risk-parity'') allocator: weight each
+asset inversely to its own trailing realized volatility over that day's \emph{same} lookback
+window the model itself saw, normalized to sum to 1 -- no vol-targeting leverage, no
+transaction-cost awareness.
+
+\begin{equation}
+  b_t = b_t^{\text{raw}} \cdot \frac{\widehat{\mathrm{std}}(r^{\text{model}})\cdot\sqrt{252}}{\widehat{\mathrm{std}}(b^{\text{raw}})\cdot\sqrt{252}}
+  \label{eq:volmatch}
+\end{equation}
+\srcref{models/portfolio\_lstm.py:1488--1507 (\texttt{vol\_match\_benchmark})}
+
+rescaled by \textbf{one constant multiplier per split} so its realized annualized volatility
+matches the \emph{model's own}, computed \textbf{separately for train, validation, and test}.
+
+\begin{rationale}\rationalelabel
+A plain risk-parity book runs at whatever volatility the market happens to produce, while the
+model is actively vol-targeted -- comparing their raw PnL would conflate ``did the learned
+allocation add value'' with ``did the model just happen to run hotter or colder than the
+benchmark this period.'' Rescaling the benchmark to the model's own realized volatility (per
+split, since realized volatility differs a lot between train/val/test) isolates the former
+question, which is the one an allocation-skill comparison actually needs answered.
+\end{rationale}
+
+% =============================================================================
+\section{Ensembling: Multi-Seed Restarts}
+\label{sec:ensembling}
+% =============================================================================
+
+\begin{optional}\optionallabel
+\texttt{n\_seeds} $>1$ (default 1) trains that many independently-seeded restarts of
+PortfolioLSTM (and, if enabled, RiskLSTM) on identical data, combined via
+\texttt{restart\_strategy}.
+\end{optional}
+
+\begin{lstlisting}[caption={"best" vs.\ "ensemble" restart combination.}, label=lst:ensemble]
+if args.restart_strategy == "best":
+    best_idx, best = max(enumerate(results), key=lambda item: float(sharpe_ratio(item[1].returns_val)))
+    return best
+# "ensemble":
+ensemble_model = EnsemblePortfolioLSTM([r.model for r in results])
+return evaluate_portfolio_model(ensemble_model, data, ...)
+\end{lstlisting}
+\srcref{models/portfolio\_lstm.py:2374--2425 (\texttt{run\_pipeline\_multi\_seed})}
+
+\begin{equation}
+  \text{"best"}: \quad \text{seed}^\ast = \arg\max_{s} \; \text{SharpeRatio}\big(r^{\text{val}}_s\big)
+  \label{eq:beststrat}
+\end{equation}
+\begin{equation}
+  \text{"ensemble"}: \quad \hat w_i = \frac{\bar w_i}{\lVert \bar w_i \rVert_1 + \epsilon}, \qquad
+  \bar w_i = \frac{1}{S}\sum_{s=1}^S \hat w_i^{(s)}
+  \label{eq:ensemblestrat}
+\end{equation}
+\srcref{models/portfolio\_lstm.py:918--932 (\texttt{EnsemblePortfolioLSTM.forward})}
+
+\begin{rationale}\rationalelabel
+The Sharpe-ratio training objective is non-convex in the LSTM's parameters (LSTM/softmax
+nonlinearities), so different random seeds converge to different local optima -- exactly the
+problem ensembling addresses. \texttt{"best"} picks the single restart with the highest
+validation Sharpe; \texttt{"ensemble"} averages every restart's predicted weights (a simple
+average of several points on the simplex already sums to 1 for \texttt{softmax} -- the
+renormalization is a no-op there -- but is \emph{not} a no-op for \texttt{tanh\_norm}, where
+individual models can disagree on an asset's sign, so re-normalizing restores the same
+``fully invested'' invariant each individual model already satisfies). Averaging tends to
+cancel out each individual restart's idiosyncratic overfitting to its own local optimum.
+\texttt{EnsembleRiskLSTM} is simpler still: attenuation values already live in
+$[\texttt{max\_attenuation},1]$, and a plain average of values in that range stays in that
+range, so no renormalization is needed there.
+\end{rationale}
+
+% =============================================================================
+\section{Configuration Reference}
+\label{sec:config}
+% =============================================================================
+
+The full \texttt{DEFAULT\_CONFIG} dictionary (\texttt{models/portfolio\_lstm.py}, lines
+1820--1980) is the single source of truth for every default; a JSON config file or the
+\texttt{TrainRequest} POST body (\texttt{api/server.py}, lines 235--276) need only specify
+keys that \emph{differ} from these defaults.
+
+\begin{longtable}{@{}p{3.6cm}p{1.6cm}p{7.8cm}@{}}
+\toprule
+\textbf{Key} & \textbf{Default} & \textbf{Meaning} \\
+\midrule
+\endfirsthead
+\toprule
+\textbf{Key} & \textbf{Default} & \textbf{Meaning} \\
+\midrule
+\endhead
+\texttt{lookback} & 30 & Sequence length $L$ (days) \\
+\texttt{years} & 8 & Years of price history to fetch \\
+\texttt{train\_frac} & 0.8 & Train fraction of the non-test remainder \\
+\texttt{test\_frac} & 0.1 & Held-out, most-recent test fraction \\
+\texttt{weight\_scheme} & \texttt{softmax} & \texttt{softmax} (long-only) or \texttt{tanh\_norm} (long/short) \\
+\texttt{hidden\_size} & 32 & PortfolioLSTM hidden width $H$ \\
+\texttt{epochs} & 300 & Training epochs \\
+\texttt{lr} & $10^{-3}$ & Adam learning rate \\
+\texttt{dropout} & 0.1 & Dropout on the pooled hidden state \\
+\texttt{weight\_decay} & $10^{-4}$ & Adam L2 penalty \\
+\texttt{noise\_std} & 0.05 & Input-window Gaussian noise std (train only) \\
+\texttt{target\_vol} & 0.20 & Annualized volatility target \\
+\texttt{max\_leverage} & 10.0 & Cap on the vol-targeting scale factor \\
+\texttt{noisy\_head} & False & NoisyNet parameter noise on the output head(s) \\
+\texttt{use\_prev\_weight} & False & Recurrent-policy feedback of $w_{i-1}$ \\
+\texttt{has\_cash} & False & Add a \texttt{CASH} pseudo-asset \\
+\texttt{cash\_return} & 0.0 & \texttt{CASH}'s constant daily return \\
+\texttt{use\_carry} & False & Add FX carry as an input channel \\
+\texttt{vol\_horizons} & \texttt{[]} & Vol-normalized-momentum horizons (days) \\
+\texttt{encoder\_type} & \texttt{concat} & \texttt{concat} or \texttt{per\_asset} \\
+\texttt{asset\_combiner} & \texttt{attention} & \texttt{attention} or \texttt{mean} (per-asset encoder only) \\
+\texttt{n\_attn\_heads} & 2 & Cross-asset attention heads \\
+\texttt{covariance\_estimator} & \texttt{sample} & \texttt{sample}, \texttt{ewma}, or \texttt{ledoit\_wolf} \\
+\texttt{ewma\_lambda} & 0.94 & EWMA decay ($\approx$11-day half-life) \\
+\texttt{pooling} & \texttt{last} & \texttt{last} ($h_n[-1]$) or \texttt{attention} (both networks) \\
+\texttt{objective} & \texttt{sharpe} & \texttt{sharpe}, \texttt{kelly}, or \texttt{cvar} \\
+\texttt{sharpe\_window} & 60 & Rolling-window width for the \texttt{"sharpe"} objective \\
+\texttt{cvar\_alpha} & 0.95 & CVaR confidence level \\
+\texttt{cvar\_kappa} & 1.0 & CVaR risk-aversion weight \\
+\texttt{n\_seeds} & 1 & Multi-restart count \\
+\texttt{restart\_strategy} & \texttt{best} & \texttt{best} or \texttt{ensemble} \\
+\texttt{risk\_overlay} & False & Enable the RiskLSTM stage \\
+\texttt{risk\_hidden\_size} & 16 & RiskLSTM hidden width $H_r$ \\
+\texttt{risk\_epochs} & 200 & RiskLSTM training epochs \\
+\texttt{risk\_lr} & $10^{-3}$ & RiskLSTM Adam learning rate \\
+\texttt{max\_attenuation} & 0.33 & Attenuation floor \\
+\texttt{risk\_rolling\_window} & 10 & $W$: RiskLSTM's rolling-statistics window \\
+\texttt{use\_cross\_sectional} & False & Add the 3 cross-sectional risk channels \\
+\texttt{transaction\_cost} & 0.0 & Cost per unit turnover (bps) \\
+\texttt{load\_portfolio} / \texttt{load\_risk} & \texttt{None} & Load a saved model instead of training \\
+\texttt{save\_db} & False & Persist to \texttt{quant.model\_registry} \\
+\bottomrule
+\end{longtable}
+
+% =============================================================================
+\section{Summary of Architectural Decisions}
+% =============================================================================
+
+\begin{longtable}{@{}p{4.0cm}p{9.2cm}@{}}
+\toprule
+\textbf{Decision} & \textbf{Primary rationale} \\
+\midrule
+\endfirsthead
+\toprule
+\textbf{Decision} & \textbf{Primary rationale} \\
+\midrule
+\endhead
+Sequential (not joint) two-network training & Keeps each network's gradient signal
+attributable to one well-posed sub-problem (asset selection vs.\ risk sizing). \\
+Log returns & Time-additive; matches the variance/covariance formulas used everywhere. \\
+Carry \& vol-normalized momentum (optional) & Standard, well-documented FX risk-adjusted
+signals, asset-major laid out for slice-ability. \\
+Forward-fill only (never back-fill) for carry/vol features & Any back-fill would leak a
+later day's value into an earlier row -- a genuine look-ahead bias. \\
+Per-asset shared encoder + cross-asset attention (optional) & Permutation-equivariant and,
+in principle, universe-size invariant, unlike the concatenated encoder's fixed asset-indexed
+weight matrices. \\
+Attention pooling over time (optional) & $h_n[-1]$ alone can lose mid-window information for
+longer lookbacks; a learned pool lets the network decide which days matter most. \\
+\texttt{use\_prev\_weight} recurrent policy & Lets the model reason about whether a
+rebalance is worth its transaction cost; implemented as a detached (not full-BPTT) sequential
+loop for tractability. \\
+NoisyNet parameter noise (optional) & A second, complementary form of regularization (in
+weight-space, not input-space) against overfitting one exact historical sequence. \\
+NoisyLinear freeze/resample fix & Sequential \texttt{forward\_sequence} would otherwise
+mutate shared noise buffers in place mid-graph, corrupting autograd; noise is now drawn once
+per sequential pass. \\
+\texttt{CASH} as a data-layer pseudo-asset & Reuses every downstream mechanism (vol-targeting,
+costs, reporting) with zero special-casing; a constant return has exactly zero variance. \\
+Three covariance estimators & Sample covariance is noisy/possibly singular on a short window;
+EWMA and Ledoit-Wolf are progressively more robust, principled remedies. \\
+\texttt{max\_leverage} cap & Bounds the worst-case realized loss from a spuriously
+near-singular covariance estimate; fixes Kelly's dead-gradient failure mode at its source. \\
+Rolling-window Sortino, Kelly, and CVaR objectives & Three different, well-understood
+risk/return trade-offs (non-convex ratio, convex log-wealth, convex tail-risk penalty). \\
+Annualizing both mean-CVaR terms & Prevents CVaR's larger raw magnitude from starving the
+mean-return gradient signal. \\
+Transaction costs inside the training loss & Trains the model to avoid costly, unnecessary
+rebalancing directly, not only as a reporting afterthought. \\
+Chronological, test-carved-first 3-way split & Test never influences any training or
+model-selection decision -- a genuinely unbiased generalization estimate, unlike validation. \\
+Best-val-Sharpe checkpoint selection & Targets the epoch that generalized best, not whichever
+the fixed epoch budget happened to land on. \\
+Marginal + cross-sectional risk features for RiskLSTM & Per-asset moments see individual
+risk; cross-sectional correlation/eigenvalue features see portfolio-wide concentration risk
+that marginal statistics alone cannot. \\
+Attenuation floor (never fully zero) & A deliberate limit on the overlay's authority -- it can
+de-risk, never fully close, a position. \\
+Multi-seed restarts \& ensembling & Both training objectives are non-convex; restarts and
+averaging mitigate sensitivity to a single unlucky initialization. \\
+Inverse-vol benchmark, vol-matched per split & Isolates ``did the learned allocation add
+value'' from ``did the model just run hotter/colder than a naive book.'' \\
+\bottomrule
+\end{longtable}
+
+% =============================================================================
+\section{Repository Map}
+% =============================================================================
+
+\begin{longtable}{@{}p{5.0cm}p{8.2cm}@{}}
+\toprule
+\textbf{Path} & \textbf{Contents} \\
+\midrule
+\endfirsthead
+\toprule
+\textbf{Path} & \textbf{Contents} \\
+\midrule
+\endhead
+\texttt{models/portfolio\_lstm.py} & Data pipeline, \texttt{PortfolioLSTM}/\texttt{EnsemblePortfolioLSTM},
+\texttt{NoisyLinear}, \texttt{TemporalAttentionPool}, volatility targeting, benchmark,
+training objectives, transaction costs, the full portfolio training/evaluation pipeline. \\
+\texttt{models/risk\_lstm.py} & \texttt{RiskLSTM}/\texttt{EnsembleRiskLSTM}, rolling moments,
+cross-sectional features, risk-sequence construction, risk training/evaluation pipeline. \\
+\texttt{models/risk\_postprocess.py} & Plotting helpers for the risk-overlay pipeline (position/attenuation, vol-matched PnL, return histograms, transaction-cost PnL). \\
+\texttt{data/db.py} & Generic \texttt{(symbol, source, field)}-keyed time-series storage/retrieval (prices and FRED rates share this schema). \\
+\texttt{data/fx\_downloader.py} & FX price downloader used to backfill missing history. \\
+\texttt{data/rates\_downloader.py} & FRED interest-rate downloader (feeds \texttt{load\_carry}). \\
+\texttt{data/model\_registry.py} & Postgres-backed \texttt{quant.model\_registry} model blob storage. \\
+\texttt{api/server.py} & FastAPI app: \texttt{TrainRequest}/\texttt{EvaluateRequest} schemas, background training jobs, live epoch-report callback, stop endpoint, evaluation endpoint. \\
+\texttt{frontend/src/TrainingView.jsx} & Training configuration form, live in-sample/validation/test PnL charts, final Sharpe table and PnL/benchmark charts. \\
+\texttt{frontend/src/EvaluationView.jsx} & Loads a saved model (or pair) purely for inference/backtesting display. \\
+\texttt{main.py} & Single CLI entry point: reads a JSON config, dispatches to the training/evaluation pipeline functions above. \\
+\bottomrule
+\end{longtable}
+
+\end{document}

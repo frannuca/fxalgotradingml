@@ -5,9 +5,10 @@ cumulative PnL and print the Sharpe ratio of both, for the in-sample
 Kept in its own file, mirroring models/portfolio_postprocess.py. This
 module is a LIBRARY - it has no CLI of its own; main.py at the repo root
 calls these functions after running models/risk_lstm.py's
-run_pipeline_multi_seed() (which trains PortfolioLSTM and RiskLSTM
-TOGETHER, end-to-end - see that module's docstring), so the plot and
-metrics always reflect the exact same trained pair.
+run_pipeline_multi_seed() (which trains/loads PortfolioLSTM completely on
+its own first, then trains/loads RiskLSTM SEPARATELY on top of it - see
+that module's docstring), so the plot and metrics always reflect the exact
+same paired portfolio/risk models.
 """
 
 from __future__ import annotations
@@ -120,10 +121,15 @@ def plot_position_and_scaling(result: RiskResult, output_path: str) -> None:
     out-of-sample (validation) period - each saved to its own file derived
     from `output_path`.
     """
+    # result.weights_train/weights_val (NOT portfolio_result's own) are
+    # ALIGNED to result.dates_train/dates_val and result.attenuation_train/
+    # attenuation_val - make_risk_sequences() drops the first
+    # `rolling_window - 1` samples of each split, so portfolio_result's own
+    # (longer) arrays would silently misalign here.
     pairs = result.portfolio_result.pairs
     _plot_position_and_scaling(
         dates=result.dates_train,
-        weights=result.portfolio_result.weights_train,
+        weights=result.weights_train,
         attenuation=result.attenuation_train,
         pairs=pairs,
         title="In-sample (train): position vs. risk-overlay scaling",
@@ -131,7 +137,7 @@ def plot_position_and_scaling(result: RiskResult, output_path: str) -> None:
     )
     _plot_position_and_scaling(
         dates=result.dates_val,
-        weights=result.portfolio_result.weights_val,
+        weights=result.weights_val,
         attenuation=result.attenuation_val,
         pairs=pairs,
         title="Out-of-sample (validation): position vs. risk-overlay scaling",
@@ -180,7 +186,12 @@ def plot_vol_matched_pnl(result: RiskResult, output_path: str, target_vol: float
     strategy looks "worse" purely from being smaller. Vol-matching removes
     that confound.
     """
-    raw = scale_to_target_vol(result.portfolio_result.returns_val_unscaled, target_vol)
+    # portfolio_result.returns_val_unscaled is portfolio_result's own
+    # (longer) array - align it to result.dates_val/returns_val_raw's
+    # range the same way make_risk_sequences() trimmed those (drops the
+    # first `rolling_window - 1` samples of the split).
+    trim = result.risk_model.rolling_window - 1
+    raw = scale_to_target_vol(result.portfolio_result.returns_val_unscaled[trim:], target_vol)
     risk_weighted = scale_to_target_vol(result.returns_val_raw, target_vol)
     attenuated = scale_to_target_vol(result.returns_val_scaled, target_vol)
 
@@ -254,7 +265,9 @@ def plot_transaction_cost_pnl(result: RiskResult, output_path: str, transaction_
     apply_transaction_costs in models/portfolio_lstm.py) - the final,
     most "realistic" view of the strategy's net-of-costs performance.
     """
-    final_weights_val = result.portfolio_result.weights_val * result.attenuation_val  # already-attenuated weights
+    # result.weights_val (not portfolio_result's own, longer array) is
+    # aligned to result.attenuation_val/dates_val - see make_risk_sequences.
+    final_weights_val = result.weights_val * result.attenuation_val  # already-attenuated weights
     net_returns = apply_transaction_costs(final_weights_val, result.returns_val_scaled, transaction_cost_bps)
 
     gross_sharpe = float(sharpe_ratio(torch.tensor(result.returns_val_scaled)))

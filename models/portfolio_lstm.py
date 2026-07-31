@@ -65,11 +65,14 @@ blind holdout:
 from __future__ import annotations
 
 import argparse
+import contextvars
+import copy
 import io
 import logging
 import os
 from dataclasses import dataclass
 from datetime import date, timedelta
+from typing import Callable
 
 import numpy as np
 import pandas as pd
@@ -81,6 +84,107 @@ from data.fx_downloader import FXDownloader, MAJOR_FX_PAIRS
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
+
+
+def get_device(device: str = "auto") -> torch.device:
+    """Resolve a `device` config string to an actual torch.device.
+
+    "auto" (the default) picks the best available accelerator: Apple
+    Silicon's Metal backend (MPS) if built and available (e.g. this
+    project's target M-series Macs), else CUDA if available, else CPU.
+    Explicit "cpu"/"mps"/"cuda" bypass detection entirely - useful for
+    forcing CPU (e.g. to reproduce a result bit-for-bit, since MPS's
+    numerics can differ very slightly from CPU's) or for a machine where
+    autodetection picks the "wrong" device for some reason.
+
+    Training here is full-batch (the whole split's worth of samples in one
+    forward/backward pass, not mini-batched - see train_portfolio_model),
+    so there's no per-batch host<->device transfer overhead once the data
+    is moved once at the start; a GPU/MPS backend meaningfully speeds up
+    the LSTM/attention matrix multiplications repeated every epoch.
+    """
+    if device == "auto":
+        if torch.backends.mps.is_available():
+            return torch.device("mps")
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        return torch.device("cpu")
+    return torch.device(device)
+
+# Optional hook so a caller (e.g. api/server.py, for live-updating charts in
+# the Training view) can observe interim in-sample AND out-of-sample results
+# DURING training, without train_portfolio_model/train_risk_model needing
+# any new PUBLIC parameters - mirrors api/server.py's own _current_job_id/
+# log-handler pattern (a contextvar, not a plain global, so concurrent
+# training jobs in different background threads never see each other's
+# callback). Library code (this module) only ever READS this; nothing here
+# ever sets it.
+_epoch_report_callback: contextvars.ContextVar[
+    Callable[[str, int, int, np.ndarray, np.ndarray | None, np.ndarray | None], None] | None
+] = contextvars.ContextVar("_epoch_report_callback", default=None)
+
+
+def _report_epoch(
+    stage: str,
+    epoch: int,
+    epochs: int,
+    train_returns: torch.Tensor,
+    val_returns: torch.Tensor | None = None,
+    test_returns: torch.Tensor | None = None,
+) -> None:
+    """Call the registered interim-results callback, if any, with this
+    epoch's in-sample (and, when available, out-of-sample validation AND
+    test) portfolio return series - a no-op when nothing has registered one
+    (e.g. the CLI / main.py path). `stage` is "portfolio" or "risk_overlay",
+    so a caller tracking both training stages of the --risk-overlay
+    pipeline can tell which one an update belongs to. `test_returns` is
+    reported purely for LIVE DISPLAY (e.g. the Training view's third PnL
+    chart) - it never influences any training/checkpoint-selection
+    decision, unlike val_returns (see train_portfolio_model's best-epoch
+    selection).
+    """
+    callback = _epoch_report_callback.get()
+    if callback is not None:
+        # .cpu() before .numpy(): these returns may live on an accelerator
+        # (MPS/CUDA - see get_device); the callback (e.g. api/server.py's
+        # live-chart reporting) only ever needs plain numpy from here.
+        callback(
+            stage, epoch, epochs, train_returns.detach().cpu().numpy(),
+            val_returns.detach().cpu().numpy() if val_returns is not None else None,
+            test_returns.detach().cpu().numpy() if test_returns is not None else None,
+        )
+
+
+class TrainingStopped(Exception):
+    """Raised from inside train_portfolio_model/train_risk_model's epoch
+    loop (see _check_stop) when a caller-registered stop-check callback
+    reports a stop was requested. Deliberately a plain exception, not a
+    return-value/flag threaded through every call site: it propagates
+    uninterrupted through any number of nested restarts (--n-seeds) and
+    sequential stages (portfolio training, then risk-overlay training), so
+    only the top-level caller (api/server.py's _run_training_job) needs to
+    catch it, once, to end the job cleanly instead of treating it as an
+    error.
+    """
+
+
+# Optional hook (same contextvar pattern as _epoch_report_callback above) so
+# a caller can request that an in-progress training run stop early - e.g. a
+# "Stop training" button in the Training view. Checked once per epoch;
+# there is deliberately no way to resume a stopped run, only to end it
+# cleanly wherever it currently is.
+_stop_check_callback: contextvars.ContextVar[Callable[[], bool] | None] = (
+    contextvars.ContextVar("_stop_check_callback", default=None)
+)
+
+
+def _check_stop() -> None:
+    """Raise TrainingStopped if the registered stop-check callback (if any)
+    reports a stop was requested. A no-op when nothing has registered one
+    (e.g. the CLI / main.py path, which has no way to request a stop)."""
+    callback = _stop_check_callback.get()
+    if callback is not None and callback():
+        raise TrainingStopped()
 
 
 # --------------------------------------------------------------------------
@@ -122,13 +226,122 @@ def to_log_returns(prices: pd.DataFrame) -> pd.DataFrame:
     return np.log(prices / prices.shift(1)).dropna()
 
 
+def _parse_pair(pair: str) -> tuple[str, str]:
+    """Split a 6-character FX ticker like "EURUSD" into (base, quote) =
+    ("EUR", "USD"). Assumes the standard 3+3-letter currency code
+    convention every pair in this project already follows."""
+    return pair[:3], pair[3:]
+
+
+def load_carry(pairs: list[str], years: int, dates: pd.DatetimeIndex) -> pd.DataFrame:
+    """For each pair, the interest-RATE DIFFERENTIAL (base currency's rate
+    minus quote currency's) - the single best-documented FX predictor
+    (uncovered interest parity says this SHOULD be offset by expected
+    depreciation of the higher-rate currency; empirically it mostly isn't,
+    which is exactly the carry trade). Reindexed/forward-filled onto
+    `dates` (the daily returns index) - the underlying FRED series
+    (data/rates_downloader.py) is monthly, so most days repeat the most
+    recent month's differential.
+
+    Returns a DataFrame indexed like `dates`, one column per pair, in
+    DECIMAL form (a rate difference of "2.5" percentage points becomes
+    0.025) - comparable in scale to a log return, not a raw percentage.
+    """
+    currencies = sorted({c for pair in pairs for c in _parse_pair(pair)})
+    end = date.today()
+    start = end - timedelta(days=365 * years)
+    rates = get_time_series(currencies, start, end, source="fred", field="rate")
+
+    carry = pd.DataFrame(index=dates)
+    for pair in pairs:
+        base, quote = _parse_pair(pair)
+        if base not in rates.columns or quote not in rates.columns:
+            logger.warning("No rate data for %s or %s - carry for %s will be all-zero", base, quote, pair)
+            carry[pair] = 0.0
+            continue
+        diff = (rates[base] - rates[quote]) / 100.0  # percentage points -> decimal
+        # Monthly series -> reindex onto the daily returns dates, forward-
+        # filling (a rate differential set at the start of the month is
+        # "known" every day until the next print). Deliberately NOT
+        # back-filled: any day before the first available rate print gets
+        # 0.0 (a neutral "no signal yet"), not a later value - back-filling
+        # would leak future information into those early rows.
+        carry[pair] = diff.reindex(carry.index, method="ffill").fillna(0.0)
+    return carry
+
+
+def vol_normalized_returns(returns: pd.DataFrame, horizons: list[int]) -> pd.DataFrame:
+    """For each horizon in `horizons`, each asset's trailing `horizon`-day
+    cumulative return divided by its trailing `horizon`-day realized
+    volatility - a simple, standard risk-adjusted momentum/reversal signal
+    (comparable across assets and regimes, unlike a raw cumulative return,
+    since it's already scaled by how volatile getting there was).
+
+    Returns a DataFrame with `len(horizons) * len(returns.columns)` columns,
+    named "{pair}_vol{h}", aligned to `returns`'s own index. The first
+    `max(horizons)` rows are necessarily NaN (not enough trailing history)
+    - left for the caller to handle (see build_feature_dataframe, which
+    forward/back-fills the whole feature set together).
+    """
+    eps = 1e-8
+    out = pd.DataFrame(index=returns.index)
+    for h in horizons:
+        cum_return = returns.rolling(h).sum()
+        vol = returns.rolling(h).std() + eps
+        normalized = cum_return / vol
+        for col in returns.columns:
+            out[f"{col}_vol{h}"] = normalized[col]
+    return out
+
+
+def build_feature_dataframe(
+    returns: pd.DataFrame,
+    pairs: list[str],
+    use_carry: bool,
+    vol_horizons: list[int],
+    years: int,
+) -> pd.DataFrame:
+    """Build the model's actual (wider) input feature set: for each pair,
+    in order, [raw log return, carry?, vol-normalized return at each of
+    `vol_horizons`?] - deliberately ASSET-MAJOR (all of one asset's
+    channels together, then the next asset's), not channel-major, so a
+    contiguous slice of the feature axis always belongs to one asset (this
+    is what a future per-asset encoder would slice on).
+
+    Channel 0 for every asset is ALWAYS its raw log return (see
+    _prepare_data, which relies on this to recover the raw-returns-only
+    view needed for volatility targeting) - carry/vol-normalized features
+    are additional context, never a substitute for it.
+    """
+    n_channels = 1 + int(use_carry) + len(vol_horizons)
+    carry = load_carry(pairs, years, returns.index) if use_carry else None
+    vol_norm = vol_normalized_returns(returns, vol_horizons) if vol_horizons else None
+
+    features = pd.DataFrame(index=returns.index)
+    for pair in pairs:
+        features[f"{pair}_ret"] = returns[pair]
+        if use_carry:
+            features[f"{pair}_carry"] = carry[pair]
+        for h in vol_horizons:
+            features[f"{pair}_vol{h}"] = vol_norm[f"{pair}_vol{h}"]
+
+    # vol_normalized_returns' rolling windows leave NaN at the very start
+    # (not enough trailing history yet) - forward-fill (for any mid-series
+    # gaps) then treat any still-leading NaN as a neutral 0.0, NOT
+    # back-filled: back-filling would leak a later day's value into an
+    # earlier row. Raw returns themselves are never NaN here.
+    features = features.ffill().fillna(0.0)
+    assert features.shape[1] == n_channels * len(pairs)
+    return features
+
+
 def standardize(values: np.ndarray, axis) -> tuple[np.ndarray, np.ndarray]:
     """Mean/std computed over `axis`, with a small epsilon to avoid /0."""
     return values.mean(axis=axis), values.std(axis=axis) + 1e-8
 
 
 def make_portfolio_sequences(
-    returns: pd.DataFrame, lookback: int
+    returns: pd.DataFrame, lookback: int, feature_returns: pd.DataFrame | None = None,
 ) -> tuple[np.ndarray, np.ndarray, pd.DatetimeIndex]:
     """Slide a window over `returns` to build (X, next_returns) pairs.
 
@@ -140,8 +353,17 @@ def make_portfolio_sequences(
           actually earns; day t+1's data never appears anywhere in X[i],
           so a weight can never be trained on the return it's applied to.
     dates[i]: the date of day t+1 (i.e. of next_returns[i]).
+
+    `feature_returns`, if given (see build_feature_dataframe), is a WIDER
+    DataFrame - same row count/date index as `returns`, extra columns
+    (carry, vol-normalized returns at multiple horizons) - used to build X
+    INSTEAD of `returns` itself. `next_returns`/`dates` always come from
+    `returns` alone: carry/vol-normalized features are inputs the model
+    reads, never a tradeable "return" a decided weight could be scored
+    against.
     """
     values = returns.to_numpy(dtype=np.float32)  # shape (T, n_pairs)
+    feature_values = feature_returns.to_numpy(dtype=np.float32) if feature_returns is not None else values
     index = returns.index
 
     X, next_returns, dates = [], [], []
@@ -150,7 +372,7 @@ def make_portfolio_sequences(
         day_t = start + lookback - 1     # last day inside the window - the decision day
         day_t_plus_1 = day_t + 1         # the day the decision's return is realized on
 
-        X.append(values[start:day_t + 1])          # rows start..day_t inclusive - never includes day_t+1
+        X.append(feature_values[start:day_t + 1])   # rows start..day_t inclusive - never includes day_t+1
         next_returns.append(values[day_t_plus_1])
         dates.append(index[day_t_plus_1])
 
@@ -206,11 +428,23 @@ class NoisyLinear(nn.Module):
         self.weight_sigma = nn.Parameter(torch.empty(out_features, in_features))
         self.bias_mu = nn.Parameter(torch.empty(out_features))
         self.bias_sigma = nn.Parameter(torch.empty(out_features))
-        # Buffers, not parameters: resampled every forward() call, never
-        # trained via gradient descent themselves.
+        # Buffers, not parameters: resampled every forward() call (while
+        # training and not frozen - see freeze_noise), never trained via
+        # gradient descent themselves.
         self.register_buffer("weight_epsilon", torch.empty(out_features, in_features))
         self.register_buffer("bias_epsilon", torch.empty(out_features))
         self._sigma_init = sigma_init
+        # See freeze_noise(): PortfolioLSTM.forward_sequence's sequential
+        # (use_prev_weight=True) loop calls forward() many times per single
+        # logical "pass" over the training period - resampling noise on
+        # EVERY one of those calls would repeatedly mutate weight_epsilon/
+        # bias_epsilon IN PLACE while earlier steps' still-unresolved
+        # backward computation needs their OWN step's epsilon value,
+        # corrupting it (a real bug this fixes: "one of the variables
+        # needed for gradient computation has been modified by an in-place
+        # operation"). Freezing lets a caller resample once, then hold that
+        # SAME noise fixed across every step of one such sequential pass.
+        self._frozen = False
         self._reset_parameters()
         self._reset_noise()
 
@@ -225,15 +459,66 @@ class NoisyLinear(nn.Module):
         self.weight_epsilon.normal_()
         self.bias_epsilon.normal_()
 
+    def resample_noise(self) -> None:
+        """Public entry point for a caller that needs to control exactly
+        WHEN noise gets resampled (see freeze_noise) rather than relying on
+        forward()'s automatic per-call resampling."""
+        self._reset_noise()
+
+    def freeze_noise(self, frozen: bool = True) -> None:
+        """While frozen, forward() reuses whatever weight_epsilon/
+        bias_epsilon currently hold instead of resampling - see
+        PortfolioLSTM.forward_sequence's sequential loop for the caller
+        that needs this."""
+        self._frozen = frozen
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.training:
-            self._reset_noise()
+            if not self._frozen:
+                self._reset_noise()
             weight = self.weight_mu + self.weight_sigma * self.weight_epsilon
             bias = self.bias_mu + self.bias_sigma * self.bias_epsilon
         else:
             weight = self.weight_mu
             bias = self.bias_mu
         return nn.functional.linear(x, weight, bias)
+
+
+class TemporalAttentionPool(nn.Module):
+    """Learned attention pooling over an LSTM's FULL output sequence,
+    shared by both PortfolioLSTM and RiskLSTM as an alternative to using
+    only the final hidden state (h_n[-1]) to summarize a window.
+
+    h_n[-1] forces the LSTM to compress everything relevant about the
+    whole lookback window into whatever it happens to be carrying at the
+    very last timestep - fine for a short window, but a real limitation
+    for a longer one where the most decision-relevant days (e.g. a vol
+    spike) might sit in the middle rather than at the end. Attention
+    pooling instead lets the network learn, per timestep, how relevant
+    that day's hidden state is to the current decision, and combines all
+    of them into one summary vector - the standard Bahdanau-style additive
+    attention pooling:
+        score_t = v^T tanh(W h_t)          (a learned scalar per timestep)
+        weight  = softmax_t(score_t)        (attention weights over time)
+        output  = sum_t weight_t * h_t      (the pooled summary vector)
+    """
+
+    def __init__(self, hidden_size: int):
+        super().__init__()
+        self.score = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.Tanh(),
+            nn.Linear(hidden_size, 1),
+        )
+
+    def forward(self, lstm_out: torch.Tensor) -> torch.Tensor:
+        # lstm_out: (*, T, hidden_size) -> (*, hidden_size). The leading
+        # dimension is generic (a plain batch, or batch*n_assets for
+        # PortfolioLSTM's per_asset encoder) - attention pooling is applied
+        # independently within each row of it.
+        scores = self.score(lstm_out)            # (*, T, 1)
+        weights = torch.softmax(scores, dim=-2)   # (*, T, 1)
+        return (weights * lstm_out).sum(dim=-2)   # (*, hidden_size)
 
 
 # --------------------------------------------------------------------------
@@ -245,6 +530,39 @@ class PortfolioLSTM(nn.Module):
     (one weight per pair) for the following day.
 
     See the module docstring for the two supported `weight_scheme` values.
+
+    Two encoder architectures (`encoder_type`):
+      "concat"    - the original design: one LSTM consumes every asset's
+                    features concatenated into a single per-timestep vector
+                    (input_size = n_assets * n_channels), and one Linear
+                    head maps its final hidden state directly to all
+                    n_assets logits at once. Simple, but the input/head
+                    weight matrices are tied to one fixed asset COUNT and
+                    ORDER - retraining is required to add/remove/reorder
+                    assets.
+      "per_asset" - one SHARED LSTM (input_size = n_channels) is run
+                    independently over each asset's own feature window
+                    (same weights reused for every asset, batched as
+                    batch*n_assets), producing one hidden state per asset.
+                    A cross-asset combiner (`asset_combiner`) then lets
+                    each asset's representation see the others - either
+                    self-attention across the asset dimension ("attention",
+                    the default: lets the model learn correlation/hedge
+                    relationships between specific assets) or a simple
+                    permutation-invariant mean-pool ("mean": one shared
+                    market-wide context, cheaper and more stable with few
+                    assets/short history). A single shared per-asset head
+                    (also reused across assets) then maps each asset's own
+                    hidden state + its cross-asset context to ONE logit.
+                    Because every learned weight is reused across assets
+                    (nothing depends on n_assets except the bookkeeping
+                    used to reshape input/broadcast prev_weight), this
+                    architecture is permutation-equivariant (reordering
+                    the input pairs reorders the output weights the same
+                    way) and, in principle, universe-size invariant (the
+                    same weights could run on a different NUMBER of assets
+                    than trained on - not currently exposed as a supported
+                    workflow, but nothing in the architecture prevents it).
     """
 
     def __init__(
@@ -255,10 +573,22 @@ class PortfolioLSTM(nn.Module):
         weight_scheme: str = "softmax",
         dropout: float = 0.0,
         noisy_head: bool = False,
+        use_prev_weight: bool = False,
+        n_channels: int = 1,
+        encoder_type: str = "concat",
+        asset_combiner: str = "attention",
+        n_attn_heads: int = 2,
+        pooling: str = "last",
     ):
         super().__init__()
         if weight_scheme not in ("softmax", "tanh_norm"):
             raise ValueError(f"Unknown weight_scheme: {weight_scheme!r}")
+        if encoder_type not in ("concat", "per_asset"):
+            raise ValueError(f"Unknown encoder_type: {encoder_type!r}")
+        if asset_combiner not in ("attention", "mean"):
+            raise ValueError(f"Unknown asset_combiner: {asset_combiner!r}")
+        if pooling not in ("last", "attention"):
+            raise ValueError(f"Unknown pooling: {pooling!r}")
         # Stashed (not just passed to submodules) so save_model() can
         # persist enough to reconstruct this exact architecture on load,
         # without the caller having to re-supply matching CLI flags.
@@ -268,34 +598,199 @@ class PortfolioLSTM(nn.Module):
         self.weight_scheme = weight_scheme
         self.dropout_p = dropout
         self.noisy_head = noisy_head
-        self.lstm = nn.LSTM(
-            input_size=n_assets,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            batch_first=True,  # inputs shaped (batch, time, features)
-        )
-        # Dropout on the final hidden state only - a no-op (p=0) when
+        self.use_prev_weight = use_prev_weight
+        # n_channels: how many input features per asset (1 = raw return
+        # only; >1 when carry and/or vol-normalized-return features are
+        # enabled - see build_feature_dataframe). Input width is always
+        # n_assets * n_channels, asset-major ordered.
+        self.n_channels = n_channels
+        self.encoder_type = encoder_type
+        self.asset_combiner = asset_combiner
+        self.n_attn_heads = n_attn_heads
+        self.pooling = pooling
+        # Dropout on the pooled hidden state(s) only - a no-op (p=0) when
         # `dropout` isn't set, and inactive automatically in model.eval().
         self.dropout = nn.Dropout(dropout)
-        self.head = NoisyLinear(hidden_size, n_assets) if noisy_head else nn.Linear(hidden_size, n_assets)
+        # One shared TemporalAttentionPool works for BOTH encoder types
+        # (see forward()) - it pools over whatever the leading "batch" dim
+        # happens to be (plain batch for "concat", batch*n_assets for
+        # "per_asset"), each row independently.
+        if pooling == "attention":
+            self.temporal_pool = TemporalAttentionPool(hidden_size)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (batch, lookback, n_assets)
-        _, (h_n, _) = self.lstm(x)
-        hidden = self.dropout(h_n[-1])
-        logits = self.head(hidden)  # (batch, n_assets)
+        if encoder_type == "concat":
+            self.lstm = nn.LSTM(
+                input_size=n_assets * n_channels,
+                hidden_size=hidden_size,
+                num_layers=num_layers,
+                batch_first=True,  # inputs shaped (batch, time, features)
+            )
+            # + n_assets when use_prev_weight: the classic Moody & Saffell
+            # recurrent-policy trick - concatenate the PREVIOUS day's own
+            # decided weight into the head, so the model knows what
+            # position it's already holding and can learn whether a
+            # rebalance is worth its transaction cost, rather than
+            # deciding each window's weight as if starting from flat
+            # every time.
+            head_input_size = hidden_size + n_assets if use_prev_weight else hidden_size
+            self.head = NoisyLinear(head_input_size, n_assets) if noisy_head else nn.Linear(head_input_size, n_assets)
+        else:  # "per_asset"
+            # ONE LSTM, weight-shared across every asset (run as an
+            # effective batch of batch*n_assets independent sequences of
+            # width n_channels) - this is what makes the encoder itself
+            # permutation/universe-size invariant.
+            self.asset_lstm = nn.LSTM(
+                input_size=n_channels,
+                hidden_size=hidden_size,
+                num_layers=num_layers,
+                batch_first=True,
+            )
+            if asset_combiner == "attention":
+                self.asset_attn = nn.MultiheadAttention(
+                    embed_dim=hidden_size, num_heads=n_attn_heads, batch_first=True,
+                )
+            # Per-asset head input: this asset's own hidden state,
+            # concatenated with the cross-asset context (attention output
+            # or mean-pooled market context - same width, hidden_size) and
+            # +1 for this asset's OWN previous weight (a scalar, not the
+            # whole vector - each asset only needs to know ITS OWN
+            # previously held position) when use_prev_weight.
+            head_input_size = 2 * hidden_size + (1 if use_prev_weight else 0)
+            # Applied per-asset with SHARED weights (nn.Linear/NoisyLinear
+            # act on the last dim regardless of leading batch dims), so one
+            # set of head weights produces every asset's logit.
+            self.head = NoisyLinear(head_input_size, 1) if noisy_head else nn.Linear(head_input_size, 1)
 
+    def _weights_from_logits(self, logits: torch.Tensor) -> torch.Tensor:
         if self.weight_scheme == "softmax":
             # Long-only: non-negative weights that sum to exactly 1.
             return torch.softmax(logits, dim=-1)
-
         # "tanh_norm": each weight in (-1, 1), then L1-normalized so the
         # book is fully invested (sum of absolute weights == 1).
         raw = torch.tanh(logits)
         return raw / (raw.abs().sum(dim=-1, keepdim=True) + 1e-8)
 
+    def forward(self, x: torch.Tensor, prev_weight: torch.Tensor | None = None) -> torch.Tensor:
+        # x: (batch, lookback, n_assets * n_channels). prev_weight:
+        # (batch, n_assets) - only meaningful when use_prev_weight=True;
+        # ignored otherwise. This is the "given a KNOWN previous weight per
+        # sample" entry point - fine for a single live prediction (one
+        # sample, one real previous position) or for use_prev_weight=False
+        # (no cross-sample dependency at all, so a normal single batched
+        # call is exact). TRAINING and full-history evaluation, where
+        # use_prev_weight=True means sample i's previous weight IS sample
+        # i-1's own output (a genuine dependency across the whole period,
+        # not independent per-sample batching), must use forward_sequence()
+        # instead - see that method.
+        if self.encoder_type == "concat":
+            lstm_out, (h_n, _) = self.lstm(x)
+            pooled = self.temporal_pool(lstm_out) if self.pooling == "attention" else h_n[-1]
+            hidden = self.dropout(pooled)
+            if self.use_prev_weight:
+                if prev_weight is None:
+                    prev_weight = torch.zeros(x.shape[0], self.n_assets, dtype=x.dtype, device=x.device)
+                combined = torch.cat([hidden, prev_weight], dim=-1)
+            else:
+                combined = hidden
+            logits = self.head(combined)  # (batch, n_assets)
+            return self._weights_from_logits(logits)
+
+        # "per_asset": run the SAME LSTM independently over every asset's
+        # own [lookback, n_channels] window (batched as batch*n_assets),
+        # then let assets attend to (or mean-pool over) each other before a
+        # SHARED per-asset head turns each asset's own representation into
+        # one logit.
+        batch, lookback, _ = x.shape
+        # (batch, lookback, n_assets, n_channels) -> (batch, n_assets, lookback, n_channels)
+        x_per_asset = x.view(batch, lookback, self.n_assets, self.n_channels).permute(0, 2, 1, 3)
+        x_flat = x_per_asset.reshape(batch * self.n_assets, lookback, self.n_channels)
+        lstm_out, (h_n, _) = self.asset_lstm(x_flat)
+        pooled = self.temporal_pool(lstm_out) if self.pooling == "attention" else h_n[-1]  # (batch*n_assets, hidden_size)
+        h = self.dropout(pooled).view(batch, self.n_assets, self.hidden_size)  # (batch, n_assets, hidden_size)
+
+        if self.asset_combiner == "attention":
+            context, _ = self.asset_attn(h, h, h, need_weights=False)  # (batch, n_assets, hidden_size)
+        else:  # "mean"
+            context = h.mean(dim=1, keepdim=True).expand(-1, self.n_assets, -1)
+
+        combined = torch.cat([h, context], dim=-1)  # (batch, n_assets, 2*hidden_size)
+        if self.use_prev_weight:
+            if prev_weight is None:
+                prev_weight = torch.zeros(batch, self.n_assets, dtype=x.dtype, device=x.device)
+            combined = torch.cat([combined, prev_weight.unsqueeze(-1)], dim=-1)  # (batch, n_assets, 2*hidden_size + 1)
+        logits = self.head(combined).squeeze(-1)  # (batch, n_assets)
+        return self._weights_from_logits(logits)
+
+    def forward_sequence(self, X: torch.Tensor, initial_weight: torch.Tensor | None = None) -> torch.Tensor:
+        """Compute weights for a whole ORDERED sequence of samples X (e.g.
+        an entire train or validation split), correctly handling
+        use_prev_weight=True's cross-sample dependency: sample i's input to
+        the head includes sample (i-1)'s OWN decided weight, not a
+        placeholder.
+
+        When use_prev_weight=False there's no such dependency, so this is
+        just one ordinary vectorized batch call (X.shape[0] independent
+        samples processed in parallel) - identical speed to before this
+        feature existed.
+
+        When use_prev_weight=True, samples must be processed ONE AT A TIME
+        in a Python loop (a genuine data dependency, not just a modeling
+        choice) - `prev` is DETACHED before being fed to the next step
+        (a "recurrent policy" that observes its own last action as state,
+        not full backprop-through-time over the whole period, which would
+        be both computationally intractable and numerically unstable over
+        hundreds/thousands of sequential steps). Gradients still flow
+        normally through EACH step's own local computation using the same
+        shared LSTM/head parameters, so a loss summed over the whole
+        resulting weight/return path still trains those shared parameters
+        using signal from every step - standard for this kind of
+        recurrent-policy setup.
+
+        `initial_weight` (default: flat/all-zero) is the position assumed
+        to be already held going into X[0] - pass the previous split's
+        final weight (detached) to continue a position across a
+        train/validation boundary rather than restarting from flat.
+        """
+        if not self.use_prev_weight:
+            return self.forward(X)
+
+        n = X.shape[0]
+        prev = (
+            initial_weight.detach() if initial_weight is not None
+            else torch.zeros(self.n_assets, dtype=X.dtype, device=X.device)
+        )
+        # NoisyLinear's forward() would otherwise resample its noise on
+        # EVERY one of the n sequential forward() calls below, mutating its
+        # epsilon buffers IN PLACE while an earlier step's not-yet-run
+        # backward pass still needs THAT step's own epsilon value - a real
+        # bug ("...modified by an in-place operation") once the whole
+        # period's loss is finally backpropagated. Resample ONCE here (this
+        # whole sequential pass gets one fresh noise draw, same as one
+        # ordinary forward() call would get) and hold it fixed for the
+        # loop's duration.
+        freeze = self.noisy_head and self.training
+        if freeze:
+            self.head.resample_noise()
+            self.head.freeze_noise(True)
+        try:
+            weights = []
+            for i in range(n):
+                w = self.forward(X[i : i + 1], prev.unsqueeze(0)).squeeze(0)
+                weights.append(w)
+                prev = w.detach()
+            return torch.stack(weights, dim=0)
+        finally:
+            if freeze:
+                self.head.freeze_noise(False)
+
     def _checkpoint_dict(
-        self, x_mean: np.ndarray, x_std: np.ndarray, pairs: list[str], lookback: int,
+        self,
+        x_mean: np.ndarray,
+        x_std: np.ndarray,
+        pairs: list[str],
+        lookback: int,
+        use_carry: bool = False,
+        vol_horizons: list[int] | None = None,
     ) -> dict:
         """Build the checkpoint dict shared by save_model() (-> local file)
         and save_to_db() (-> quant.model_registry blob) - one definition of
@@ -315,6 +810,12 @@ class PortfolioLSTM(nn.Module):
         it lets load_pipeline rebuild windows the same size the model was
         actually trained on, rather than trusting whatever lookback a
         caller passes in later.
+
+        `use_carry`/`vol_horizons` say exactly WHICH extra per-asset feature
+        channels (beyond n_channels itself, already in `config`) this model
+        expects - unlike `pairs`/`lookback`, there's no way to re-derive
+        these from anything else already stored, so they must be persisted
+        explicitly for load_pipeline to rebuild an identical feature set.
         """
         return {
             "config": {
@@ -324,12 +825,20 @@ class PortfolioLSTM(nn.Module):
                 "weight_scheme": self.weight_scheme,
                 "dropout": self.dropout_p,
                 "noisy_head": self.noisy_head,
+                "use_prev_weight": self.use_prev_weight,
+                "n_channels": self.n_channels,
+                "encoder_type": self.encoder_type,
+                "asset_combiner": self.asset_combiner,
+                "n_attn_heads": self.n_attn_heads,
+                "pooling": self.pooling,
             },
             "state_dict": self.state_dict(),
             "x_mean": torch.as_tensor(x_mean),
             "x_std": torch.as_tensor(x_std),
             "pairs": list(pairs),
             "lookback": lookback,
+            "use_carry": use_carry,
+            "vol_horizons": list(vol_horizons) if vol_horizons else [],
         }
 
     @classmethod
@@ -337,10 +846,11 @@ class PortfolioLSTM(nn.Module):
         """Reconstruct a PortfolioLSTM from a checkpoint dict (however it was
         loaded - from a local file or a DB blob). The returned model also
         carries `.x_mean`/`.x_std` (as numpy arrays), `.pairs` (the ordered
-        FX pairs it was trained on), and `.lookback` (the sequence length it
-        was trained on) so callers can standardize new input windows
-        identically to training and build them with the correct asset
-        order/length without having to re-supply either themselves.
+        FX pairs it was trained on), `.lookback` (the sequence length it
+        was trained on), and `.use_carry`/`.vol_horizons` (which extra
+        feature channels it expects) so callers can standardize new input
+        windows and rebuild the exact same feature set without having to
+        re-supply any of it themselves.
         """
         model = cls(**checkpoint["config"])
         model.load_state_dict(checkpoint["state_dict"])
@@ -349,6 +859,8 @@ class PortfolioLSTM(nn.Module):
         model.x_std = checkpoint["x_std"].numpy()
         model.pairs = checkpoint["pairs"]
         model.lookback = checkpoint["lookback"]
+        model.use_carry = checkpoint.get("use_carry", False)
+        model.vol_horizons = checkpoint.get("vol_horizons", [])
         return model
 
     def save_model(
@@ -359,6 +871,8 @@ class PortfolioLSTM(nn.Module):
         x_std: np.ndarray,
         pairs: list[str],
         lookback: int,
+        use_carry: bool = False,
+        vol_horizons: list[int] | None = None,
     ) -> None:
         """Persist trained weights, the architecture config, the input
         standardization stats (x_mean/x_std), the ordered FX pairs, and the
@@ -368,7 +882,7 @@ class PortfolioLSTM(nn.Module):
         re-derive x_mean/x_std, and without risking weights being applied
         to the wrong assets or windows of the wrong length.
         """
-        torch.save(self._checkpoint_dict(x_mean, x_std, pairs, lookback), path)
+        torch.save(self._checkpoint_dict(x_mean, x_std, pairs, lookback, use_carry, vol_horizons), path)
         logger.info("Saved model weights to %s", path)
 
     def save_to_db(
@@ -379,6 +893,8 @@ class PortfolioLSTM(nn.Module):
         x_std: np.ndarray,
         pairs: list[str],
         lookback: int,
+        use_carry: bool = False,
+        vol_horizons: list[int] | None = None,
         description: str = "",
     ) -> None:
         """Serialize the same checkpoint save_model() would write, and
@@ -388,7 +904,7 @@ class PortfolioLSTM(nn.Module):
         from data.model_registry import save_model_blob
 
         buffer = io.BytesIO()
-        torch.save(self._checkpoint_dict(x_mean, x_std, pairs, lookback), buffer)
+        torch.save(self._checkpoint_dict(x_mean, x_std, pairs, lookback, use_carry, vol_horizons), buffer)
         save_model_blob(name, buffer.getvalue(), model_type="portfolio", description=description)
 
     @classmethod
@@ -424,9 +940,16 @@ class EnsemblePortfolioLSTM(nn.Module):
         # all members share the same scheme since they're restarts of the
         # same training run.
         self.weight_scheme = models[0].weight_scheme
+        self.use_prev_weight = models[0].use_prev_weight
+        self.n_assets = models[0].n_assets
+        self.n_channels = models[0].n_channels
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        weights = torch.stack([m(x) for m in self.models], dim=0)  # (n_models, batch, n_assets)
+    def forward(self, x: torch.Tensor, prev_weight: torch.Tensor | None = None) -> torch.Tensor:
+        # Every member sees the SAME prev_weight - there's only one actual
+        # position held (the ensemble average), so all members reason
+        # about a rebalance from that same real starting point, not their
+        # own individual (never-actually-held) previous prediction.
+        weights = torch.stack([m(x, prev_weight) for m in self.models], dim=0)  # (n_models, batch, n_assets)
         averaged = weights.mean(dim=0)                              # (batch, n_assets)
         # A simple average of several softmax vectors already sums to
         # exactly 1 (a convex combination of points on the simplex stays on
@@ -437,14 +960,52 @@ class EnsemblePortfolioLSTM(nn.Module):
         # invested" invariant each individual model already satisfies.
         return averaged / (averaged.abs().sum(dim=-1, keepdim=True) + 1e-8)
 
+    def forward_sequence(self, X: torch.Tensor, initial_weight: torch.Tensor | None = None) -> torch.Tensor:
+        """Ensemble counterpart of PortfolioLSTM.forward_sequence() - see
+        that method's docstring. Feeds the ENSEMBLE's own (averaged)
+        previous decision back to every member at each step, since that
+        average is the only position actually held."""
+        if not self.use_prev_weight:
+            return self.forward(X)
+        n = X.shape[0]
+        prev = (
+            initial_weight.detach() if initial_weight is not None
+            else torch.zeros(self.n_assets, dtype=X.dtype, device=X.device)
+        )
+        # Same NoisyLinear in-place-mutation hazard as
+        # PortfolioLSTM.forward_sequence (see its comment) - here across
+        # EVERY member's own head, since self.forward() calls each member's
+        # forward() once per sequential step.
+        noisy_members = [m for m in self.models if m.noisy_head and m.training]
+        for m in noisy_members:
+            m.head.resample_noise()
+            m.head.freeze_noise(True)
+        try:
+            weights = []
+            for i in range(n):
+                w = self.forward(X[i : i + 1], prev.unsqueeze(0)).squeeze(0)
+                weights.append(w)
+                prev = w.detach()
+            return torch.stack(weights, dim=0)
+        finally:
+            for m in noisy_members:
+                m.head.freeze_noise(False)
+
     def _checkpoint_dict(
-        self, x_mean: np.ndarray, x_std: np.ndarray, pairs: list[str], lookback: int,
+        self,
+        x_mean: np.ndarray,
+        x_std: np.ndarray,
+        pairs: list[str],
+        lookback: int,
+        use_carry: bool = False,
+        vol_horizons: list[int] | None = None,
     ) -> dict:
         """Build the checkpoint dict shared by save_model() (-> local file)
         and save_to_db() (-> quant.model_registry blob). All restarts were
         trained on the same standardized data, so one x_mean/x_std pair, one
-        ordered `pairs` list, and one `lookback` (see
-        PortfolioLSTM._checkpoint_dict) cover the whole ensemble.
+        ordered `pairs` list, one `lookback`, and one `use_carry`/
+        `vol_horizons` (see PortfolioLSTM._checkpoint_dict) cover the whole
+        ensemble.
         """
         return {
             "members": [
@@ -456,6 +1017,12 @@ class EnsemblePortfolioLSTM(nn.Module):
                         "weight_scheme": m.weight_scheme,
                         "dropout": m.dropout_p,
                         "noisy_head": m.noisy_head,
+                        "use_prev_weight": m.use_prev_weight,
+                        "n_channels": m.n_channels,
+                        "encoder_type": m.encoder_type,
+                        "asset_combiner": m.asset_combiner,
+                        "n_attn_heads": m.n_attn_heads,
+                        "pooling": m.pooling,
                     },
                     "state_dict": m.state_dict(),
                 }
@@ -465,14 +1032,17 @@ class EnsemblePortfolioLSTM(nn.Module):
             "x_std": torch.as_tensor(x_std),
             "pairs": list(pairs),
             "lookback": lookback,
+            "use_carry": use_carry,
+            "vol_horizons": list(vol_horizons) if vol_horizons else [],
         }
 
     @classmethod
     def _from_checkpoint(cls, checkpoint: dict) -> "EnsemblePortfolioLSTM":
         """Reconstruct every member from a checkpoint dict (however it was
         loaded - from a local file or a DB blob). The returned ensemble
-        also carries `.x_mean`/`.x_std` (as numpy arrays), `.pairs`, and
-        `.lookback`, same as PortfolioLSTM._from_checkpoint()."""
+        also carries `.x_mean`/`.x_std` (as numpy arrays), `.pairs`,
+        `.lookback`, and `.use_carry`/`.vol_horizons`, same as
+        PortfolioLSTM._from_checkpoint()."""
         members = []
         for member_checkpoint in checkpoint["members"]:
             member = PortfolioLSTM(**member_checkpoint["config"])
@@ -485,6 +1055,8 @@ class EnsemblePortfolioLSTM(nn.Module):
         ensemble.x_std = checkpoint["x_std"].numpy()
         ensemble.pairs = checkpoint["pairs"]
         ensemble.lookback = checkpoint["lookback"]
+        ensemble.use_carry = checkpoint.get("use_carry", False)
+        ensemble.vol_horizons = checkpoint.get("vol_horizons", [])
         return ensemble
 
     def save_model(
@@ -495,9 +1067,11 @@ class EnsemblePortfolioLSTM(nn.Module):
         x_std: np.ndarray,
         pairs: list[str],
         lookback: int,
+        use_carry: bool = False,
+        vol_horizons: list[int] | None = None,
     ) -> None:
         """Persist every member's config + weights so the ensemble can be reloaded without retraining any of them."""
-        torch.save(self._checkpoint_dict(x_mean, x_std, pairs, lookback), path)
+        torch.save(self._checkpoint_dict(x_mean, x_std, pairs, lookback, use_carry, vol_horizons), path)
         logger.info("Saved ensemble weights (%d members) to %s", len(self.models), path)
 
     def save_to_db(
@@ -508,6 +1082,8 @@ class EnsemblePortfolioLSTM(nn.Module):
         x_std: np.ndarray,
         pairs: list[str],
         lookback: int,
+        use_carry: bool = False,
+        vol_horizons: list[int] | None = None,
         description: str = "",
     ) -> None:
         """Serialize the same checkpoint save_model() would write, and
@@ -517,7 +1093,7 @@ class EnsemblePortfolioLSTM(nn.Module):
         from data.model_registry import save_model_blob
 
         buffer = io.BytesIO()
-        torch.save(self._checkpoint_dict(x_mean, x_std, pairs, lookback), buffer)
+        torch.save(self._checkpoint_dict(x_mean, x_std, pairs, lookback, use_carry, vol_horizons), buffer)
         save_model_blob(name, buffer.getvalue(), model_type="portfolio_ensemble", description=description)
 
     @classmethod
@@ -581,17 +1157,271 @@ def sharpe_ratio(
     return mean / std * (periods_per_year ** 0.5)
 
 
+def rolling_window_ratio(
+    portfolio_returns: torch.Tensor,
+    window: int,
+    downside: bool = True,
+    periods_per_year: int = 252,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """A more robust training objective than sharpe_ratio()'s single
+    whole-period ratio: the MEAN ratio computed over many overlapping
+    `window`-day sub-windows of `portfolio_returns` instead of one ratio
+    over the entire period.
+
+    A single whole-period Sharpe lets a model with enough capacity find one
+    weight pattern that happens to nail this exact historical sequence - it
+    can be "great on net" while being terrible in some sub-periods and great
+    in others, as long as the two average out favorably; that's exactly the
+    kind of fit that maximizes in-sample Sharpe but doesn't generalize.
+    Scoring (and averaging) the SAME ratio across many overlapping
+    sub-windows instead forces the model to be consistently good across
+    different segments of the training history, not just good in
+    aggregate. Falls back to a single whole-period window when there isn't
+    enough history for even one `window`-day slice.
+
+    `downside=True` computes a Sortino-style ratio (mean / downside
+    deviation, i.e. the std of only the below-zero returns, with zeros
+    substituted for the rest so the denominator's sample size stays fixed)
+    instead of Sharpe's plain mean/std - same shape of objective, still a
+    single number with no extra combined penalty weight to tune, just a
+    risk measure that isn't inflated by the upside volatility a trader is
+    happy to keep.
+
+    Used as the TRAINING loss only (train_portfolio_model/train_joint_model)
+    - reported/plotted Sharpe elsewhere in the app still uses the plain
+    whole-period sharpe_ratio(), so what gets shown to the user is unchanged;
+    only what the optimizer is pushed toward changes.
+    """
+    n = portfolio_returns.shape[0]
+    window = min(window, n)  # not enough history for a full window - fall back to one whole-period "window"
+    windows = portfolio_returns.unfold(0, window, 1)  # (n_windows, window)
+    means = windows.mean(dim=1)
+    if downside:
+        downside_sq = windows.clamp(max=0.0) ** 2
+        spread = torch.sqrt(downside_sq.mean(dim=1) + eps)
+    else:
+        spread = windows.std(dim=1) + eps
+    ratios = means / spread * (periods_per_year ** 0.5)
+    return ratios.mean()
+
+
+def kelly_loss(portfolio_returns: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Negative expected log-wealth growth rate (the Kelly criterion):
+    -E[log(1 + portfolio_return)].
+
+    Unlike Sharpe/Sortino (ratios, not convex or concave in general), this
+    is a genuinely CONCAVE function of the weights - log(1 + affine
+    function of weights) is concave, and expectation preserves concavity -
+    so maximizing expected log-wealth is a convex minimization problem in
+    weight-space (on top of whatever the LSTM itself contributes). It
+    directly targets long-run COMPOUNDED growth rather than a single-period
+    mean/std ratio: two return paths with identical mean and std can
+    compound to very different wealth outcomes if one has fatter tails, and
+    log-wealth penalizes that automatically, with no extra tunable weight.
+
+    `portfolio_returns` is treated as an (approximately arithmetic) period
+    return, consistent with how the rest of this module already treats the
+    weights-dot-log-returns quantity (see e.g. apply_transaction_costs).
+    Clamped at `eps` before taking the log so a very bad, highly levered day
+    (1 + return <= 0) can't produce a NaN/-inf gradient - the clamp is a
+    numerical safety net, not expected to bind for a well-behaved,
+    vol-targeted portfolio.
+    """
+    return -torch.log(torch.clamp(1.0 + portfolio_returns, min=eps)).mean()
+
+
+def cvar(portfolio_returns: torch.Tensor, alpha: float = 0.95) -> torch.Tensor:
+    """Empirical Conditional Value-at-Risk (a.k.a. Expected Shortfall) of
+    `portfolio_returns` at confidence level `alpha`: the average LOSS on the
+    worst `1 - alpha` fraction of days (e.g. alpha=0.95 -> the average of
+    the worst 5% of days).
+
+    CVaR is a well-known CONVEX risk measure (Rockafellar & Uryasev, 2000) -
+    unlike variance, it only penalizes the tail that actually hurts (the
+    downside), and unlike max drawdown it stays convex/differentiable. This
+    uses the standard empirical estimator (mean of the k worst realized
+    losses, via topk) rather than the auxiliary-variable LP formulation
+    Rockafellar & Uryasev derive for classical convex solvers - equivalent
+    for a fixed empirical sample, and differentiable via topk's gradient
+    (flows through whichever k days are currently the worst).
+    """
+    losses = -portfolio_returns
+    n = losses.shape[0]
+    k = max(1, int(round((1.0 - alpha) * n)))
+    worst_losses, _ = torch.topk(losses, k)
+    return worst_losses.mean()
+
+
+def mean_cvar_loss(
+    portfolio_returns: torch.Tensor, alpha: float = 0.95, kappa: float = 1.0, periods_per_year: int = 252,
+) -> torch.Tensor:
+    """Mean-CVaR training loss: -annualized_mean(returns) + kappa * annualized_CVaR_alpha(returns).
+
+    This is the textbook convex portfolio objective (Rockafellar & Uryasev,
+    2000): both `-mean` (linear/affine) and `CVaR` (convex) are convex in
+    the weights, and a nonnegative linear combination of convex functions is
+    convex, so this whole loss is convex in weight-space - unlike a RATIO
+    of return to risk (Sharpe, Sortino, or a naive mean/CVaR ratio), which
+    is not convex/concave in general. The tradeoff for that guarantee is
+    `kappa`: a FIXED (not learned) risk-aversion weight balancing "how much
+    expected return is worth giving up to reduce tail risk" - there is no
+    way to combine two different quantities (return, tail risk) into one
+    strictly convex scalar without some such weight; `kappa` plays the same
+    structural role as mean-variance's lambda, just applied to CVaR
+    (tail risk) instead of variance (symmetric risk).
+
+    Both terms are annualized the SAME way sharpe_ratio() annualizes mean
+    and std (mean scaled by `periods_per_year`, the spread-like CVaR term
+    by its square root) before being combined - not just cosmetic scaling.
+    On raw daily FX returns, the mean is tiny (a fraction of a percent) while
+    CVaR (average of the worst days) is roughly the same order of magnitude
+    as daily volatility - 10-30x larger in practice - so combining them
+    UNANNUALIZED with kappa=1.0 made the loss almost entirely about
+    minimizing CVaR, with the mean term contributing well under 10% of the
+    gradient signal: the model barely learned to seek return at all.
+    Annualizing first brings both terms to a comparable order of magnitude
+    (a plausible annual return vs. a plausible annual tail-loss figure), so
+    kappa=1.0 is a genuinely balanced default instead of one that
+    accidentally starves the return term.
+    """
+    annualized_mean = portfolio_returns.mean() * periods_per_year
+    annualized_cvar = cvar(portfolio_returns, alpha=alpha) * (periods_per_year ** 0.5)
+    return -annualized_mean + kappa * annualized_cvar
+
+
+def compute_training_loss(
+    portfolio_returns: torch.Tensor,
+    objective: str,
+    sharpe_window: int = 60,
+    cvar_alpha: float = 0.95,
+    cvar_kappa: float = 1.0,
+) -> torch.Tensor:
+    """Dispatch to whichever training objective `objective` selects - the
+    single place train_portfolio_model/train_joint_model compute their loss,
+    so all three objectives are available to both.
+
+    - "sharpe": -rolling_window_ratio(..., downside=True) - the default;
+      a rolling-window, downside-risk-adjusted Sortino-style ratio (see
+      rolling_window_ratio). Not convex, but a ratio directly comparable to
+      the Sharpe numbers reported everywhere else in the app.
+    - "kelly": kelly_loss(...) - maximize expected log-wealth growth.
+      Convex, no extra tunable weight.
+    - "cvar": mean_cvar_loss(...) - maximize mean return net of a tail-risk
+      (CVaR) penalty at a fixed weight. Convex, but needs `cvar_kappa`.
+    """
+    if objective == "sharpe":
+        return -rolling_window_ratio(portfolio_returns, window=sharpe_window, downside=True)
+    if objective == "kelly":
+        return kelly_loss(portfolio_returns)
+    if objective == "cvar":
+        return mean_cvar_loss(portfolio_returns, alpha=cvar_alpha, kappa=cvar_kappa)
+    raise ValueError(f"Unknown objective: {objective!r} (expected 'sharpe', 'kelly', or 'cvar')")
+
+
 # --------------------------------------------------------------------------
 # Volatility targeting: rescale PortfolioLSTM's raw weights to a target vol
 # --------------------------------------------------------------------------
 
+def estimate_covariance(
+    window_returns: torch.Tensor, estimator: str = "sample", ewma_lambda: float = 0.94,
+) -> torch.Tensor:
+    """Estimate each sample's (n_assets, n_assets) return covariance matrix
+    from its own `window_returns` (batch, lookback, n_assets) window, under
+    one of three estimators:
+
+    "sample" (the original/default): every day in the window weighted
+    equally - simple, but on a short window (the default lookback is 30
+    days) a handful of coincidentally-calm or coincidentally-correlated
+    days can swing the whole estimate, and with lookback <= n_assets it can
+    even be singular. This is the estimator portfolio_volatility always
+    used before covariance_estimator existed.
+
+    "ewma" (RiskMetrics-style exponentially-weighted covariance):
+    more recent days weighted more heavily via geometric decay
+    `ewma_lambda` (0.94 is the RiskMetrics daily default - a ~11-day
+    half-life), so the estimate reacts faster to a genuine regime change
+    (a real vol spike) while still using the whole window for stability -
+    a strict improvement over equal-weighting for a quantity (volatility)
+    that's well known to cluster/decay over time.
+
+    "ledoit_wolf" (Ledoit & Wolf, 2004 - shrinkage toward scaled identity):
+    blends the sample covariance with a well-conditioned target
+    (`mu * I`, where mu is the average sample variance) using the
+    analytically-derived optimal shrinkage intensity, rather than a fixed
+    blend weight. Directly addresses the sample estimator's worst failure
+    mode for vol-targeting (see scale_weights_to_target_vol's max_leverage
+    docstring): a short window's sample covariance can be near-singular
+    (spuriously tiny estimated risk) purely by chance, producing an
+    enormous leverage scale-up right before a normal-sized move wipes out
+    the position. Shrinkage inflates small eigenvalues toward the target,
+    so the estimate is never THAT close to singular.
+
+    Returns: (batch, n_assets, n_assets).
+    """
+    if estimator not in ("sample", "ewma", "ledoit_wolf"):
+        raise ValueError(f"Unknown covariance_estimator: {estimator!r} (expected 'sample', 'ewma', or 'ledoit_wolf')")
+
+    lookback = window_returns.shape[1]
+
+    if estimator == "ewma":
+        # Weight day t (0 = oldest, lookback-1 = most recent) by
+        # (1 - lambda) * lambda^(lookback-1-t), then renormalize to sum to
+        # exactly 1 (a finite window truncates the infinite geometric
+        # series, so the raw weights alone sum to slightly under 1).
+        age = torch.arange(lookback - 1, -1, -1, dtype=window_returns.dtype, device=window_returns.device)
+        raw_w = (1.0 - ewma_lambda) * (ewma_lambda ** age)
+        w = (raw_w / raw_w.sum()).view(1, lookback, 1)  # (1, lookback, 1) - broadcasts over batch/assets
+        mean = (window_returns * w).sum(dim=1, keepdim=True)
+        centered = window_returns - mean
+        # Weighted outer product sum: (batch, n_assets, n_assets).
+        return torch.einsum("bti,btj->bij", centered * w, centered)
+
+    # "sample" and "ledoit_wolf" both start from the plain sample covariance.
+    centered = window_returns - window_returns.mean(dim=1, keepdim=True)  # (batch, lookback, n_assets)
+    sample_cov = torch.einsum("bti,btj->bij", centered, centered) / max(lookback - 1, 1)
+
+    if estimator == "sample":
+        return sample_cov
+
+    # "ledoit_wolf": shrink toward F = mu * I, mu = average sample variance,
+    # with the analytically optimal shrinkage intensity (Ledoit & Wolf,
+    # 2004, eq. 14): delta* = clamp(pi_hat / gamma_hat, 0, 1), where
+    # pi_hat estimates the total variance of the sample covariance's own
+    # entries (how noisy the estimate itself is) and gamma_hat is the
+    # squared Frobenius distance between the sample covariance and the
+    # target (how much bias shrinking toward that target would introduce).
+    n_assets = window_returns.shape[-1]
+    mu = torch.diagonal(sample_cov, dim1=-2, dim2=-1).mean(dim=-1)  # (batch,)
+    eye = torch.eye(n_assets, dtype=window_returns.dtype, device=window_returns.device)
+    target = mu.view(-1, 1, 1) * eye  # (batch, n_assets, n_assets)
+
+    # Per-day outer products x_t x_t' (batch, lookback, n_assets, n_assets),
+    # each an unbiased-in-expectation single-day covariance estimate;
+    # pi_hat is how much these vary sample-to-sample around their average
+    # (the sample covariance itself).
+    outer = torch.einsum("bti,btj->btij", centered, centered)
+    deviation = outer - sample_cov.unsqueeze(1)  # (batch, lookback, n_assets, n_assets)
+    pi_hat = (deviation ** 2).sum(dim=(-1, -2)).mean(dim=1) / max(lookback - 1, 1)  # (batch,)
+    gamma_hat = ((sample_cov - target) ** 2).sum(dim=(-1, -2))  # (batch,)
+    delta = (pi_hat / gamma_hat.clamp(min=1e-12)).clamp(min=0.0, max=1.0)  # (batch,)
+
+    delta = delta.view(-1, 1, 1)
+    return delta * target + (1.0 - delta) * sample_cov
+
+
 def portfolio_volatility(
-    window_returns: torch.Tensor, weights: torch.Tensor, periods_per_year: int = 252
+    window_returns: torch.Tensor,
+    weights: torch.Tensor,
+    periods_per_year: int = 252,
+    covariance_estimator: str = "sample",
+    ewma_lambda: float = 0.94,
 ) -> torch.Tensor:
     """Estimate each sample's ANNUALIZED portfolio volatility from the
-    realized covariance of every asset's log returns over `window_returns`
-    (the same RAW, real-scale lookback window the weights were computed
-    from) and the proposed `weights`.
+    estimated covariance (see estimate_covariance - "sample", "ewma", or
+    "ledoit_wolf") of every asset's log returns over `window_returns` (the
+    same RAW, real-scale lookback window the weights were computed from)
+    and the proposed `weights`.
 
     window_returns: (batch, lookback, n_assets), real (unstandardized) log
     returns - real units are required since this gets compared against a
@@ -600,16 +1430,19 @@ def portfolio_volatility(
     Returns: (batch,) - annualized volatility of dot(weights, daily_return)
     under each sample's own window covariance estimate (w^T . Sigma . w).
     """
-    lookback = window_returns.shape[1]
-    centered = window_returns - window_returns.mean(dim=1, keepdim=True)  # (batch, lookback, n_assets)
-    # Per-sample covariance matrix: (batch, n_assets, n_assets).
-    cov = torch.einsum("bti,btj->bij", centered, centered) / max(lookback - 1, 1)
+    cov = estimate_covariance(window_returns, covariance_estimator, ewma_lambda)
     portfolio_var = torch.einsum("bi,bij,bj->b", weights, cov, weights).clamp(min=1e-12)
     return torch.sqrt(portfolio_var) * (periods_per_year ** 0.5)
 
 
 def scale_weights_to_target_vol(
-    weights: torch.Tensor, window_returns: torch.Tensor, target_vol: float, periods_per_year: int = 252
+    weights: torch.Tensor,
+    window_returns: torch.Tensor,
+    target_vol: float,
+    periods_per_year: int = 252,
+    max_leverage: float = 10.0,
+    covariance_estimator: str = "sample",
+    ewma_lambda: float = 0.94,
 ) -> torch.Tensor:
     """Rescale `weights` uniformly per sample so the resulting portfolio's
     estimated annualized volatility (see portfolio_volatility) matches
@@ -619,13 +1452,88 @@ def scale_weights_to_target_vol(
     FX portfolios are typically low-vol day to day, so hitting a target
     like 20% annualized usually means scaling weights UP - sum(weights)
     can end up above 1 (real leverage). That's the intended effect of
-    vol-targeting, not a bug: everything downstream (Sharpe training
-    objective, reported PnL, the risk overlay) operates on these
-    already-scaled weights, and nothing scales them again afterwards.
+    vol-targeting, not a bug: everything downstream (training objective,
+    reported PnL, the risk overlay) operates on these already-scaled
+    weights, and nothing scales them again afterwards.
+
+    `max_leverage` caps the scale factor itself (not just a clamp deep
+    inside portfolio_volatility): whenever a sample's window happens to
+    look coincidentally calm, the ESTIMATED covariance can be tiny, and
+    dividing target_vol by a near-zero estimate produces an enormous scale
+    - confirmed to reach 1000x+ on realistic synthetic data. That one
+    sample can then realize a catastrophic (<-100%) return the moment the
+    actual next-day move isn't equally calm. This hurts every training
+    objective's numerical stability, but is especially severe for
+    log-wealth (Kelly): log(1 + return) has a singularity at return = -1,
+    and the safety clamp used there produces an exact ZERO gradient for
+    any return at or below it - the model gets no corrective signal from
+    precisely the sample that most needs one. Capping leverage at a sane
+    multiple keeps every sample's worst-case return bounded and finite,
+    fixing that dead-gradient failure mode at its source rather than
+    papering over the symptom in each loss function individually.
     """
-    vol = portfolio_volatility(window_returns, weights, periods_per_year).clamp(min=1e-8)
-    scale = target_vol / vol
+    if target_vol == 0:
+        return weights
+
+    vol = portfolio_volatility(
+        window_returns, weights, periods_per_year, covariance_estimator, ewma_lambda,
+    ).clamp(min=1e-8)
+    scale = (target_vol / vol).clamp(max=max_leverage)
     return weights * scale.unsqueeze(-1)
+
+
+# --------------------------------------------------------------------------
+# Benchmark: inverse-volatility (risk-weighted) portfolio
+# --------------------------------------------------------------------------
+
+def inverse_vol_benchmark_returns(window_returns: np.ndarray, next_returns: np.ndarray) -> np.ndarray:
+    """A simple, UN-LEARNED "risk-weighted" benchmark allocator: every day,
+    weight each asset inversely to its own trailing realized volatility
+    over that SAME day's lookback window, normalized so weights sum to 1 -
+    the classic inverse-volatility / naive risk-parity portfolio (no
+    learning, no target-vol leverage, no transaction-cost awareness - just
+    "hold less of whatever's been noisier lately").
+
+    window_returns: (n_days, lookback, n_assets), the SAME raw per-sample
+    windows the model itself saw for each of those days (so the benchmark
+    uses exactly as much information as the model did, no more/less).
+    next_returns: (n_days, n_assets) - the realized next-day return
+    actually applied on each of those days.
+
+    Returns: (n_days,) - this benchmark's own raw (unscaled) daily
+    returns. Callers comparing it against a model's PnL should first
+    rescale it to the model's own realized volatility - see
+    vol_match_benchmark - since a plain risk-parity book runs at whatever
+    volatility the market happens to produce, not any particular target.
+    """
+    if len(window_returns) == 0:
+        return np.zeros(0, dtype=np.float64)
+    std = window_returns.std(axis=1) + 1e-8  # (n_days, n_assets)
+    inv_vol = 1.0 / std
+    weights = inv_vol / inv_vol.sum(axis=1, keepdims=True)
+    return (weights * next_returns).sum(axis=1)
+
+
+def vol_match_benchmark(
+    benchmark_returns: np.ndarray, model_returns: np.ndarray, periods_per_year: int = 252,
+) -> np.ndarray:
+    """Rescale `benchmark_returns` by ONE constant multiplier (uniform
+    across the whole period, not day-by-day) so its realized annualized
+    volatility matches `model_returns`' own - so a benchmark-vs-model PnL
+    comparison isolates "did the LEARNED allocation add value" from "did
+    the model just happen to run hotter or colder than the benchmark this
+    period", which would otherwise be an apples-to-oranges comparison (the
+    model is actively vol-targeted; a plain risk-parity book is not).
+    Matched SEPARATELY per split (train/val/test), since realized
+    volatility can differ a lot between them.
+    """
+    if len(benchmark_returns) == 0:
+        return benchmark_returns
+    benchmark_vol = benchmark_returns.std() * (periods_per_year ** 0.5)
+    model_vol = model_returns.std() * (periods_per_year ** 0.5)
+    if benchmark_vol < 1e-12:
+        return benchmark_returns
+    return benchmark_returns * (model_vol / benchmark_vol)
 
 
 # --------------------------------------------------------------------------
@@ -709,18 +1617,36 @@ def train_portfolio_model(
     weight_decay: float = 0.0,
     noise_std: float = 0.0,
     transaction_cost: float = 0.0,
+    max_leverage: float = 10.0,
+    objective: str = "sharpe",
+    sharpe_window: int = 60,
+    cvar_alpha: float = 0.95,
+    cvar_kappa: float = 1.0,
+    covariance_estimator: str = "sample",
+    ewma_lambda: float = 0.94,
+    X_val: torch.Tensor | None = None,
+    X_val_raw: torch.Tensor | None = None,
+    next_returns_val: torch.Tensor | None = None,
+    X_test: torch.Tensor | None = None,
+    X_test_raw: torch.Tensor | None = None,
+    next_returns_test: torch.Tensor | None = None,
 ) -> None:
     """Full-batch training: at every epoch, allocate weights for the WHOLE
     training period at once, rescale them to --target-vol (see
     scale_weights_to_target_vol), compute the resulting return series, and
-    take a gradient step on its (negated) Sharpe ratio - so the model is
-    trained to directly maximize the Sharpe ratio of the volatility-
-    targeted portfolio it will actually be evaluated on, not the raw one.
+    take a gradient step on `objective`'s loss (see compute_training_loss -
+    "sharpe": a rolling-window, downside-risk-adjusted ratio; "kelly":
+    negative expected log-wealth growth, convex; "cvar": mean return net of
+    a fixed-weight CVaR tail-risk penalty, convex). The default ("sharpe")
+    scores the model across many overlapping `sharpe_window`-day
+    sub-periods of training history instead of one ratio over the whole
+    period, so it can't just find one weight pattern that happens to nail
+    the exact historical sequence.
 
-    This is full-batch rather than mini-batch on purpose: Sharpe ratio is a
-    statistic of the entire return distribution (mean/std), so it can only
-    be evaluated meaningfully over a full set of returns, not one sample at
-    a time as with a per-sample loss like MSE.
+    This is full-batch rather than mini-batch on purpose: these ratios are
+    statistics of a return distribution (mean/std), so they can only be
+    evaluated meaningfully over a full set of returns, not one sample at a
+    time as with a per-sample loss like MSE.
 
     `noise_std` > 0 adds fresh Gaussian noise to the (already standardized)
     input window on every epoch - the model sees a slightly different
@@ -733,28 +1659,118 @@ def train_portfolio_model(
 
     `transaction_cost` > 0 (basis points per unit of turnover - the same
     knob apply_transaction_costs uses for reporting) subtracts a turnover-
-    based cost from the return series BEFORE computing Sharpe (see
-    apply_transaction_costs_torch), so the model is trained to maximize
-    Sharpe net of trading costs directly - it learns to avoid abrupt,
-    expensive day-to-day weight swings whenever they're not worth their
-    cost, rather than being scored on gross returns and only having costs
-    applied afterwards as a reporting adjustment.
+    based cost from the return series BEFORE computing the training ratio
+    (see apply_transaction_costs_torch), so the model is trained to
+    maximize its objective net of trading costs directly - it learns to
+    avoid abrupt, expensive day-to-day weight swings whenever they're not
+    worth their cost, rather than being scored on gross returns and only
+    having costs applied afterwards as a reporting adjustment.
+
+    If `X_val`/`X_val_raw`/`next_returns_val` are given, the model is
+    scored on genuine held-out validation Sharpe (the plain whole-period
+    metric, matching what's reported elsewhere) after every epoch, and the
+    state_dict from whichever epoch had the BEST validation Sharpe is
+    restored at the end - not just whichever epoch the fixed `epochs`
+    budget happened to end on. This directly targets an in-sample-great,
+    out-of-sample-poor training curve: rather than trusting the last epoch,
+    the run keeps the point that actually generalized best. This is a
+    genuine use of validation data (an early-stopping / checkpoint-
+    selection criterion, not part of the loss/gradient itself), the
+    standard reason a validation split exists.
+
+    If `X_test`/`X_test_raw`/`next_returns_test` are ALSO given, test
+    returns are computed every epoch too - but PURELY for live reporting
+    (see _report_epoch/the Training view's third PnL chart), never for
+    checkpoint selection: best_state is chosen by validation Sharpe alone,
+    exactly as without a test set. This is the whole point of a separate
+    test split (see PortfolioResult's docstring) - it stays a genuinely
+    unbiased read on generalization, never influencing any decision the
+    way validation does.
     """
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    track_val = X_val is not None and X_val_raw is not None and next_returns_val is not None
+    track_test = X_test is not None and X_test_raw is not None and next_returns_test is not None
+    best_val_sharpe = -float("inf")
+    best_state: dict | None = None
 
     model.train()
-    for epoch in range(1, epochs + 1):
-        optimizer.zero_grad()
-        noisy_X_train = X_train + torch.randn_like(X_train) * noise_std if noise_std > 0 else X_train
-        raw_weights = model(noisy_X_train)                                       # (n_train, n_assets)
-        weights = scale_weights_to_target_vol(raw_weights, X_train_raw, target_vol)
-        portfolio_returns = (weights * next_returns_train).sum(dim=-1)  # (n_train,)
-        portfolio_returns = apply_transaction_costs_torch(weights, portfolio_returns, transaction_cost)
-        loss = -sharpe_ratio(portfolio_returns)
-        loss.backward()
-        optimizer.step()
-        if epoch == 1 or epoch % max(epochs // 10, 1) == 0:
-            logger.info("epoch %d/%d - train Sharpe (vol-targeted, net of costs) %.4f", epoch, epochs, -loss.item())
+    try:
+        for epoch in range(1, epochs + 1):
+            _check_stop()
+            optimizer.zero_grad()
+            noisy_X_train = X_train + torch.randn_like(X_train) * noise_std if noise_std > 0 else X_train
+            raw_weights = model.forward_sequence(noisy_X_train)                       # (n_train, n_assets)
+            weights = scale_weights_to_target_vol(
+                raw_weights, X_train_raw, target_vol, max_leverage=max_leverage,
+                covariance_estimator=covariance_estimator, ewma_lambda=ewma_lambda,
+            )
+            portfolio_returns = (weights * next_returns_train).sum(dim=-1)  # (n_train,)
+            portfolio_returns = apply_transaction_costs_torch(weights, portfolio_returns, transaction_cost)
+            loss = compute_training_loss(
+                portfolio_returns, objective, sharpe_window=sharpe_window, cvar_alpha=cvar_alpha, cvar_kappa=cvar_kappa,
+            )
+            loss.backward()
+            optimizer.step()
+
+            if track_val:
+                model.eval()
+                with torch.no_grad():
+                    # Continue the position from train's own last decided
+                    # weight (this epoch) rather than restarting flat at
+                    # the train/val boundary - real portfolios don't reset.
+                    val_initial = weights[-1].detach() if model.use_prev_weight else None
+                    val_weights = scale_weights_to_target_vol(
+                        model.forward_sequence(X_val, initial_weight=val_initial), X_val_raw, target_vol,
+                        max_leverage=max_leverage,
+                        covariance_estimator=covariance_estimator, ewma_lambda=ewma_lambda,
+                    )
+                    val_returns = (val_weights * next_returns_val).sum(dim=-1)
+                    val_returns = apply_transaction_costs_torch(val_weights, val_returns, transaction_cost)
+                    val_sharpe = float(sharpe_ratio(val_returns))
+
+                    test_returns = None
+                    if track_test:
+                        # Continue from val's own last decided weight, same
+                        # reasoning as train->val above. Purely for live
+                        # display - see track_test's docstring note above -
+                        # never touches best_state/checkpoint selection.
+                        test_initial = val_weights[-1].detach() if model.use_prev_weight and val_weights.shape[0] > 0 else val_initial
+                        test_weights = scale_weights_to_target_vol(
+                            model.forward_sequence(X_test, initial_weight=test_initial), X_test_raw, target_vol,
+                            max_leverage=max_leverage,
+                            covariance_estimator=covariance_estimator, ewma_lambda=ewma_lambda,
+                        )
+                        test_returns = (test_weights * next_returns_test).sum(dim=-1)
+                        test_returns = apply_transaction_costs_torch(test_weights, test_returns, transaction_cost)
+                model.train()
+                if val_sharpe > best_val_sharpe:
+                    best_val_sharpe = val_sharpe
+                    best_state = copy.deepcopy(model.state_dict())
+
+            if epoch == 1 or epoch % max(epochs // 10, 1) == 0:
+                val_msg = f" | val Sharpe {val_sharpe:.4f}" if track_val else ""
+                logger.info(
+                    "epoch %d/%d - train loss (%s, net of costs) %.4f%s",
+                    epoch, epochs, objective, loss.item(), val_msg,
+                )
+                _report_epoch(
+                    "portfolio", epoch, epochs, portfolio_returns,
+                    val_returns if track_val else None,
+                    # test tracking piggybacks on val's continuation chain
+                    # (test_initial is derived from val_weights above), so
+                    # it's only computed/reported when val tracking is ALSO on.
+                    test_returns if track_val and track_test else None,
+                )
+    except TrainingStopped:
+        logger.info("Training stopped early at epoch %d/%d", epoch, epochs)
+        if track_val and best_state is not None:
+            model.load_state_dict(best_state)
+            logger.info("Restored best-validation-Sharpe checkpoint (val Sharpe %.4f)", best_val_sharpe)
+        raise
+
+    if track_val and best_state is not None:
+        model.load_state_dict(best_state)
+        logger.info("Restored best-validation-Sharpe checkpoint (val Sharpe %.4f)", best_val_sharpe)
 
 
 # --------------------------------------------------------------------------
@@ -803,6 +1819,26 @@ class PortfolioResult:
     next_returns_val: np.ndarray    # raw log-return scale, (n_val, n_assets)
     x_mean: np.ndarray          # standardization stats X was fit/loaded with
     x_std: np.ndarray
+    # Test split (see DEFAULT_CONFIG's test_frac) - held out from every
+    # training/model-selection decision, unlike validation. Empty arrays
+    # (n_test=0) when test_frac=0. Mirrors the train/val fields above.
+    dates_test: pd.DatetimeIndex
+    returns_test: np.ndarray
+    weights_test: np.ndarray
+    returns_test_unscaled: np.ndarray
+    weights_test_unscaled: np.ndarray
+    X_test: torch.Tensor
+    next_returns_test: np.ndarray
+    # Inverse-volatility (risk-weighted) benchmark - a plain, un-learned
+    # allocator (see inverse_vol_benchmark_returns) rescaled to match this
+    # model's OWN realized volatility on the SAME period (see
+    # vol_match_benchmark) - so the comparison isolates "did the LEARNED
+    # allocation add value" from "did the model just run hotter/colder",
+    # separately for each split (in-sample and out-of-sample dynamics can
+    # differ a lot).
+    benchmark_returns_train: np.ndarray
+    benchmark_returns_val: np.ndarray
+    benchmark_returns_test: np.ndarray
 
 
 #: Default configuration - main.py (the project's single entry point) reads
@@ -816,6 +1852,18 @@ DEFAULT_CONFIG: dict = {
     "lookback": 30,
     "years": 8,
     "train_frac": 0.8,
+    # Chronological 3-way split: the most recent `test_frac` fraction of
+    # ALL sequences is carved off FIRST as the test set - held out
+    # completely from every training/model-selection decision (unlike
+    # validation, which best-epoch checkpoint selection DOES see - see
+    # train_portfolio_model's docstring) - so test performance is a genuine
+    # unbiased read on generalization, not just "the split that happened to
+    # look best." `train_frac` keeps its original meaning applied to
+    # whatever remains AFTER carving out test: e.g. train_frac=0.8,
+    # test_frac=0.1 -> the oldest 72% of all data is train, the next 18%
+    # is validation, and the most recent 10% is test. 0.0 disables the test
+    # split entirely (train/val only, the original 2-way behavior).
+    "test_frac": 0.1,
     # PortfolioLSTM architecture / training
     "weight_scheme": "softmax",  # "softmax" (long-only) or "tanh_norm" (long/short)
     "hidden_size": 32,
@@ -825,13 +1873,64 @@ DEFAULT_CONFIG: dict = {
     "weight_decay": 1e-4,
     "noise_std": 0.05,
     "target_vol": 0.20,
+    # Caps the leverage vol-targeting can impose on any single sample (see
+    # scale_weights_to_target_vol) - without this, a window whose ESTIMATED
+    # covariance happens to be near zero can get scaled up by 100x-1000x+,
+    # risking a catastrophic realized loss the moment the actual next-day
+    # move isn't equally calm. This is what makes the "kelly"/"cvar"
+    # training objectives numerically safe (log-wealth in particular has a
+    # singularity at a -100% return); it also protects "sharpe" from rare
+    # but arbitrarily large outlier gradients.
+    "max_leverage": 10.0,
     # Parameter-space noise (NoisyNet) on the output head(s) - PortfolioLSTM's
-    # head, and RiskLSTM's head_2 when risk_overlay is on - resampled every
-    # forward() call during training, mu-only (deterministic) at eval time.
+    # head, and BOTH of RiskLSTM's head/head_2 layers when risk_overlay is
+    # on - resampled every forward() call during training, mu-only
+    # (deterministic) at eval time.
     # Composes with noise_std rather than replacing it: noise_std perturbs
     # the input, this perturbs the model's own decision boundary, so neither
     # alone is enough to memorize one exact Sharpe-maximizing configuration.
     "noisy_head": False,
+    # Feed the previous day's OWN decided weight into the head alongside
+    # the current window (the Moody & Saffell recurrent-policy trick) - so
+    # the model knows what position it already holds and can learn whether
+    # a rebalance is worth its transaction cost, rather than deciding each
+    # window as if starting flat every time. Pairs naturally with
+    # `transaction_cost` > 0. Forces training/evaluation to process the
+    # whole split as a genuine sequential recurrence (see
+    # PortfolioLSTM.forward_sequence) instead of one parallel batched call,
+    # so it's meaningfully slower - off by default.
+    "use_prev_weight": False,
+    # Adds one extra "CASH" pseudo-pair (constant `cash_return` every day,
+    # so it's a zero-variance asset - see _prepare_data) to `pairs`, letting
+    # the allocator choose to de-risk by holding cash directly instead of
+    # relying solely on the (separate) risk overlay to shrink positions.
+    # Enables the ablation: does the risk overlay still add value once the
+    # allocator itself can hold cash? cash_return=0.0 means cash earns
+    # nothing (the standard, simplest choice; a nonzero short rate can be
+    # supplied instead).
+    "has_cash": False,
+    "cash_return": 0.0,
+    # Training objective (see compute_training_loss): which quantity
+    # train_portfolio_model/train_joint_model take a gradient step on.
+    #   "sharpe" - rolling-window, downside-risk-adjusted ratio (see
+    #              rolling_window_ratio) over `sharpe_window`-day
+    #              sub-windows of the training period, not one ratio over
+    #              the whole period - so it can't just find one weight
+    #              pattern that happens to nail the exact historical
+    #              sequence. Not convex, but directly comparable to the
+    #              Sharpe numbers reported everywhere else in the app.
+    #   "kelly"  - negative expected log-wealth growth (Kelly criterion).
+    #              Convex, no extra tunable weight.
+    #   "cvar"   - mean return net of a fixed-weight CVaR tail-risk penalty
+    #              (`cvar_kappa`). Convex, at the cost of that fixed weight.
+    "objective": "sharpe",
+    "sharpe_window": 60,
+    "cvar_alpha": 0.95,  # confidence level for CVaR - the worst (1 - alpha) fraction of days
+    "cvar_kappa": 1.0,   # fixed risk-aversion weight on CVaR in the "cvar" objective
+    # Whichever epoch has the best VALIDATION Sharpe (always the plain,
+    # whole-period metric, regardless of `objective`) is kept at the end
+    # instead of always the last one - see train_portfolio_model's
+    # docstring for why.
     # Multi-seed restarts (see run_pipeline_multi_seed)
     "n_seeds": 1,
     "restart_strategy": "best",  # "best" or "ensemble"
@@ -842,12 +1941,62 @@ DEFAULT_CONFIG: dict = {
     "risk_lr": 1e-3,
     "max_attenuation": 0.33,
     "risk_rolling_window": 10,
+    # Portfolio-wide cross-sectional risk features (average pairwise
+    # correlation, correlation dispersion, top eigenvalue share of the
+    # rolling cross-asset correlation matrix - see risk_lstm.py's
+    # cross_sectional_features) appended to RiskLSTM's per-timestep input
+    # alongside its existing per-asset (marginal) statistics. Off by
+    # default - the attenuation head then sees only marginal risk, exactly
+    # as before this feature existed.
+    "use_cross_sectional": False,
     # Transaction costs, in basis points per unit of turnover - 0 disables
     # them entirely. Applied BOTH inside the training objective (Sharpe is
     # computed net of turnover-based costs - see apply_transaction_costs_torch
     # - so the model learns to avoid abrupt, costly weight swings) and to
     # reported/plotted returns (see apply_transaction_costs).
     "transaction_cost": 0.0,
+    # Extra per-asset input feature channels (see build_feature_dataframe).
+    # use_carry adds the interest-rate differential (data/rates_downloader.py
+    # via db.py's get_time_series); vol_horizons adds, for each horizon (in
+    # days), that asset's trailing cumulative-return-over-realized-vol ratio.
+    # Both default OFF - the model then sees raw log returns only, exactly
+    # as before either feature existed.
+    "use_carry": False,
+    "vol_horizons": [],
+    # Encoder architecture (see PortfolioLSTM's docstring): "concat" (the
+    # original design - one LSTM over all assets' concatenated features) or
+    # "per_asset" (one shared per-asset LSTM + cross-asset attention/mean-
+    # pooling - permutation/universe-size invariant). asset_combiner and
+    # n_attn_heads only matter when encoder_type="per_asset".
+    "encoder_type": "concat",
+    "asset_combiner": "attention",  # "attention" or "mean"
+    "n_attn_heads": 2,
+    # Covariance estimator for volatility targeting (see estimate_covariance
+    # in scale_weights_to_target_vol/portfolio_volatility): "sample" (the
+    # original plain equal-weighted covariance over the lookback window),
+    # "ewma" (RiskMetrics-style exponentially-weighted - reacts faster to a
+    # genuine vol regime change), or "ledoit_wolf" (shrinkage toward a
+    # well-conditioned scaled-identity target with the analytically optimal
+    # shrinkage intensity - directly addresses the near-singular-covariance
+    # failure mode max_leverage was added to cap the SYMPTOM of).
+    # ewma_lambda only matters when covariance_estimator="ewma" (0.94 is the
+    # RiskMetrics daily default, a ~11-day half-life).
+    "covariance_estimator": "sample",
+    "ewma_lambda": 0.94,
+    # Time pooling (see TemporalAttentionPool): "last" (the original design
+    # - use the LSTM's final hidden state, h_n[-1], as the whole window's
+    # summary) or "attention" (learned attention pooling over EVERY
+    # timestep's hidden state - lets the network learn which days in the
+    # window matter most, rather than trusting the last day alone to have
+    # retained everything relevant). Applies to both PortfolioLSTM and
+    # RiskLSTM.
+    "pooling": "last",
+    # Compute device (see get_device): "auto" picks Apple Silicon's Metal
+    # backend (MPS) if available, else CUDA, else CPU. Both PortfolioLSTM
+    # and (if enabled) RiskLSTM are moved to this device for training and
+    # evaluation; only their own hot per-epoch forward/backward passes run
+    # on it - one-off feature engineering (pandas/numpy) stays on CPU.
+    "device": "auto",
     # Persistence: each of load_portfolio/load_risk accepts EITHER a local
     # .pt file path OR a quant.model_registry name (see
     # load_portfolio_model_auto below); save_db additionally persists
@@ -883,6 +2032,14 @@ def portfolio_model_name(args: argparse.Namespace) -> str:
         lookback=args.lookback,
         hidden_size=args.hidden_size,
         target_vol=args.target_vol,
+        has_cash=getattr(args, "has_cash", False),
+        use_prev_weight=getattr(args, "use_prev_weight", False),
+        use_carry=getattr(args, "use_carry", False),
+        vol_horizons=sorted(getattr(args, "vol_horizons", []) or []),
+        encoder_type=getattr(args, "encoder_type", "concat"),
+        asset_combiner=getattr(args, "asset_combiner", "attention"),
+        covariance_estimator=getattr(args, "covariance_estimator", "sample"),
+        pooling=getattr(args, "pooling", "last"),
     )
 
 
@@ -903,16 +2060,22 @@ class _PreparedData:
 
     pairs: list[str]
     lookback: int
+    n_channels: int
     dates_train: pd.DatetimeIndex
     dates_val: pd.DatetimeIndex
+    dates_test: pd.DatetimeIndex
     X_train: torch.Tensor
     X_val: torch.Tensor
+    X_test: torch.Tensor
     X_train_raw: torch.Tensor   # real (unstandardized) log-return windows - for volatility targeting
     X_val_raw: torch.Tensor
+    X_test_raw: torch.Tensor
     next_returns_train_raw: np.ndarray
     next_returns_val_raw: np.ndarray
+    next_returns_test_raw: np.ndarray
     x_mean: np.ndarray
     x_std: np.ndarray
+    device: torch.device   # X_train/X_val/X_test/*_raw already live here - see get_device
 
 
 def _prepare_data(
@@ -921,6 +2084,8 @@ def _prepare_data(
     x_std: np.ndarray | None = None,
     pairs: list[str] | None = None,
     lookback: int | None = None,
+    use_carry: bool | None = None,
+    vol_horizons: list[int] | None = None,
 ) -> _PreparedData:
     """Load data (via db.py), build sequences, split by time, and
     standardize - everything a training (or inference) run needs that
@@ -938,15 +2103,47 @@ def _prepare_data(
     always corresponds to pairs[i], and the LSTM's learned dynamics assume
     windows of exactly the trained lookback, so a loaded model's own stored
     values must win over whatever a caller (e.g. a UI form) passes in.
+
+    Likewise, `use_carry`/`vol_horizons`, when given (not None), OVERRIDE
+    args.use_carry/args.vol_horizons - a loaded model's own stored feature
+    configuration (see PortfolioLSTM._from_checkpoint) must win, since the
+    LSTM's input width is fixed at training time and would silently
+    mismatch data built with a different feature configuration.
+
+    "CASH" (see `args.has_cash`/`args.cash_return`) is added to `pairs`
+    (and to `returns`, as a constant-value column) here - AFTER fetching
+    real price data for the real pairs only, since CASH has no ticker - so
+    it's treated as JUST ANOTHER ASSET everywhere downstream (vol-
+    targeting, transaction costs, reporting, per-asset charts) with no
+    special-casing needed: a constant daily return gives it exactly zero
+    realized variance, which scale_weights_to_target_vol's own covariance
+    estimate already handles correctly (a risk-free asset contributes no
+    variance, exactly as it should). If `pairs` was passed in already
+    containing "CASH" (a loaded model that was trained with has_cash=True),
+    that's honored regardless of `args.has_cash` - it's a property of the
+    model, not a free evaluation-time choice.
     """
+    has_cash = getattr(args, "has_cash", False)
+    cash_return = getattr(args, "cash_return", 0.0)
+
     if pairs is None:
-        pairs = list(dict.fromkeys(args.pairs))  # de-duplicate, keep order
+        real_pairs = list(dict.fromkeys(args.pairs))  # de-duplicate, keep order
+    else:
+        has_cash = has_cash or ("CASH" in pairs)
+        real_pairs = [p for p in pairs if p != "CASH"]
     if lookback is None:
         lookback = args.lookback
 
-    logger.info("Loading %s via db.py", pairs)
-    prices = load_close_prices(pairs, years=args.years)
+    logger.info("Loading %s via db.py", real_pairs)
+    prices = load_close_prices(real_pairs, years=args.years)
     returns = to_log_returns(prices)
+
+    if has_cash:
+        returns = returns.copy()
+        returns["CASH"] = cash_return
+        pairs = real_pairs + ["CASH"]
+    else:
+        pairs = real_pairs
 
     min_rows = lookback + 1  # need `lookback` history days plus 1 realized return to form even one sequence
     if len(returns) < min_rows:
@@ -955,63 +2152,149 @@ def _prepare_data(
             f"{min_rows} (sequence length {lookback} + 1) - increase 'years' to fetch more history."
         )
 
-    X, next_returns, dates = make_portfolio_sequences(returns, lookback=lookback)
+    if use_carry is None:
+        use_carry = getattr(args, "use_carry", False)
+    if vol_horizons is None:
+        vol_horizons = getattr(args, "vol_horizons", []) or []
+    n_channels = 1 + int(use_carry) + len(vol_horizons)
+    feature_returns = (
+        build_feature_dataframe(returns, pairs, use_carry, vol_horizons, args.years)
+        if n_channels > 1 else None
+    )
 
-    # Time-based split: train on the earlier segment, validate on the later
-    # (most recent) one - this is the out-of-sample set.
-    n_train = int(len(X) * args.train_frac)
-    X_train_raw, X_val_raw = X[:n_train], X[n_train:]
-    next_returns_train_raw, next_returns_val_raw = next_returns[:n_train], next_returns[n_train:]
-    dates_train, dates_val = dates[:n_train], dates[n_train:]
+    X, next_returns, dates = make_portfolio_sequences(returns, lookback=lookback, feature_returns=feature_returns)
 
-    # Standardize only the LSTM's input features. next_returns stay on the
-    # real log-return scale - they're multiplied by the weights to get real
-    # portfolio P&L, so they must not be rescaled.
+    # Chronological 3-way split: the most recent `test_frac` fraction is
+    # carved off FIRST as the test set (held out from every training/
+    # model-selection decision - see PortfolioResult's docstring), then
+    # `train_frac` splits whatever REMAINS into train/validation, exactly
+    # as before test_frac existed. test_frac=0 (the default off-state for
+    # any caller that doesn't set it) reproduces the original 2-way split
+    # precisely: n_test=0, n_remaining=len(X).
+    test_frac = getattr(args, "test_frac", 0.0) or 0.0
+    n_total = len(X)
+    n_test = int(n_total * test_frac)
+    n_remaining = n_total - n_test
+    n_train = int(n_remaining * args.train_frac)
+
+    X_full_train_raw, X_full_val_raw, X_full_test_raw = X[:n_train], X[n_train:n_remaining], X[n_remaining:]
+    next_returns_train_raw = next_returns[:n_train]
+    next_returns_val_raw = next_returns[n_train:n_remaining]
+    next_returns_test_raw = next_returns[n_remaining:]
+    dates_train, dates_val, dates_test = dates[:n_train], dates[n_train:n_remaining], dates[n_remaining:]
+
+    # Standardize the LSTM's FULL (possibly multi-channel: return + carry +
+    # vol-normalized-return per asset) input features. next_returns stay on
+    # the real log-return scale - they're multiplied by the weights to get
+    # real portfolio P&L, so they must not be rescaled.
     if x_mean is None or x_std is None:
-        x_mean, x_std = standardize(X_train_raw, axis=(0, 1))  # TRAIN-only stats
-    X_train = torch.tensor((X_train_raw - x_mean) / x_std)
-    X_val = torch.tensor((X_val_raw - x_mean) / x_std)
+        x_mean, x_std = standardize(X_full_train_raw, axis=(0, 1))  # TRAIN-only stats
+
+    # Every tensor that feeds the network's own hot per-epoch forward/
+    # backward pass (the standardized X_*, and the raw-return X_*_raw used
+    # every epoch by vol-targeting) is moved to `device` ONCE here - see
+    # get_device. Everything upstream (pandas/numpy feature engineering)
+    # stays on CPU; only the repeated matrix-multiply-heavy work benefits
+    # from an accelerator, and this is full-batch training (one transfer
+    # per split, not one per mini-batch), so there's no per-step overhead.
+    device = get_device(getattr(args, "device", "auto"))
+    X_train = torch.tensor((X_full_train_raw - x_mean) / x_std, device=device)
+    X_val = torch.tensor((X_full_val_raw - x_mean) / x_std, device=device)
+    X_test = torch.tensor((X_full_test_raw - x_mean) / x_std, device=device)
+
+    # Volatility targeting (scale_weights_to_target_vol/portfolio_volatility)
+    # needs the RAW REAL log-return of each asset only - never carry or a
+    # vol-normalized ratio, which aren't returns and would corrupt the
+    # covariance estimate. Channel 0 of every asset's block is always the
+    # raw return (see build_feature_dataframe's asset-major layout), so
+    # slicing every n_channels-th column recovers exactly that.
+    X_train_raw = X_full_train_raw[:, :, 0::n_channels]
+    X_val_raw = X_full_val_raw[:, :, 0::n_channels]
+    X_test_raw = X_full_test_raw[:, :, 0::n_channels]
 
     return _PreparedData(
         pairs=pairs,
         lookback=lookback,
+        n_channels=n_channels,
         dates_train=dates_train,
         dates_val=dates_val,
+        dates_test=dates_test,
         X_train=X_train,
         X_val=X_val,
-        X_train_raw=torch.tensor(X_train_raw),
-        X_val_raw=torch.tensor(X_val_raw),
+        X_test=X_test,
+        X_train_raw=torch.tensor(X_train_raw, device=device),
+        X_val_raw=torch.tensor(X_val_raw, device=device),
+        X_test_raw=torch.tensor(X_test_raw, device=device),
         next_returns_train_raw=next_returns_train_raw,
         next_returns_val_raw=next_returns_val_raw,
+        next_returns_test_raw=next_returns_test_raw,
         x_mean=x_mean,
         x_std=x_std,
+        device=device,
     )
 
 
-def evaluate_portfolio_model(model: nn.Module, data: _PreparedData, weight_scheme: str, target_vol: float) -> PortfolioResult:
-    """Run an already-trained-or-loaded model (eval mode, no grad) over both
-    splits, rescale its raw weights to `target_vol` (see
-    scale_weights_to_target_vol), and package the result - keeping both the
-    pre-scaling ("unscaled") and post-scaling (vol-targeted) weights/returns
-    so callers can compare them. Shared by the train path (after fitting)
-    and the load path (skips fitting entirely).
+def evaluate_portfolio_model(
+    model: nn.Module, data: _PreparedData, weight_scheme: str, target_vol: float, max_leverage: float = 10.0,
+    covariance_estimator: str = "sample", ewma_lambda: float = 0.94,
+) -> PortfolioResult:
+    """Run an already-trained-or-loaded model (eval mode, no grad) over all
+    three splits (train/validation/test - test is empty when test_frac=0),
+    rescale its raw weights to `target_vol` (see scale_weights_to_target_vol),
+    and package the result - keeping both the pre-scaling ("unscaled") and
+    post-scaling (vol-targeted) weights/returns so callers can compare them,
+    plus an inverse-volatility benchmark vol-matched to the model on each
+    split. Shared by the train path (after fitting) and the load path
+    (skips fitting entirely).
     """
     model.eval()
     with torch.no_grad():
-        raw_weights_train = model(data.X_train)
-        raw_weights_val = model(data.X_val)
-        weights_train_t = scale_weights_to_target_vol(raw_weights_train, data.X_train_raw, target_vol)
-        weights_val_t = scale_weights_to_target_vol(raw_weights_val, data.X_val_raw, target_vol)
+        raw_weights_train = model.forward_sequence(data.X_train)
+        use_prev = getattr(model, "use_prev_weight", False)
+        val_initial = raw_weights_train[-1].detach() if use_prev and raw_weights_train.shape[0] > 0 else None
+        raw_weights_val = model.forward_sequence(data.X_val, initial_weight=val_initial)
+        test_initial = raw_weights_val[-1].detach() if use_prev and raw_weights_val.shape[0] > 0 else val_initial
+        raw_weights_test = model.forward_sequence(data.X_test, initial_weight=test_initial)
+        weights_train_t = scale_weights_to_target_vol(
+            raw_weights_train, data.X_train_raw, target_vol, max_leverage=max_leverage,
+            covariance_estimator=covariance_estimator, ewma_lambda=ewma_lambda,
+        )
+        weights_val_t = scale_weights_to_target_vol(
+            raw_weights_val, data.X_val_raw, target_vol, max_leverage=max_leverage,
+            covariance_estimator=covariance_estimator, ewma_lambda=ewma_lambda,
+        )
+        weights_test_t = scale_weights_to_target_vol(
+            raw_weights_test, data.X_test_raw, target_vol, max_leverage=max_leverage,
+            covariance_estimator=covariance_estimator, ewma_lambda=ewma_lambda,
+        )
 
-    weights_train_unscaled = raw_weights_train.numpy()
-    weights_val_unscaled = raw_weights_val.numpy()
-    weights_train = weights_train_t.numpy()
-    weights_val = weights_val_t.numpy()
+    # .cpu() before .numpy(): these tensors may live on an accelerator
+    # (MPS/CUDA - see get_device); torch's .numpy() only works on CPU
+    # tensors, and everything from here on (PnL, benchmark, reporting) is
+    # plain numpy - no further accelerator benefit past this point.
+    weights_train_unscaled = raw_weights_train.cpu().numpy()
+    weights_val_unscaled = raw_weights_val.cpu().numpy()
+    weights_test_unscaled = raw_weights_test.cpu().numpy()
+    weights_train = weights_train_t.cpu().numpy()
+    weights_val = weights_val_t.cpu().numpy()
+    weights_test = weights_test_t.cpu().numpy()
 
     returns_train_unscaled = (weights_train_unscaled * data.next_returns_train_raw).sum(axis=1)
     returns_val_unscaled = (weights_val_unscaled * data.next_returns_val_raw).sum(axis=1)
+    returns_test_unscaled = (weights_test_unscaled * data.next_returns_test_raw).sum(axis=1)
     returns_train = (weights_train * data.next_returns_train_raw).sum(axis=1)
     returns_val = (weights_val * data.next_returns_val_raw).sum(axis=1)
+    returns_test = (weights_test * data.next_returns_test_raw).sum(axis=1)
+
+    benchmark_returns_train = vol_match_benchmark(
+        inverse_vol_benchmark_returns(data.X_train_raw.cpu().numpy(), data.next_returns_train_raw), returns_train,
+    )
+    benchmark_returns_val = vol_match_benchmark(
+        inverse_vol_benchmark_returns(data.X_val_raw.cpu().numpy(), data.next_returns_val_raw), returns_val,
+    )
+    benchmark_returns_test = vol_match_benchmark(
+        inverse_vol_benchmark_returns(data.X_test_raw.cpu().numpy(), data.next_returns_test_raw), returns_test,
+    )
 
     return PortfolioResult(
         model=model,
@@ -1021,20 +2304,30 @@ def evaluate_portfolio_model(model: nn.Module, data: _PreparedData, weight_schem
         target_vol=target_vol,
         dates_train=data.dates_train,
         dates_val=data.dates_val,
+        dates_test=data.dates_test,
         returns_train=returns_train,
         returns_val=returns_val,
+        returns_test=returns_test,
         weights_train=weights_train,
         weights_val=weights_val,
+        weights_test=weights_test,
         returns_train_unscaled=returns_train_unscaled,
         returns_val_unscaled=returns_val_unscaled,
+        returns_test_unscaled=returns_test_unscaled,
         weights_train_unscaled=weights_train_unscaled,
         weights_val_unscaled=weights_val_unscaled,
+        weights_test_unscaled=weights_test_unscaled,
         X_train=data.X_train,
         X_val=data.X_val,
+        X_test=data.X_test,
         next_returns_train=data.next_returns_train_raw,
         next_returns_val=data.next_returns_val_raw,
+        next_returns_test=data.next_returns_test_raw,
         x_mean=data.x_mean,
         x_std=data.x_std,
+        benchmark_returns_train=benchmark_returns_train,
+        benchmark_returns_val=benchmark_returns_val,
+        benchmark_returns_test=benchmark_returns_test,
     )
 
 
@@ -1048,15 +2341,34 @@ def _train_and_evaluate(data: _PreparedData, args: argparse.Namespace) -> Portfo
         weight_scheme=args.weight_scheme,
         dropout=args.dropout,
         noisy_head=args.noisy_head,
-    )
+        use_prev_weight=args.use_prev_weight,
+        n_channels=data.n_channels,
+        encoder_type=getattr(args, "encoder_type", "concat"),
+        asset_combiner=getattr(args, "asset_combiner", "attention"),
+        n_attn_heads=getattr(args, "n_attn_heads", 2),
+        pooling=getattr(args, "pooling", "last"),
+    ).to(data.device)
+    covariance_estimator = getattr(args, "covariance_estimator", "sample")
+    ewma_lambda = getattr(args, "ewma_lambda", 0.94)
     train_portfolio_model(
-        model, data.X_train, data.X_train_raw, torch.tensor(data.next_returns_train_raw),
+        model, data.X_train, data.X_train_raw,
+        torch.tensor(data.next_returns_train_raw, device=data.device),
         target_vol=args.target_vol,
         epochs=args.epochs, lr=args.lr,
         weight_decay=args.weight_decay, noise_std=args.noise_std,
-        transaction_cost=args.transaction_cost,
+        transaction_cost=args.transaction_cost, max_leverage=args.max_leverage,
+        objective=args.objective, sharpe_window=args.sharpe_window,
+        cvar_alpha=args.cvar_alpha, cvar_kappa=args.cvar_kappa,
+        covariance_estimator=covariance_estimator, ewma_lambda=ewma_lambda,
+        X_val=data.X_val, X_val_raw=data.X_val_raw,
+        next_returns_val=torch.tensor(data.next_returns_val_raw, device=data.device),
+        X_test=data.X_test, X_test_raw=data.X_test_raw,
+        next_returns_test=torch.tensor(data.next_returns_test_raw, device=data.device),
     )
-    return evaluate_portfolio_model(model, data, args.weight_scheme, args.target_vol)
+    return evaluate_portfolio_model(
+        model, data, args.weight_scheme, args.target_vol, max_leverage=args.max_leverage,
+        covariance_estimator=covariance_estimator, ewma_lambda=ewma_lambda,
+    )
 
 
 def load_pipeline(args: argparse.Namespace) -> PortfolioResult:
@@ -1088,8 +2400,20 @@ def load_pipeline(args: argparse.Namespace) -> PortfolioResult:
             "using the model's own lookback.",
             args.lookback, model.lookback,
         )
-    data = _prepare_data(args, x_mean=model.x_mean, x_std=model.x_std, pairs=model.pairs, lookback=model.lookback)
-    return evaluate_portfolio_model(model, data, model.weight_scheme, args.target_vol)
+    data = _prepare_data(
+        args, x_mean=model.x_mean, x_std=model.x_std, pairs=model.pairs, lookback=model.lookback,
+        use_carry=getattr(model, "use_carry", False), vol_horizons=getattr(model, "vol_horizons", []),
+    )
+    # load_portfolio_model_auto reconstructs the checkpoint on CPU
+    # (torch.load(..., map_location="cpu")) regardless of what device it was
+    # originally trained on - move it to match data's device (see
+    # _prepare_data/get_device) before running it against data.X_train/etc.
+    model = model.to(data.device)
+    return evaluate_portfolio_model(
+        model, data, model.weight_scheme, args.target_vol, max_leverage=args.max_leverage,
+        covariance_estimator=getattr(args, "covariance_estimator", "sample"),
+        ewma_lambda=getattr(args, "ewma_lambda", 0.94),
+    )
 
 
 def run_pipeline(args: argparse.Namespace) -> PortfolioResult:
@@ -1147,7 +2471,9 @@ def run_pipeline_multi_seed(args: argparse.Namespace) -> PortfolioResult:
 
     # "ensemble": average every restart's predicted weights.
     ensemble_model = EnsemblePortfolioLSTM([r.model for r in results])
-    ensemble_result = evaluate_portfolio_model(ensemble_model, data, args.weight_scheme, args.target_vol)
+    ensemble_result = evaluate_portfolio_model(
+        ensemble_model, data, args.weight_scheme, args.target_vol, max_leverage=args.max_leverage,
+    )
     logger.info(
         "Ensemble of %d restarts: validation Sharpe %.3f",
         len(results), float(sharpe_ratio(torch.tensor(ensemble_result.returns_val))),

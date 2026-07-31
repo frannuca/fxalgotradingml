@@ -7,6 +7,8 @@ export const SERIES_COLOR = {
   vol_targeted: "#64748b", // slate - same series identity as "baseline", used in training payloads
   with_risk: "#2563eb", // blue - risk-overlay attenuated
   with_risk_and_costs: "#d97706", // amber - attenuated, net of transaction costs
+  live: "#059669", // green - live PnL snapshot while training is running
+  benchmark: "#7c3aed", // violet - inverse-vol (risk-weighted, un-learned) benchmark, vol-matched to the model
 };
 
 export const SERIES_LABEL = {
@@ -14,6 +16,8 @@ export const SERIES_LABEL = {
   vol_targeted: "Risk-weighted (vol-targeted)",
   with_risk: "With risk overlay",
   with_risk_and_costs: "With risk overlay + transaction costs",
+  live: "Cumulative PnL (live)",
+  benchmark: "Inverse-vol benchmark (vol-matched)",
 };
 
 export const GRID_COLOR = "#e2e8f0";

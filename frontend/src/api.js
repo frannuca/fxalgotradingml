@@ -47,6 +47,10 @@ export function getTrainingStatus(jobId) {
   return request(`/api/train/${jobId}`);
 }
 
+export function stopTraining(jobId) {
+  return request(`/api/train/${jobId}/stop`, { method: "POST" });
+}
+
 export function evaluate(config) {
   return request("/api/evaluate", {
     method: "POST",

@@ -10,8 +10,8 @@ multi-seed restarts, save/load, plot output paths) is a key in it. Any key
 left out falls back to models.portfolio_lstm.DEFAULT_CONFIG's default.
 Only "pairs" has no default and must always be provided.
 
-Example config - risk overlay, ensemble of 5 joint restarts, persisted to
-the database as well as to a local .pt file:
+Example config - risk overlay on top of an ensemble of 5 PortfolioLSTM
+restarts, persisted to the database as well as to a local .pt file:
 
     {
         "pairs": ["EURUSD", "GBPUSD", "USDJPY"],
@@ -41,11 +41,14 @@ or a name previously saved with "save_db": true.
 
 What happens, in order:
 1. Load the config, merge over defaults, validate "pairs" is present.
-2. If "risk_overlay" is true: train (or load) PortfolioLSTM and RiskLSTM
-   TOGETHER via models/risk_lstm.py's run_pipeline_multi_seed (see that
-   module's docstring for what "together" means - one shared optimizer,
-   not two frozen/sequential stages). Otherwise: train (or load)
-   PortfolioLSTM alone via models/portfolio_lstm.py's run_pipeline_multi_seed.
+2. Train (or load) PortfolioLSTM via models/portfolio_lstm.py's
+   run_pipeline_multi_seed - completely independent of the risk overlay,
+   whatever "n_seeds"/"restart_strategy"/"objective" apply, they apply to
+   PortfolioLSTM alone. If "risk_overlay" is true, that (now fixed, frozen)
+   result is then handed to models/risk_lstm.py's run_pipeline_multi_seed,
+   which trains (or loads) RiskLSTM SEPARATELY on top of it to improve its
+   realized Sharpe (see that module's docstring) - the risk overlay never
+   feeds back into how PortfolioLSTM itself was trained.
 3. Save whatever was freshly trained to a local .pt file, and, if
    "save_db" is true, also to Postgres (quant.model_registry) under a name
    derived from the config's characteristics (see portfolio_model_name()/
@@ -108,14 +111,16 @@ def run_portfolio_only(args: Namespace) -> None:
 
 
 def run_with_risk_overlay(args: Namespace) -> None:
-    """Train (or load) PortfolioLSTM and RiskLSTM TOGETHER: save, print
-    Sharpe, plot PnL + position/attenuation + the vol-matched comparison.
+    """Train (or load) PortfolioLSTM, then train (or load) RiskLSTM
+    SEPARATELY on top of it (see models/risk_lstm.py's run_pipeline_multi_seed):
+    save, print Sharpe, plot PnL + position/attenuation + the vol-matched
+    comparison.
 
     Deferred import: models/risk_lstm.py imports from models/portfolio_lstm.py
     at module load time, so importing it back at this module's top level
     would be a circular import.
     """
-    from models.risk_lstm import risk_model_name, run_pipeline_multi_seed as run_joint_pipeline
+    from models.risk_lstm import risk_model_name, run_pipeline_multi_seed as run_risk_overlay_pipeline
     from models.risk_postprocess import (
         plot_pnl as plot_risk_pnl,
         plot_position_and_scaling,
@@ -125,7 +130,7 @@ def run_with_risk_overlay(args: Namespace) -> None:
         print_sharpe_ratios as print_risk_sharpe_ratios,
     )
 
-    result = run_joint_pipeline(args)
+    result = run_risk_overlay_pipeline(args)
 
     if not args.load_portfolio:
         result.portfolio_result.model.save_model(

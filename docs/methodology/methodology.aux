@@ -1,0 +1,159 @@
+\relax 
+\providecommand\zref@newlabel[2]{}
+\providecommand\hyper@newdestlabel[2]{}
+\providecommand\HyField@AuxAddToFields[1]{}
+\providecommand\HyField@AuxAddToCoFields[2]{}
+\@writefile{toc}{\contentsline {section}{\numberline {1}Notation and Conventions}{3}{section.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {2}System Overview}{3}{section.2}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces End-to-end pipeline. Dashed arrow: when the risk overlay is disabled, vol-targeted weights flow directly to the final-weights stage with $a\equiv 1$. Grey = data/feature engineering, blue = PortfolioLSTM \& volatility targeting, amber = RiskLSTM overlay, violet = reporting.}}{4}{figure.caption.1}\protected@file@percent }
+\providecommand*\caption@xref[2]{\@setref\relax\@undefined{#1}}
+\newlabel{fig:pipeline}{{1}{4}{End-to-end pipeline. Dashed arrow: when the risk overlay is disabled, vol-targeted weights flow directly to the final-weights stage with $a\equiv 1$. Grey = data/feature engineering, blue = PortfolioLSTM \& volatility targeting, amber = RiskLSTM overlay, violet = reporting}{figure.caption.1}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {3}Data Pipeline and Feature Engineering}{4}{section.3}\protected@file@percent }
+\newlabel{sec:data}{{3}{4}{Data Pipeline and Feature Engineering}{section.3}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.1}Price loading and log returns}{4}{subsection.3.1}\protected@file@percent }
+\newlabel{lst:logret}{{1}{4}{Log-return conversion}{lstlisting.1}{}}
+\@writefile{lol}{\contentsline {lstlisting}{\numberline {1}{\ignorespaces Log-return conversion.}}{4}{lstlisting.1}\protected@file@percent }
+\newlabel{eq:logret}{{1}{4}{Price loading and log returns}{equation.1}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.2}Feature engineering: carry and vol-normalized momentum}{4}{subsection.3.2}\protected@file@percent }
+\newlabel{sec:features}{{3.2}{4}{Feature engineering: carry and vol-normalized momentum}{subsection.3.2}{}}
+\@writefile{toc}{\contentsline {paragraph}{Carry.}{5}{paragraph*.2}\protected@file@percent }
+\newlabel{eq:carry}{{2}{5}{Carry}{equation.2}{}}
+\newlabel{lst:carry}{{2}{5}{Carry construction (forward-fill only -- no look-ahead)}{lstlisting.2}{}}
+\@writefile{lol}{\contentsline {lstlisting}{\numberline {2}{\ignorespaces Carry construction (forward-fill only -- no look-ahead).}}{5}{lstlisting.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Vol-normalized momentum.}{5}{paragraph*.3}\protected@file@percent }
+\newlabel{eq:volnorm}{{3}{5}{Vol-normalized momentum}{equation.3}{}}
+\newlabel{lst:volnorm}{{3}{5}{Vol-normalized return at horizon $h$}{lstlisting.3}{}}
+\@writefile{lol}{\contentsline {lstlisting}{\numberline {3}{\ignorespaces Vol-normalized return at horizon $h$.}}{5}{lstlisting.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Asset-major channel layout.}{5}{paragraph*.4}\protected@file@percent }
+\newlabel{eq:assetmajor}{{4}{5}{Asset-major channel layout}{equation.4}{}}
+\newlabel{lst:buildfeat}{{4}{5}{Asset-major feature assembly}{lstlisting.4}{}}
+\@writefile{lol}{\contentsline {lstlisting}{\numberline {4}{\ignorespaces Asset-major feature assembly.}}{5}{lstlisting.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.3}Rolling window construction}{6}{subsection.3.3}\protected@file@percent }
+\newlabel{lst:seq}{{5}{6}{Building lookback windows and next-day targets}{lstlisting.5}{}}
+\@writefile{lol}{\contentsline {lstlisting}{\numberline {5}{\ignorespaces Building lookback windows and next-day targets.}}{6}{lstlisting.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.4}Standardization}{6}{subsection.3.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {4}Chronological Train / Validation / Test Split}{7}{section.4}\protected@file@percent }
+\newlabel{sec:split}{{4}{7}{Chronological Train / Validation / Test Split}{section.4}{}}
+\newlabel{lst:split}{{6}{7}{3-way chronological split}{lstlisting.6}{}}
+\@writefile{lol}{\contentsline {lstlisting}{\numberline {6}{\ignorespaces 3-way chronological split.}}{7}{lstlisting.6}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {5}PortfolioLSTM}{7}{section.5}\protected@file@percent }
+\newlabel{sec:portfolio}{{5}{7}{PortfolioLSTM}{section.5}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {2}{\ignorespaces PortfolioLSTM's two interchangeable encoders. Both feed the same downstream weight scheme; \texttt  {prev\_weight} feedback (\S  \ref {sec:prevweight}) concatenates into the head's input in both branches (the whole vector $w_{i-1}\in \mathbb  {R}^N$ for ``concat'', only the asset's own scalar $w_{i-1}^{(k)}$ for ``per\_asset'').}}{7}{figure.caption.5}\protected@file@percent }
+\newlabel{fig:portfoliolstm}{{2}{7}{PortfolioLSTM's two interchangeable encoders. Both feed the same downstream weight scheme; \texttt {prev\_weight} feedback (\S \ref {sec:prevweight}) concatenates into the head's input in both branches (the whole vector $w_{i-1}\in \mathbb {R}^N$ for ``concat'', only the asset's own scalar $w_{i-1}^{(k)}$ for ``per\_asset'')}{figure.caption.5}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.1}Encoder A: concatenated input}{8}{subsection.5.1}\protected@file@percent }
+\newlabel{sec:concat}{{5.1}{8}{Encoder A: concatenated input}{subsection.5.1}{}}
+\newlabel{lst:concat}{{7}{8}{Concatenated-input encoder (default)}{lstlisting.7}{}}
+\@writefile{lol}{\contentsline {lstlisting}{\numberline {7}{\ignorespaces Concatenated-input encoder (default).}}{8}{lstlisting.7}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.2}Encoder B: shared per-asset encoder with cross-asset attention}{8}{subsection.5.2}\protected@file@percent }
+\newlabel{sec:perasset}{{5.2}{8}{Encoder B: shared per-asset encoder with cross-asset attention}{subsection.5.2}{}}
+\newlabel{lst:perasset}{{8}{8}{Per-asset encoder + cross-asset combiner}{lstlisting.8}{}}
+\@writefile{lol}{\contentsline {lstlisting}{\numberline {8}{\ignorespaces Per-asset encoder + cross-asset combiner.}}{8}{lstlisting.8}\protected@file@percent }
+\newlabel{lst:perassetfwd}{{9}{8}{Per-asset encoder forward pass}{lstlisting.9}{}}
+\@writefile{lol}{\contentsline {lstlisting}{\numberline {9}{\ignorespaces Per-asset encoder forward pass.}}{8}{lstlisting.9}\protected@file@percent }
+\newlabel{eq:crossattn}{{16}{9}{Encoder B: shared per-asset encoder with cross-asset attention}{equation.16}{}}
+\newlabel{eq:crossmean}{{17}{9}{Encoder B: shared per-asset encoder with cross-asset attention}{equation.17}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.3}Temporal pooling: last hidden state vs.\ attention pooling}{9}{subsection.5.3}\protected@file@percent }
+\newlabel{sec:pooling}{{5.3}{9}{Temporal pooling: last hidden state vs.\ attention pooling}{subsection.5.3}{}}
+\newlabel{lst:temporalpool}{{10}{9}{Learned attention pooling over the full LSTM output sequence}{lstlisting.10}{}}
+\@writefile{lol}{\contentsline {lstlisting}{\numberline {10}{\ignorespaces Learned attention pooling over the full LSTM output sequence.}}{9}{lstlisting.10}\protected@file@percent }
+\newlabel{eq:attnpool}{{19}{10}{Temporal pooling: last hidden state vs.\ attention pooling}{equation.19}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.4}Weight schemes}{10}{subsection.5.4}\protected@file@percent }
+\newlabel{sec:weightschemes}{{5.4}{10}{Weight schemes}{subsection.5.4}{}}
+\newlabel{eq:softmax}{{20}{10}{Weight schemes}{equation.20}{}}
+\newlabel{eq:tanhnorm}{{21}{10}{Weight schemes}{equation.21}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.5}Recurrent-policy feedback: feeding the previous weight into the head}{10}{subsection.5.5}\protected@file@percent }
+\newlabel{sec:prevweight}{{5.5}{10}{Recurrent-policy feedback: feeding the previous weight into the head}{subsection.5.5}{}}
+\newlabel{lst:fseq}{{11}{10}{The sequential recurrent-policy loop (\texttt {forward\_sequence})}{lstlisting.11}{}}
+\@writefile{lol}{\contentsline {lstlisting}{\numberline {11}{\ignorespaces The sequential recurrent-policy loop (\texttt  {forward\_sequence}).}}{10}{lstlisting.11}\protected@file@percent }
+\newlabel{eq:recurrentpolicy}{{22}{11}{Recurrent-policy feedback: feeding the previous weight into the head}{equation.22}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.6}NoisyNet: parameter-space exploration noise}{11}{subsection.5.6}\protected@file@percent }
+\newlabel{sec:noisynet}{{5.6}{11}{NoisyNet: parameter-space exploration noise}{subsection.5.6}{}}
+\newlabel{lst:noisy}{{12}{11}{NoisyLinear: independent Gaussian parameter noise}{lstlisting.12}{}}
+\@writefile{lol}{\contentsline {lstlisting}{\numberline {12}{\ignorespaces NoisyLinear: independent Gaussian parameter noise.}}{11}{lstlisting.12}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.7}The \texttt  {CASH} pseudo-asset}{12}{subsection.5.7}\protected@file@percent }
+\newlabel{sec:cash}{{5.7}{12}{The \texttt {CASH} pseudo-asset}{subsection.5.7}{}}
+\newlabel{lst:cash}{{13}{12}{CASH is a data-layer pseudo-pair, not a model-layer special case}{lstlisting.13}{}}
+\@writefile{lol}{\contentsline {lstlisting}{\numberline {13}{\ignorespaces CASH is a data-layer pseudo-pair, not a model-layer special case.}}{12}{lstlisting.13}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {6}Volatility Targeting}{12}{section.6}\protected@file@percent }
+\newlabel{sec:voltarget}{{6}{12}{Volatility Targeting}{section.6}{}}
+\newlabel{eq:voltarget}{{24}{12}{Volatility Targeting}{equation.24}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.1}Three covariance estimators}{13}{subsection.6.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{(a) Sample covariance (default).}{13}{paragraph*.6}\protected@file@percent }
+\newlabel{eq:samplecov}{{25}{13}{(a) Sample covariance (default)}{equation.25}{}}
+\@writefile{toc}{\contentsline {paragraph}{(b) EWMA (RiskMetrics-style).}{13}{paragraph*.7}\protected@file@percent }
+\newlabel{eq:ewmacov}{{27}{13}{(b) EWMA (RiskMetrics-style)}{equation.27}{}}
+\@writefile{toc}{\contentsline {paragraph}{(c) Ledoit-Wolf shrinkage (Ledoit \& Wolf, 2004).}{13}{paragraph*.8}\protected@file@percent }
+\newlabel{eq:ledoitwolf}{{31}{13}{(c) Ledoit-Wolf shrinkage (Ledoit \& Wolf, 2004)}{equation.31}{}}
+\newlabel{lst:lw}{{14}{13}{Ledoit-Wolf shrinkage intensity (batched, vectorized)}{lstlisting.14}{}}
+\@writefile{lol}{\contentsline {lstlisting}{\numberline {14}{\ignorespaces Ledoit-Wolf shrinkage intensity (batched, vectorized).}}{13}{lstlisting.14}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.2}The leverage cap}{14}{subsection.6.2}\protected@file@percent }
+\newlabel{lst:maxlev}{{15}{14}{\texttt {max\_leverage} caps the scale factor itself}{lstlisting.15}{}}
+\@writefile{lol}{\contentsline {lstlisting}{\numberline {15}{\ignorespaces \texttt  {max\_leverage} caps the scale factor itself.}}{14}{lstlisting.15}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {7}Training Objectives}{14}{section.7}\protected@file@percent }
+\newlabel{sec:objectives}{{7}{14}{Training Objectives}{section.7}{}}
+\newlabel{lst:dispatch}{{16}{14}{Objective dispatcher}{lstlisting.16}{}}
+\@writefile{lol}{\contentsline {lstlisting}{\numberline {16}{\ignorespaces Objective dispatcher.}}{14}{lstlisting.16}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.1}Rolling-window Sortino-style ratio (\texttt  {"sharpe"}, default)}{14}{subsection.7.1}\protected@file@percent }
+\newlabel{eq:sortino}{{32}{14}{Rolling-window Sortino-style ratio (\texttt {"sharpe"}, default)}{equation.32}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.2}Kelly criterion (\texttt  {"kelly"})}{15}{subsection.7.2}\protected@file@percent }
+\newlabel{eq:kelly}{{33}{15}{Kelly criterion (\texttt {"kelly"})}{equation.33}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.3}Mean-CVaR (\texttt  {"cvar"})}{15}{subsection.7.3}\protected@file@percent }
+\newlabel{eq:cvar}{{34}{15}{Mean-CVaR (\texttt {"cvar"})}{equation.34}{}}
+\newlabel{eq:meancvar}{{35}{15}{Mean-CVaR (\texttt {"cvar"})}{equation.35}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {8}Transaction Costs}{15}{section.8}\protected@file@percent }
+\newlabel{sec:txcost}{{8}{15}{Transaction Costs}{section.8}{}}
+\newlabel{eq:txcost}{{36}{15}{Transaction Costs}{equation.36}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {9}Portfolio Training Loop}{15}{section.9}\protected@file@percent }
+\newlabel{sec:trainloop}{{9}{15}{Portfolio Training Loop}{section.9}{}}
+\newlabel{lst:trainloop}{{17}{16}{\texttt {train\_portfolio\_model}: one full-batch epoch}{lstlisting.17}{}}
+\@writefile{lol}{\contentsline {lstlisting}{\numberline {17}{\ignorespaces \texttt  {train\_portfolio\_model}: one full-batch epoch.}}{16}{lstlisting.17}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {10}RiskLSTM: Risk-Attenuation Overlay}{16}{section.10}\protected@file@percent }
+\newlabel{sec:risklstm}{{10}{16}{RiskLSTM: Risk-Attenuation Overlay}{section.10}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {3}{\ignorespaces RiskLSTM: the input feature stack (per-asset weighted PnL, marginal rolling moments, and optional cross-sectional features) feeds its own LSTM; the frozen portfolio weight vector re-enters at the head as a conditioning input, exactly as in PortfolioLSTM's \texttt  {use\_prev\_weight}.}}{17}{figure.caption.9}\protected@file@percent }
+\newlabel{fig:risklstm}{{3}{17}{RiskLSTM: the input feature stack (per-asset weighted PnL, marginal rolling moments, and optional cross-sectional features) feeds its own LSTM; the frozen portfolio weight vector re-enters at the head as a conditioning input, exactly as in PortfolioLSTM's \texttt {use\_prev\_weight}}{figure.caption.9}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {10.1}Marginal risk features: rolling moments of the weighted PnL path}{17}{subsection.10.1}\protected@file@percent }
+\newlabel{lst:moments}{{18}{17}{Rolling std / skewness / excess kurtosis}{lstlisting.18}{}}
+\@writefile{lol}{\contentsline {lstlisting}{\numberline {18}{\ignorespaces Rolling std / skewness / excess kurtosis.}}{17}{lstlisting.18}\protected@file@percent }
+\newlabel{eq:moments}{{38}{17}{Marginal risk features: rolling moments of the weighted PnL path}{equation.38}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {10.2}Cross-sectional risk features (optional)}{17}{subsection.10.2}\protected@file@percent }
+\newlabel{sec:xsec}{{10.2}{17}{Cross-sectional risk features (optional)}{subsection.10.2}{}}
+\newlabel{lst:xsec}{{19}{18}{Cross-sectional correlation-structure features}{lstlisting.19}{}}
+\@writefile{lol}{\contentsline {lstlisting}{\numberline {19}{\ignorespaces Cross-sectional correlation-structure features.}}{18}{lstlisting.19}\protected@file@percent }
+\newlabel{eq:avgcorr}{{39}{18}{Cross-sectional risk features (optional)}{equation.39}{}}
+\newlabel{eq:corrdisp}{{40}{18}{Cross-sectional risk features (optional)}{equation.40}{}}
+\newlabel{eq:topeig}{{41}{18}{Cross-sectional risk features (optional)}{equation.41}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {10.3}Building RiskLSTM's input sequences}{18}{subsection.10.3}\protected@file@percent }
+\newlabel{lst:mkrisk}{{20}{18}{\texttt {make\_risk\_sequences}: decoupling \texttt {rolling\_window} from \texttt {lookback}}{lstlisting.20}{}}
+\@writefile{lol}{\contentsline {lstlisting}{\numberline {20}{\ignorespaces \texttt  {make\_risk\_sequences}: decoupling \texttt  {rolling\_window} from \texttt  {lookback}.}}{18}{lstlisting.20}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {10.4}RiskLSTM architecture and forward pass}{19}{subsection.10.4}\protected@file@percent }
+\newlabel{lst:risklstm}{{21}{19}{RiskLSTM.\_\_init\_\_ and forward}{lstlisting.21}{}}
+\@writefile{lol}{\contentsline {lstlisting}{\numberline {21}{\ignorespaces RiskLSTM.\_\_init\_\_ and forward.}}{19}{lstlisting.21}\protected@file@percent }
+\newlabel{eq:attenuation}{{42}{19}{RiskLSTM architecture and forward pass}{equation.42}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {10.5}Risk training loop}{20}{subsection.10.5}\protected@file@percent }
+\newlabel{lst:risktrain}{{22}{20}{\texttt {train\_risk\_model}: one epoch}{lstlisting.22}{}}
+\@writefile{lol}{\contentsline {lstlisting}{\numberline {22}{\ignorespaces \texttt  {train\_risk\_model}: one epoch.}}{20}{lstlisting.22}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {11}Inverse-Volatility Benchmark}{20}{section.11}\protected@file@percent }
+\newlabel{sec:benchmark}{{11}{20}{Inverse-Volatility Benchmark}{section.11}{}}
+\newlabel{eq:benchmark}{{43}{20}{Inverse-Volatility Benchmark}{equation.43}{}}
+\newlabel{eq:volmatch}{{44}{20}{Inverse-Volatility Benchmark}{equation.44}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {12}Ensembling: Multi-Seed Restarts}{20}{section.12}\protected@file@percent }
+\newlabel{sec:ensembling}{{12}{20}{Ensembling: Multi-Seed Restarts}{section.12}{}}
+\newlabel{lst:ensemble}{{23}{20}{"best" vs.\ "ensemble" restart combination}{lstlisting.23}{}}
+\@writefile{lol}{\contentsline {lstlisting}{\numberline {23}{\ignorespaces "best" vs.\ "ensemble" restart combination.}}{20}{lstlisting.23}\protected@file@percent }
+\gdef \LT@i {\LT@entry 
+    {1}{108.43008pt}\LT@entry 
+    {1}{57.52458pt}\LT@entry 
+    {1}{227.93158pt}}
+\newlabel{eq:beststrat}{{45}{21}{Ensembling: Multi-Seed Restarts}{equation.45}{}}
+\newlabel{eq:ensemblestrat}{{46}{21}{Ensembling: Multi-Seed Restarts}{equation.46}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {13}Configuration Reference}{21}{section.13}\protected@file@percent }
+\newlabel{sec:config}{{13}{21}{Configuration Reference}{section.13}{}}
+\gdef \LT@ii {\LT@entry 
+    {1}{119.81102pt}\LT@entry 
+    {1}{267.76526pt}}
+\@writefile{toc}{\contentsline {section}{\numberline {14}Summary of Architectural Decisions}{22}{section.14}\protected@file@percent }
+\gdef \LT@iii {\LT@entry 
+    {1}{148.26378pt}\LT@entry 
+    {1}{239.3125pt}}
+\@writefile{toc}{\contentsline {section}{\numberline {15}Repository Map}{23}{section.15}\protected@file@percent }
+\gdef \@abspage@last{24}
