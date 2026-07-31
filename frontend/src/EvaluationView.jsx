@@ -216,6 +216,29 @@ export default function EvaluationView() {
             />
           </div>
 
+          <h2>Model vs. risk-weighted benchmark (out-of-sample)</h2>
+          <div className="chart-grid">
+            <PnlChart
+              title={
+                `Model (${hasRisk ? "with risk overlay + costs" : "vol-targeted"}) vs. inverse-vol benchmark ` +
+                `(Sharpe ${(hasRisk ? result.sharpe.with_risk_and_costs : result.sharpe.baseline).toFixed(2)} ` +
+                `/ ${result.sharpe.benchmark.toFixed(2)})`
+              }
+              pnl={result.pnl}
+              seriesKeys={
+                hasRisk
+                  ? ["with_risk_and_costs", "benchmark", "model_minus_benchmark"]
+                  : ["baseline", "benchmark", "model_minus_benchmark"]
+              }
+              height={380}
+            />
+          </div>
+          <p className="status-line" style={{ marginTop: 4 }}>
+            The benchmark is a simple, un-learned inverse-volatility ("risk-weighted") allocator, rescaled to match
+            the model's own realized volatility on this same out-of-sample period - "Model − benchmark" isolates
+            whether the learned allocation actually added value, independent of how much risk either one ran at.
+          </p>
+
           <h2>Return distribution (out-of-sample)</h2>
           <div className="chart-grid">
             <HistogramChart

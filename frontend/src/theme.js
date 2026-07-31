@@ -9,6 +9,7 @@ export const SERIES_COLOR = {
   with_risk_and_costs: "#d97706", // amber - attenuated, net of transaction costs
   live: "#059669", // green - live PnL snapshot while training is running
   benchmark: "#7c3aed", // violet - inverse-vol (risk-weighted, un-learned) benchmark, vol-matched to the model
+  model_minus_benchmark: "#dc2626", // red - model's PnL minus the benchmark's, i.e. the value the model itself added
 };
 
 export const SERIES_LABEL = {
@@ -18,6 +19,7 @@ export const SERIES_LABEL = {
   with_risk_and_costs: "With risk overlay + transaction costs",
   live: "Cumulative PnL (live)",
   benchmark: "Inverse-vol benchmark (vol-matched)",
+  model_minus_benchmark: "Model − benchmark",
 };
 
 export const GRID_COLOR = "#e2e8f0";

@@ -726,8 +726,9 @@ def evaluate(req: EvaluateRequest) -> dict:
     local path) and run it purely for inference - no training happens.
     Returns everything the Evaluation view plots:
       - pnl: cumulative baseline ("risk-weighted", pre-attenuation) vs
-        with-risk-overlay vs with-risk-overlay-and-transaction-costs,
-        out-of-sample only.
+        with-risk-overlay vs with-risk-overlay-and-transaction-costs vs the
+        inverse-vol ("risk-weighted") benchmark, vol-matched to the model,
+        vs model-minus-benchmark - out-of-sample only.
       - sharpe: matching Sharpe ratios for each series.
       - histograms: return distributions for baseline and with-risk.
       - positions: per-asset portfolio weight over time, out-of-sample.
@@ -777,6 +778,13 @@ def evaluate(req: EvaluateRequest) -> dict:
                 args, result.portfolio_result.model, result.risk_model,
             )
 
+            # "Model" here is the FINAL, realistic series (attenuated AND net
+            # of transaction costs) - compared against the inverse-vol
+            # ("risk-weighted"), un-learned benchmark (see
+            # portfolio_lstm.inverse_vol_benchmark_returns/vol_match_benchmark),
+            # vol-matched to THIS model on this same out-of-sample period.
+            model_minus_benchmark_val = net_returns_val - result.benchmark_returns_val
+
             return {
                 "pairs": pairs,
                 "latest_weights": latest_weights,
@@ -785,11 +793,14 @@ def evaluate(req: EvaluateRequest) -> dict:
                     baseline=np.cumsum(result.returns_val_raw),
                     with_risk=np.cumsum(result.returns_val_scaled),
                     with_risk_and_costs=np.cumsum(net_returns_val),
+                    benchmark=np.cumsum(result.benchmark_returns_val),
+                    model_minus_benchmark=np.cumsum(model_minus_benchmark_val),
                 ),
                 "sharpe": {
                     "baseline": float(sharpe_ratio(torch.tensor(result.returns_val_raw))),
                     "with_risk": float(sharpe_ratio(torch.tensor(result.returns_val_scaled))),
                     "with_risk_and_costs": float(sharpe_ratio(torch.tensor(net_returns_val))),
+                    "benchmark": float(sharpe_ratio(torch.tensor(result.benchmark_returns_val))),
                 },
                 "histograms": {
                     "baseline": _histogram(result.returns_val_raw),
@@ -806,11 +817,25 @@ def evaluate(req: EvaluateRequest) -> dict:
         pairs = result.pairs
         latest_weights = _predict_latest_weights(args, result.model)
 
+        # No risk overlay here, so "model" is the vol-targeted series
+        # (labeled "baseline" above for historical reasons - see the
+        # docstring) - compared against the inverse-vol benchmark,
+        # vol-matched to it on this same out-of-sample period.
+        model_minus_benchmark_val = result.returns_val - result.benchmark_returns_val
+
         return {
             "pairs": pairs,
             "latest_weights": latest_weights,
-            "pnl": _series_payload(result.dates_val, baseline=np.cumsum(result.returns_val)),
-            "sharpe": {"baseline": float(sharpe_ratio(torch.tensor(result.returns_val)))},
+            "pnl": _series_payload(
+                result.dates_val,
+                baseline=np.cumsum(result.returns_val),
+                benchmark=np.cumsum(result.benchmark_returns_val),
+                model_minus_benchmark=np.cumsum(model_minus_benchmark_val),
+            ),
+            "sharpe": {
+                "baseline": float(sharpe_ratio(torch.tensor(result.returns_val))),
+                "benchmark": float(sharpe_ratio(torch.tensor(result.benchmark_returns_val))),
+            },
             "histograms": {"baseline": _histogram(result.returns_val)},
             "positions": _positions_payload(result.dates_val, pairs, result.weights_val),
             "attenuation": None,
