@@ -529,7 +529,31 @@ class PortfolioLSTM(nn.Module):
     """Maps a window of multi-pair log returns to a portfolio weight vector
     (one weight per pair) for the following day.
 
-    See the module docstring for the two supported `weight_scheme` values.
+    The network does NOT predict a weight directly. For each asset it
+    predicts a single continuous coefficient, and the final weight is:
+        weight = risk_parity_weights(window_returns_raw) * coefficient
+    where `risk_parity_weights` is a fixed, long-only, inverse-volatility
+    ("risk parity") baseline allocation (not learned - see that function).
+    The network's whole job is choosing DIRECTION (the coefficient's sign,
+    when allowed) and CONVICTION (its magnitude) per asset; how much
+    capital an asset gets when fully committed is fixed by its own
+    trailing volatility, never learned. `position_mode` selects the
+    coefficient's range:
+      "long_short" (default) - coefficient = tanh(logit) in (-1, 1): the
+                    network can go short (negative coefficient), flat
+                    (near 0), or long (positive), same sign convention as
+                    the risk-parity baseline itself flipped.
+      "long_only"  - coefficient = sigmoid(logit) in (0, 1): the network
+                    can only ever scale the (already long-only) baseline
+                    DOWN toward flat, never flip an asset short.
+    Either way, gross exposure is bounded by construction: since
+    risk_parity_weights sums to 1 and |coefficient| < 1, sum(|weight|) < 1
+    always, BEFORE volatility targeting (which still applies on top
+    exactly as before, and may leverage this up - see
+    scale_weights_to_target_vol). This composes with everything downstream
+    unchanged (the risk overlay, transaction costs, every training
+    objective) - it only changes how `forward()` computes its "raw"
+    weight, before any of that.
 
     Two encoder architectures (`encoder_type`):
       "concat"    - the original design: one LSTM consumes every asset's
@@ -570,7 +594,6 @@ class PortfolioLSTM(nn.Module):
         n_assets: int,
         hidden_size: int = 32,
         num_layers: int = 1,
-        weight_scheme: str = "softmax",
         dropout: float = 0.0,
         noisy_head: bool = False,
         use_prev_weight: bool = False,
@@ -579,24 +602,25 @@ class PortfolioLSTM(nn.Module):
         asset_combiner: str = "attention",
         n_attn_heads: int = 2,
         pooling: str = "last",
+        position_mode: str = "long_short",
     ):
         super().__init__()
-        if weight_scheme not in ("softmax", "tanh_norm"):
-            raise ValueError(f"Unknown weight_scheme: {weight_scheme!r}")
         if encoder_type not in ("concat", "per_asset"):
             raise ValueError(f"Unknown encoder_type: {encoder_type!r}")
         if asset_combiner not in ("attention", "mean"):
             raise ValueError(f"Unknown asset_combiner: {asset_combiner!r}")
         if pooling not in ("last", "attention"):
             raise ValueError(f"Unknown pooling: {pooling!r}")
+        if position_mode not in ("long_short", "long_only"):
+            raise ValueError(f"Unknown position_mode: {position_mode!r}")
         # Stashed (not just passed to submodules) so save_model() can
         # persist enough to reconstruct this exact architecture on load,
         # without the caller having to re-supply matching CLI flags.
         self.n_assets = n_assets
         self.hidden_size = hidden_size
         self.num_layers = num_layers
-        self.weight_scheme = weight_scheme
         self.dropout_p = dropout
+        self.position_mode = position_mode
         self.noisy_head = noisy_head
         self.use_prev_weight = use_prev_weight
         # n_channels: how many input features per asset (1 = raw return
@@ -633,7 +657,10 @@ class PortfolioLSTM(nn.Module):
             # deciding each window's weight as if starting from flat
             # every time.
             head_input_size = hidden_size + n_assets if use_prev_weight else hidden_size
-            self.head = NoisyLinear(head_input_size, n_assets) if noisy_head else nn.Linear(head_input_size, n_assets)
+            self.head = (
+                NoisyLinear(head_input_size, n_assets) if noisy_head
+                else nn.Linear(head_input_size, n_assets)
+            )
         else:  # "per_asset"
             # ONE LSTM, weight-shared across every asset (run as an
             # effective batch of batch*n_assets independent sequences of
@@ -659,18 +686,45 @@ class PortfolioLSTM(nn.Module):
             # Applied per-asset with SHARED weights (nn.Linear/NoisyLinear
             # act on the last dim regardless of leading batch dims), so one
             # set of head weights produces every asset's logit.
-            self.head = NoisyLinear(head_input_size, 1) if noisy_head else nn.Linear(head_input_size, 1)
+            self.head = (
+                NoisyLinear(head_input_size, 1) if noisy_head
+                else nn.Linear(head_input_size, 1)
+            )
 
-    def _weights_from_logits(self, logits: torch.Tensor) -> torch.Tensor:
-        if self.weight_scheme == "softmax":
-            # Long-only: non-negative weights that sum to exactly 1.
-            return torch.softmax(logits, dim=-1)
-        # "tanh_norm": each weight in (-1, 1), then L1-normalized so the
-        # book is fully invested (sum of absolute weights == 1).
-        raw = torch.tanh(logits)
-        return raw / (raw.abs().sum(dim=-1, keepdim=True) + 1e-8)
+    def _weights_from_coefficients(
+        self,
+        logits: torch.Tensor,
+        risk_parity_baseline: torch.Tensor,
+    ) -> torch.Tensor:
+        """Turn per-asset logits into a weight vector.
 
-    def forward(self, x: torch.Tensor, prev_weight: torch.Tensor | None = None) -> torch.Tensor:
+        logits: (batch, n_assets) - one raw value per asset.
+        risk_parity_baseline: (batch, n_assets) - PRECOMPUTED (see
+        precompute_risk_parity_baseline), long-only, sums to 1 - never
+        solved here, since it depends only on raw returns, never on this
+        model's parameters (see precompute_risk_parity_baseline's
+        docstring for why recomputing it per forward() call is wasted work).
+
+        coefficient is tanh(logits) in (-1, 1) when self.position_mode is
+        "long_short" (sign = direction, magnitude = conviction; can flip
+        the risk-parity baseline short), or sigmoid(logits) in (0, 1)
+        when "long_only" (can only scale the baseline down toward flat,
+        never flip its sign) - see this class's own docstring. The final
+        weight scales the (fixed, non-learned) risk-parity baseline by
+        this coefficient.
+        """
+        if self.position_mode == "long_short":
+            coefficients = torch.tanh(logits)      # (batch, n_assets), in (-1, 1)
+        else:  # "long_only"
+            coefficients = torch.sigmoid(logits)   # (batch, n_assets), in (0, 1)
+        return risk_parity_baseline * coefficients
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        prev_weight: torch.Tensor | None = None,
+        risk_parity_baseline: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         # x: (batch, lookback, n_assets * n_channels). prev_weight:
         # (batch, n_assets) - only meaningful when use_prev_weight=True;
         # ignored otherwise. This is the "given a KNOWN previous weight per
@@ -682,6 +736,19 @@ class PortfolioLSTM(nn.Module):
         # i-1's own output (a genuine dependency across the whole period,
         # not independent per-sample batching), must use forward_sequence()
         # instead - see that method.
+        #
+        # risk_parity_baseline: (batch, n_assets) - REQUIRED, PRECOMPUTED
+        # (see precompute_risk_parity_baseline) risk-parity weights this
+        # forward pass's coefficients scale (see _weights_from_coefficients).
+        # Never solved here - it doesn't depend on this model's parameters,
+        # only on raw returns, so solving it once outside the training/
+        # inference loop and reusing it is both correct and far cheaper.
+        if risk_parity_baseline is None:
+            raise ValueError(
+                "PortfolioLSTM.forward requires risk_parity_baseline "
+                "(see precompute_risk_parity_baseline) to scale into its final weight."
+            )
+
         if self.encoder_type == "concat":
             lstm_out, (h_n, _) = self.lstm(x)
             pooled = self.temporal_pool(lstm_out) if self.pooling == "attention" else h_n[-1]
@@ -693,7 +760,7 @@ class PortfolioLSTM(nn.Module):
             else:
                 combined = hidden
             logits = self.head(combined)  # (batch, n_assets)
-            return self._weights_from_logits(logits)
+            return self._weights_from_coefficients(logits, risk_parity_baseline)
 
         # "per_asset": run the SAME LSTM independently over every asset's
         # own [lookback, n_channels] window (batched as batch*n_assets),
@@ -719,9 +786,14 @@ class PortfolioLSTM(nn.Module):
                 prev_weight = torch.zeros(batch, self.n_assets, dtype=x.dtype, device=x.device)
             combined = torch.cat([combined, prev_weight.unsqueeze(-1)], dim=-1)  # (batch, n_assets, 2*hidden_size + 1)
         logits = self.head(combined).squeeze(-1)  # (batch, n_assets)
-        return self._weights_from_logits(logits)
+        return self._weights_from_coefficients(logits, risk_parity_baseline)
 
-    def forward_sequence(self, X: torch.Tensor, initial_weight: torch.Tensor | None = None) -> torch.Tensor:
+    def forward_sequence(
+        self,
+        X: torch.Tensor,
+        initial_weight: torch.Tensor | None = None,
+        risk_parity_baseline: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Compute weights for a whole ORDERED sequence of samples X (e.g.
         an entire train or validation split), correctly handling
         use_prev_weight=True's cross-sample dependency: sample i's input to
@@ -750,9 +822,15 @@ class PortfolioLSTM(nn.Module):
         to be already held going into X[0] - pass the previous split's
         final weight (detached) to continue a position across a
         train/validation boundary rather than restarting from flat.
+
+        `risk_parity_baseline` (n, n_assets) - PRECOMPUTED (see
+        precompute_risk_parity_baseline), matching X 1:1 - REQUIRED, the
+        fixed risk-parity weights each step's coefficients scale (see
+        forward()). Precomputed ONCE for the whole split by the caller,
+        not solved per-step here.
         """
         if not self.use_prev_weight:
-            return self.forward(X)
+            return self.forward(X, risk_parity_baseline=risk_parity_baseline)
 
         n = X.shape[0]
         prev = (
@@ -775,7 +853,10 @@ class PortfolioLSTM(nn.Module):
         try:
             weights = []
             for i in range(n):
-                w = self.forward(X[i : i + 1], prev.unsqueeze(0)).squeeze(0)
+                step_baseline = risk_parity_baseline[i : i + 1] if risk_parity_baseline is not None else None
+                w = self.forward(
+                    X[i : i + 1], prev.unsqueeze(0), risk_parity_baseline=step_baseline,
+                ).squeeze(0)
                 weights.append(w)
                 prev = w.detach()
             return torch.stack(weights, dim=0)
@@ -822,7 +903,6 @@ class PortfolioLSTM(nn.Module):
                 "n_assets": self.n_assets,
                 "hidden_size": self.hidden_size,
                 "num_layers": self.num_layers,
-                "weight_scheme": self.weight_scheme,
                 "dropout": self.dropout_p,
                 "noisy_head": self.noisy_head,
                 "use_prev_weight": self.use_prev_weight,
@@ -831,6 +911,7 @@ class PortfolioLSTM(nn.Module):
                 "asset_combiner": self.asset_combiner,
                 "n_attn_heads": self.n_attn_heads,
                 "pooling": self.pooling,
+                "position_mode": self.position_mode,
             },
             "state_dict": self.state_dict(),
             "x_mean": torch.as_tensor(x_mean),
@@ -936,37 +1017,47 @@ class EnsemblePortfolioLSTM(nn.Module):
     def __init__(self, models: list[PortfolioLSTM]):
         super().__init__()
         self.models = nn.ModuleList(models)
-        # Purely informational (mirrors the field every member already has);
-        # all members share the same scheme since they're restarts of the
-        # same training run.
-        self.weight_scheme = models[0].weight_scheme
+        # Purely informational (mirrors the field every member already has).
         self.use_prev_weight = models[0].use_prev_weight
         self.n_assets = models[0].n_assets
         self.n_channels = models[0].n_channels
 
-    def forward(self, x: torch.Tensor, prev_weight: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        prev_weight: torch.Tensor | None = None,
+        risk_parity_baseline: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         # Every member sees the SAME prev_weight - there's only one actual
         # position held (the ensemble average), so all members reason
         # about a rebalance from that same real starting point, not their
         # own individual (never-actually-held) previous prediction.
-        weights = torch.stack([m(x, prev_weight) for m in self.models], dim=0)  # (n_models, batch, n_assets)
-        averaged = weights.mean(dim=0)                              # (batch, n_assets)
-        # A simple average of several softmax vectors already sums to
-        # exactly 1 (a convex combination of points on the simplex stays on
-        # the simplex) - this re-normalization is a no-op there. For
-        # tanh_norm it's not a no-op: individual models can disagree on
-        # sign per asset, so naive averaging can shrink the sum of absolute
-        # weights below 1. Dividing by it here restores the same "fully
-        # invested" invariant each individual model already satisfies.
-        return averaged / (averaged.abs().sum(dim=-1, keepdim=True) + 1e-8)
+        # risk_parity_baseline is the same PRECOMPUTED tensor for every
+        # member (none of this is model-specific, just the shared
+        # risk-parity baseline each member scales by its own coefficient -
+        # see PortfolioLSTM.forward).
+        weights = torch.stack(
+            [m(x, prev_weight, risk_parity_baseline) for m in self.models], dim=0,
+        )  # (n_models, batch, n_assets)
+        # No re-normalization needed: each member's weight is
+        # risk_parity_weights(...) * coefficient_i with |coefficient_i| < 1
+        # and the SAME risk-parity baseline for every member, so
+        # |mean_i(weight_i)| = baseline * |mean_i(coefficient_i)| <=
+        # baseline * 1 - averaging alone preserves the gross-exposure bound.
+        return weights.mean(dim=0)  # (batch, n_assets)
 
-    def forward_sequence(self, X: torch.Tensor, initial_weight: torch.Tensor | None = None) -> torch.Tensor:
+    def forward_sequence(
+        self,
+        X: torch.Tensor,
+        initial_weight: torch.Tensor | None = None,
+        risk_parity_baseline: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Ensemble counterpart of PortfolioLSTM.forward_sequence() - see
         that method's docstring. Feeds the ENSEMBLE's own (averaged)
         previous decision back to every member at each step, since that
         average is the only position actually held."""
         if not self.use_prev_weight:
-            return self.forward(X)
+            return self.forward(X, risk_parity_baseline=risk_parity_baseline)
         n = X.shape[0]
         prev = (
             initial_weight.detach() if initial_weight is not None
@@ -983,7 +1074,10 @@ class EnsemblePortfolioLSTM(nn.Module):
         try:
             weights = []
             for i in range(n):
-                w = self.forward(X[i : i + 1], prev.unsqueeze(0)).squeeze(0)
+                step_baseline = risk_parity_baseline[i : i + 1] if risk_parity_baseline is not None else None
+                w = self.forward(
+                    X[i : i + 1], prev.unsqueeze(0), risk_parity_baseline=step_baseline,
+                ).squeeze(0)
                 weights.append(w)
                 prev = w.detach()
             return torch.stack(weights, dim=0)
@@ -1014,7 +1108,6 @@ class EnsemblePortfolioLSTM(nn.Module):
                         "n_assets": m.n_assets,
                         "hidden_size": m.hidden_size,
                         "num_layers": m.num_layers,
-                        "weight_scheme": m.weight_scheme,
                         "dropout": m.dropout_p,
                         "noisy_head": m.noisy_head,
                         "use_prev_weight": m.use_prev_weight,
@@ -1023,6 +1116,7 @@ class EnsemblePortfolioLSTM(nn.Module):
                         "asset_combiner": m.asset_combiner,
                         "n_attn_heads": m.n_attn_heads,
                         "pooling": m.pooling,
+                        "position_mode": m.position_mode,
                     },
                     "state_dict": m.state_dict(),
                 }
@@ -1216,7 +1310,7 @@ def kelly_loss(portfolio_returns: torch.Tensor, eps: float = 1e-6) -> torch.Tens
     so maximizing expected log-wealth is a convex minimization problem in
     weight-space (on top of whatever the LSTM itself contributes). It
     directly targets long-run COMPOUNDED growth rather than a single-period
-    mean/std ratio: two return paths with identical mean and std can
+    mean/std ratio: two return pa ths with identical mean and std can
     compound to very different wealth outcomes if one has fatter tails, and
     log-wealth penalizes that automatically, with no extra tunable weight.
 
@@ -1537,6 +1631,101 @@ def vol_match_benchmark(
 
 
 # --------------------------------------------------------------------------
+# Risk-parity baseline allocation (see PortfolioLSTM's own docstring)
+# --------------------------------------------------------------------------
+
+def risk_parity_weights(
+    window_returns: torch.Tensor,
+    covariance_estimator: str = "sample",
+    ewma_lambda: float = 0.94,
+    n_iter: int = 20,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """TRUE, covariance-based risk-parity weights: the long-only portfolio
+    where every asset contributes EQUALLY to total portfolio risk (equal
+    risk contribution / ERC) - not merely marginal inverse-volatility
+    weighting, which ignores how assets move together.
+
+    The covariance matrix is estimated from `window_returns` via
+    estimate_covariance, using the SAME `covariance_estimator`/
+    `ewma_lambda` choice (and the same window) already used for volatility
+    targeting elsewhere (see scale_weights_to_target_vol) - one consistent
+    view of "current risk" drives both how much of each asset to hold
+    (this function) and how much overall leverage to apply (target-vol
+    scaling), rather than two independently-configured risk estimates.
+
+    Solved via cyclical coordinate descent (Griveau-Billiotte, Richard &
+    Roncalli, 2013) on Spinu's (2013) convex log-barrier reformulation of
+    the ERC problem:
+        minimize_{w > 0}  0.5 w^T Sigma w  -  (1/N) * sum_i log(w_i)
+    whose minimizer, renormalized to sum to 1, IS the ERC portfolio -
+    at that minimum, every asset's contribution to portfolio variance
+    (w_i * (Sigma w)_i) is equal, by construction of the log-barrier's
+    first-order condition. Each coordinate update (holding every other
+    w_j fixed) has a closed-form solution - the positive root of a
+    quadratic in w_i - so no matrix inversion or line search is needed,
+    only `n_iter` sweeps over the (typically small, a handful of FX pairs)
+    N assets; this converges to high precision within ~20 sweeps for a
+    well-conditioned Sigma, and is cheap enough to re-solve for every
+    sample, every epoch.
+
+    window_returns: (batch, lookback, n_assets) raw (unstandardized) log
+    returns - the SAME raw window used for volatility targeting, never a
+    carry/vol-normalized channel.
+    Returns: (batch, n_assets), non-negative, summing to 1.
+    """
+    cov = estimate_covariance(window_returns, covariance_estimator, ewma_lambda)  # (batch, n_assets, n_assets)
+    batch, n_assets, _ = cov.shape
+    diag = torch.diagonal(cov, dim1=-2, dim2=-1).clamp(min=eps)  # (batch, n_assets) - each asset's own variance
+
+    # w[i] is a (batch,) tensor per asset; reassigned (never mutated
+    # in-place) each coordinate update, so this stays autograd-safe over
+    # the unrolled sweeps.
+    w = [torch.full((batch,), 1.0 / n_assets, dtype=cov.dtype, device=cov.device) for _ in range(n_assets)]
+    for _ in range(n_iter):
+        for i in range(n_assets):
+            w_vec = torch.stack(w, dim=-1)  # (batch, n_assets) - latest value of every coordinate
+            sigma_w_i = torch.einsum("bj,bj->b", cov[:, i, :], w_vec)  # (Sigma w)_i under the CURRENT w
+            b_i = sigma_w_i - cov[:, i, i] * w[i]  # sum_{j != i} Sigma[i,j] * w_j (drop asset i's own term)
+            a_i = diag[:, i]
+            # Positive root of: a_i * w_i^2 + b_i * w_i - 1/n_assets = 0
+            # (the log-barrier's first-order condition for coordinate i).
+            w[i] = ((-b_i + torch.sqrt(b_i ** 2 + 4 * a_i / n_assets)) / (2 * a_i)).clamp(min=eps)
+
+    w_vec = torch.stack(w, dim=-1)
+    return w_vec / w_vec.sum(dim=-1, keepdim=True)
+
+
+def precompute_risk_parity_baseline(
+    window_returns: torch.Tensor,
+    covariance_estimator: str = "sample",
+    ewma_lambda: float = 0.94,
+) -> torch.Tensor:
+    """Solve risk_parity_weights ONCE for every window in `window_returns`
+    and return the result detached, as a fixed constant to reuse for the
+    rest of training/evaluation.
+
+    risk_parity_weights depends only on raw (unstandardized) return
+    windows - never on model parameters - so, unlike the model's own
+    logits, it is the SAME value every epoch for a given sample. Calling
+    it from inside forward() (as an earlier version of this code did)
+    re-ran its ~20-sweep coordinate-descent solve for every sample, every
+    epoch, for an answer that never changed - pure wasted compute (and
+    wasted autograd-graph bookkeeping, even though the result never needed
+    gradients in the first place, since it doesn't depend on any learned
+    parameter). Calling this once per split (train/val/test), before the
+    epoch loop starts, and reusing the result is exactly equivalent and
+    orders of magnitude cheaper.
+
+    window_returns: (n, lookback, n_assets) - every window in a split
+    (n = however many samples that split has), not just one batch.
+    Returns: (n, n_assets), detached, no_grad.
+    """
+    with torch.no_grad():
+        return risk_parity_weights(window_returns, covariance_estimator, ewma_lambda)
+
+
+# --------------------------------------------------------------------------
 # Transaction costs
 # --------------------------------------------------------------------------
 
@@ -1693,13 +1882,32 @@ def train_portfolio_model(
     best_val_sharpe = -float("inf")
     best_state: dict | None = None
 
+    # Risk-parity baseline depends only on raw returns, never on model
+    # parameters, so it's the SAME value every epoch - solve it ONCE per
+    # split here (see precompute_risk_parity_baseline) instead of
+    # re-running its ~20-sweep coordinate-descent solve inside
+    # forward_sequence on every single epoch.
+    train_baseline = precompute_risk_parity_baseline(X_train_raw, covariance_estimator, ewma_lambda)
+    val_baseline = (
+        precompute_risk_parity_baseline(X_val_raw, covariance_estimator, ewma_lambda) if track_val else None
+    )
+    test_baseline = (
+        precompute_risk_parity_baseline(X_test_raw, covariance_estimator, ewma_lambda) if track_test else None
+    )
+
     model.train()
     try:
         for epoch in range(1, epochs + 1):
             _check_stop()
             optimizer.zero_grad()
             noisy_X_train = X_train + torch.randn_like(X_train) * noise_std if noise_std > 0 else X_train
-            raw_weights = model.forward_sequence(noisy_X_train)                       # (n_train, n_assets)
+            # risk_parity_baseline=train_baseline (precomputed from the
+            # CLEAN window, not noisy_X_train) - same reasoning as
+            # vol-targeting already using the clean window, not the noised
+            # one, for its own volatility estimate.
+            raw_weights = model.forward_sequence(
+                noisy_X_train, risk_parity_baseline=train_baseline,
+            )    # (n_train, n_assets)
             weights = scale_weights_to_target_vol(
                 raw_weights, X_train_raw, target_vol, max_leverage=max_leverage,
                 covariance_estimator=covariance_estimator, ewma_lambda=ewma_lambda,
@@ -1720,7 +1928,9 @@ def train_portfolio_model(
                     # the train/val boundary - real portfolios don't reset.
                     val_initial = weights[-1].detach() if model.use_prev_weight else None
                     val_weights = scale_weights_to_target_vol(
-                        model.forward_sequence(X_val, initial_weight=val_initial), X_val_raw, target_vol,
+                        model.forward_sequence(
+                            X_val, initial_weight=val_initial, risk_parity_baseline=val_baseline,
+                        ), X_val_raw, target_vol,
                         max_leverage=max_leverage,
                         covariance_estimator=covariance_estimator, ewma_lambda=ewma_lambda,
                     )
@@ -1736,7 +1946,9 @@ def train_portfolio_model(
                         # never touches best_state/checkpoint selection.
                         test_initial = val_weights[-1].detach() if model.use_prev_weight and val_weights.shape[0] > 0 else val_initial
                         test_weights = scale_weights_to_target_vol(
-                            model.forward_sequence(X_test, initial_weight=test_initial), X_test_raw, target_vol,
+                            model.forward_sequence(
+                                X_test, initial_weight=test_initial, risk_parity_baseline=test_baseline,
+                            ), X_test_raw, target_vol,
                             max_leverage=max_leverage,
                             covariance_estimator=covariance_estimator, ewma_lambda=ewma_lambda,
                         )
@@ -1801,7 +2013,6 @@ class PortfolioResult:
     model: PortfolioLSTM
     pairs: list[str]
     lookback: int
-    weight_scheme: str
     target_vol: float
     dates_train: pd.DatetimeIndex
     dates_val: pd.DatetimeIndex
@@ -1839,6 +2050,16 @@ class PortfolioResult:
     benchmark_returns_train: np.ndarray
     benchmark_returns_val: np.ndarray
     benchmark_returns_test: np.ndarray
+    # Per-asset coefficient the model applied to the risk-parity baseline
+    # each day (tanh(logits) if position_mode="long_short", else
+    # sigmoid(logits) - see PortfolioLSTM._weights_from_coefficients),
+    # i.e. weights_*_unscaled / risk_parity_baseline elementwise: this is
+    # the model's own learned "conviction" signal, separate from both the
+    # (fixed, un-learned) risk-parity baseline and vol-targeting's overall
+    # leverage scale - what the Evaluation view's coefficient chart plots.
+    coefficients_train: np.ndarray  # (n_train, n_assets), in (-1, 1) or (0, 1)
+    coefficients_val: np.ndarray    # (n_val, n_assets)
+    coefficients_test: np.ndarray   # (n_test, n_assets)
 
 
 #: Default configuration - main.py (the project's single entry point) reads
@@ -1865,7 +2086,13 @@ DEFAULT_CONFIG: dict = {
     # split entirely (train/val only, the original 2-way behavior).
     "test_frac": 0.1,
     # PortfolioLSTM architecture / training
-    "weight_scheme": "softmax",  # "softmax" (long-only) or "tanh_norm" (long/short)
+    # Every asset's final weight is a fixed, non-learned risk-parity
+    # (inverse-volatility) baseline multiplied by a per-asset coefficient
+    # the network predicts (see PortfolioLSTM's own docstring and
+    # risk_parity_weights). "position_mode" selects that coefficient's
+    # range: "long_short" (tanh, in (-1,1) - can go short) or "long_only"
+    # (sigmoid, in (0,1) - can only scale the baseline down toward flat).
+    "position_mode": "long_short",
     "hidden_size": 32,
     "epochs": 300,
     "lr": 1e-3,
@@ -2026,7 +2253,7 @@ DEFAULT_CONFIG: dict = {
 def portfolio_model_name(args: argparse.Namespace) -> str:
     """Deterministic quant.model_registry name for a PortfolioLSTM/-ensemble
     trained with `args` - built from the characteristics that actually
-    change the trained model (pairs, weight scheme, lookback, hidden size,
+    change the trained model (pairs, position mode, lookback, hidden size,
     target vol), so the same configuration always maps to the same name
     and re-saving under it is a natural update.
     """
@@ -2036,7 +2263,7 @@ def portfolio_model_name(args: argparse.Namespace) -> str:
     return build_model_name(
         "portfolio_ensemble" if is_ensemble else "portfolio",
         pairs=sorted(args.pairs),
-        weight_scheme=args.weight_scheme,
+        position_mode=getattr(args, "position_mode", "long_short"),
         lookback=args.lookback,
         hidden_size=args.hidden_size,
         target_vol=args.target_vol,
@@ -2243,7 +2470,7 @@ def _prepare_data(
 
 
 def evaluate_portfolio_model(
-    model: nn.Module, data: _PreparedData, weight_scheme: str, target_vol: float, max_leverage: float = 10.0,
+    model: nn.Module, data: _PreparedData, target_vol: float, max_leverage: float = 10.0,
     covariance_estimator: str = "sample", ewma_lambda: float = 0.94,
 ) -> PortfolioResult:
     """Run an already-trained-or-loaded model (eval mode, no grad) over all
@@ -2255,14 +2482,27 @@ def evaluate_portfolio_model(
     split. Shared by the train path (after fitting) and the load path
     (skips fitting entirely).
     """
+    # Risk-parity baseline depends only on raw returns, never on the
+    # model - solve it ONCE per split here (see
+    # precompute_risk_parity_baseline) rather than inside forward_sequence.
+    train_baseline = precompute_risk_parity_baseline(data.X_train_raw, covariance_estimator, ewma_lambda)
+    val_baseline = precompute_risk_parity_baseline(data.X_val_raw, covariance_estimator, ewma_lambda)
+    test_baseline = precompute_risk_parity_baseline(data.X_test_raw, covariance_estimator, ewma_lambda)
+
     model.eval()
     with torch.no_grad():
-        raw_weights_train = model.forward_sequence(data.X_train)
+        raw_weights_train = model.forward_sequence(
+            data.X_train, risk_parity_baseline=train_baseline,
+        )
         use_prev = getattr(model, "use_prev_weight", False)
         val_initial = raw_weights_train[-1].detach() if use_prev and raw_weights_train.shape[0] > 0 else None
-        raw_weights_val = model.forward_sequence(data.X_val, initial_weight=val_initial)
+        raw_weights_val = model.forward_sequence(
+            data.X_val, initial_weight=val_initial, risk_parity_baseline=val_baseline,
+        )
         test_initial = raw_weights_val[-1].detach() if use_prev and raw_weights_val.shape[0] > 0 else val_initial
-        raw_weights_test = model.forward_sequence(data.X_test, initial_weight=test_initial)
+        raw_weights_test = model.forward_sequence(
+            data.X_test, initial_weight=test_initial, risk_parity_baseline=test_baseline,
+        )
         weights_train_t = scale_weights_to_target_vol(
             raw_weights_train, data.X_train_raw, target_vol, max_leverage=max_leverage,
             covariance_estimator=covariance_estimator, ewma_lambda=ewma_lambda,
@@ -2287,6 +2527,14 @@ def evaluate_portfolio_model(
     weights_val = weights_val_t.cpu().numpy()
     weights_test = weights_test_t.cpu().numpy()
 
+    # coefficient = raw (pre-vol-targeting) weight / risk-parity baseline,
+    # elementwise - see PortfolioResult's docstring on coefficients_train.
+    # Safe to divide directly: risk_parity_weights clamps every entry to
+    # >= eps, so the baseline is never exactly zero.
+    coefficients_train = (raw_weights_train / train_baseline).cpu().numpy()
+    coefficients_val = (raw_weights_val / val_baseline).cpu().numpy()
+    coefficients_test = (raw_weights_test / test_baseline).cpu().numpy()
+
     returns_train_unscaled = (weights_train_unscaled * data.next_returns_train_raw).sum(axis=1)
     returns_val_unscaled = (weights_val_unscaled * data.next_returns_val_raw).sum(axis=1)
     returns_test_unscaled = (weights_test_unscaled * data.next_returns_test_raw).sum(axis=1)
@@ -2308,7 +2556,6 @@ def evaluate_portfolio_model(
         model=model,
         pairs=data.pairs,
         lookback=data.lookback,
-        weight_scheme=weight_scheme,
         target_vol=target_vol,
         dates_train=data.dates_train,
         dates_val=data.dates_val,
@@ -2336,6 +2583,9 @@ def evaluate_portfolio_model(
         benchmark_returns_train=benchmark_returns_train,
         benchmark_returns_val=benchmark_returns_val,
         benchmark_returns_test=benchmark_returns_test,
+        coefficients_train=coefficients_train,
+        coefficients_val=coefficients_val,
+        coefficients_test=coefficients_test,
     )
 
 
@@ -2346,7 +2596,6 @@ def _train_and_evaluate(data: _PreparedData, args: argparse.Namespace) -> Portfo
     model = PortfolioLSTM(
         n_assets=len(data.pairs),
         hidden_size=args.hidden_size,
-        weight_scheme=args.weight_scheme,
         dropout=args.dropout,
         noisy_head=args.noisy_head,
         use_prev_weight=args.use_prev_weight,
@@ -2355,6 +2604,7 @@ def _train_and_evaluate(data: _PreparedData, args: argparse.Namespace) -> Portfo
         asset_combiner=getattr(args, "asset_combiner", "attention"),
         n_attn_heads=getattr(args, "n_attn_heads", 2),
         pooling=getattr(args, "pooling", "last"),
+        position_mode=getattr(args, "position_mode", "long_short"),
     ).to(data.device)
     covariance_estimator = getattr(args, "covariance_estimator", "sample")
     ewma_lambda = getattr(args, "ewma_lambda", 0.94)
@@ -2374,7 +2624,7 @@ def _train_and_evaluate(data: _PreparedData, args: argparse.Namespace) -> Portfo
         next_returns_test=torch.tensor(data.next_returns_test_raw, device=data.device),
     )
     return evaluate_portfolio_model(
-        model, data, args.weight_scheme, args.target_vol, max_leverage=args.max_leverage,
+        model, data, args.target_vol, max_leverage=args.max_leverage,
         covariance_estimator=covariance_estimator, ewma_lambda=ewma_lambda,
     )
 
@@ -2418,7 +2668,7 @@ def load_pipeline(args: argparse.Namespace) -> PortfolioResult:
     # _prepare_data/get_device) before running it against data.X_train/etc.
     model = model.to(data.device)
     return evaluate_portfolio_model(
-        model, data, model.weight_scheme, args.target_vol, max_leverage=args.max_leverage,
+        model, data, args.target_vol, max_leverage=args.max_leverage,
         covariance_estimator=getattr(args, "covariance_estimator", "sample"),
         ewma_lambda=getattr(args, "ewma_lambda", 0.94),
     )
@@ -2480,7 +2730,7 @@ def run_pipeline_multi_seed(args: argparse.Namespace) -> PortfolioResult:
     # "ensemble": average every restart's predicted weights.
     ensemble_model = EnsemblePortfolioLSTM([r.model for r in results])
     ensemble_result = evaluate_portfolio_model(
-        ensemble_model, data, args.weight_scheme, args.target_vol, max_leverage=args.max_leverage,
+        ensemble_model, data, args.target_vol, max_leverage=args.max_leverage,
     )
     logger.info(
         "Ensemble of %d restarts: validation Sharpe %.3f",

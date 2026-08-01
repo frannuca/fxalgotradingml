@@ -821,6 +821,14 @@ class RiskResult:
     benchmark_returns_train: np.ndarray
     benchmark_returns_val: np.ndarray
     benchmark_returns_test: np.ndarray
+    # portfolio_result.coefficients_{split}, trimmed to the SAME
+    # `rolling_window - 1:` alignment as everything else on this class -
+    # the model's own per-asset conviction signal (see PortfolioResult's
+    # docstring on coefficients_train), unaffected by the risk overlay
+    # (which attenuates the FINAL weight, downstream of this coefficient).
+    coefficients_train: np.ndarray
+    coefficients_val: np.ndarray
+    coefficients_test: np.ndarray
 
 
 def risk_model_name(args: argparse.Namespace) -> str:
@@ -1007,6 +1015,9 @@ def _build_risk_result(portfolio_result: PortfolioResult, risk_model: nn.Module)
         benchmark_returns_train=portfolio_result.benchmark_returns_train[rolling_window - 1:],
         benchmark_returns_val=portfolio_result.benchmark_returns_val[rolling_window - 1:],
         benchmark_returns_test=portfolio_result.benchmark_returns_test[rolling_window - 1:],
+        coefficients_train=portfolio_result.coefficients_train[rolling_window - 1:],
+        coefficients_val=portfolio_result.coefficients_val[rolling_window - 1:],
+        coefficients_test=portfolio_result.coefficients_test[rolling_window - 1:],
     )
 
 

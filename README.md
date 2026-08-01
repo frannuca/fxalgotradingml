@@ -80,7 +80,7 @@ Full config showing every option and its default:
     "years": 8,
     "train_frac": 0.8,
 
-    "weight_scheme": "softmax",
+    "position_mode": "long_short",
     "hidden_size": 32,
     "epochs": 300,
     "lr": 0.001,
@@ -136,11 +136,17 @@ trading decision - a weight per FX pair - trained end-to-end via
 full-batch gradient descent to maximize the Sharpe ratio of the resulting
 portfolio.
 
-- `weight_scheme`:
-  - `"softmax"` (default) - long-only; weights in (0, 1) summing to 1.
-  - `"tanh_norm"` - long/short; weights in (-1, 1), L1-normalized so the
-    book is fully invested (sum of `|weight|` == 1); the signed sum floats
-    freely in [-1, 1] since allowing shorts rules out also pinning it to 1.
+Every asset's final weight is a fixed, un-learned risk-parity
+(inverse-volatility, long-only) baseline multiplied by a coefficient the
+network predicts (see `risk_parity_weights`) - the network only ever
+decides direction and conviction per asset, never how much capital an
+asset gets when fully committed.
+
+- `position_mode`:
+  - `"long_short"` (default) - coefficient = `tanh(logit)` in (-1, 1); the
+    network can flip an asset short.
+  - `"long_only"` - coefficient = `sigmoid(logit)` in (0, 1); the network
+    can only scale the baseline down toward flat, never flip its sign.
 
 **Volatility targeting** (`target_vol`, default `0.20` = 20% annualized):
 right after PortfolioLSTM computes its raw weights, they're uniformly
@@ -181,11 +187,11 @@ independent restarts on the same data and combines them via
 
 - `"best"` (default): keeps the single restart with the highest
   validation Sharpe.
-- `"ensemble"`: averages every restart's predicted weights (re-normalized
-  to keep the weight-scheme invariant - a no-op for `softmax`, a real
-  renormalization for `tanh_norm` since restarts can disagree on sign per
-  asset). Averaging tends to cancel out each restart's idiosyncratic
-  overfitting.
+- `"ensemble"`: averages every restart's predicted weights - no
+  re-normalization needed (each restart's weight is the same risk-parity
+  baseline times a coefficient in (-1, 1) or (0, 1), so the average
+  naturally stays within the same bound). Averaging tends to cancel out
+  each restart's idiosyncratic overfitting.
 
 `n_seeds: 1` (the default) skips all of this. Data is loaded once and
 reused across every restart, so the cost of `n_seeds: N` is roughly N
@@ -262,7 +268,7 @@ with.
 **Database persistence** (`quant.model_registry` - see step 2): set
 `"save_db": true` to ALSO persist the trained model(s) to Postgres, under
 a name deterministically derived from the config's characteristics (e.g.
-`portfolio_hidden_size=32_lookback=30_pairs=EURUSD-GBPUSD-USDJPY_target_vol=0.2_weight_scheme=softmax`)
+`portfolio_hidden_size=32_lookback=30_pairs=EURUSD-GBPUSD-USDJPY_position_mode=long_short_target_vol=0.2`)
 - printed to the console so you can copy it into another config. The same
 training configuration always maps to the same name, so re-saving under
 it is a natural update, not a collision.
@@ -285,7 +291,7 @@ Example - load a previously-trained pair purely by name and just re-plot:
     "pairs": ["EURUSD", "GBPUSD", "USDJPY"],
     "lookback": 30,
     "risk_overlay": true,
-    "load_portfolio": "portfolio_hidden_size=32_lookback=30_pairs=EURUSD-GBPUSD-USDJPY_target_vol=0.2_weight_scheme=softmax",
+    "load_portfolio": "portfolio_hidden_size=32_lookback=30_pairs=EURUSD-GBPUSD-USDJPY_position_mode=long_short_target_vol=0.2",
     "load_risk": "risk_lookback=30_max_attenuation=0.33_pairs=EURUSD-GBPUSD-USDJPY_risk_hidden_size=16_risk_rolling_window=10"
 }
 ```

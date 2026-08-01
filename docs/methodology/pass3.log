@@ -1,0 +1,410 @@
+This is pdfTeX, Version 3.141592653-2.6-1.40.29 (TeX Live 2026) (preloaded format=pdflatex)
+ restricted \write18 enabled.
+entering extended mode
+(./methodology.tex
+LaTeX2e <2025-11-01>
+L3 programming layer <2026-01-19>
+(/usr/local/texlive/2026/texmf-dist/tex/latex/base/article.cls
+Document Class: article 2025/01/22 v1.4n Standard LaTeX document class
+(/usr/local/texlive/2026/texmf-dist/tex/latex/base/size11.clo))
+(/usr/local/texlive/2026/texmf-dist/tex/latex/geometry/geometry.sty
+(/usr/local/texlive/2026/texmf-dist/tex/latex/graphics/keyval.sty)
+(/usr/local/texlive/2026/texmf-dist/tex/generic/iftex/ifvtex.sty
+(/usr/local/texlive/2026/texmf-dist/tex/generic/iftex/iftex.sty)))
+(/usr/local/texlive/2026/texmf-dist/tex/latex/base/inputenc.sty)
+(/usr/local/texlive/2026/texmf-dist/tex/latex/base/fontenc.sty)
+(/usr/local/texlive/2026/texmf-dist/tex/latex/amsmath/amsmath.sty
+For additional information on amsmath, use the `?' option.
+(/usr/local/texlive/2026/texmf-dist/tex/latex/amsmath/amstext.sty
+(/usr/local/texlive/2026/texmf-dist/tex/latex/amsmath/amsgen.sty))
+(/usr/local/texlive/2026/texmf-dist/tex/latex/amsmath/amsbsy.sty)
+(/usr/local/texlive/2026/texmf-dist/tex/latex/amsmath/amsopn.sty))
+(/usr/local/texlive/2026/texmf-dist/tex/latex/amsfonts/amssymb.sty
+(/usr/local/texlive/2026/texmf-dist/tex/latex/amsfonts/amsfonts.sty))
+(/usr/local/texlive/2026/texmf-dist/tex/latex/graphics/graphicx.sty
+(/usr/local/texlive/2026/texmf-dist/tex/latex/graphics/graphics.sty
+(/usr/local/texlive/2026/texmf-dist/tex/latex/graphics/trig.sty)
+(/usr/local/texlive/2026/texmf-dist/tex/latex/graphics-cfg/graphics.cfg)
+(/usr/local/texlive/2026/texmf-dist/tex/latex/graphics-def/pdftex.def)))
+(/usr/local/texlive/2026/texmf-dist/tex/latex/xcolor/xcolor.sty
+(/usr/local/texlive/2026/texmf-dist/tex/latex/graphics-cfg/color.cfg)
+(/usr/local/texlive/2026/texmf-dist/tex/latex/graphics/mathcolor.ltx))
+(/usr/local/texlive/2026/texmf-dist/tex/latex/booktabs/booktabs.sty)
+(/usr/local/texlive/2026/texmf-dist/tex/latex/tools/longtable.sty)
+(/usr/local/texlive/2026/texmf-dist/tex/latex/tools/array.sty)
+(/usr/local/texlive/2026/texmf-dist/tex/latex/enumitem/enumitem.sty)
+(/usr/local/texlive/2026/texmf-dist/tex/latex/caption/caption.sty
+(/usr/local/texlive/2026/texmf-dist/tex/latex/caption/caption3.sty)
+(/usr/local/texlive/2026/texmf-dist/tex/latex/caption/ltcaption.sty))
+(/usr/local/texlive/2026/texmf-dist/tex/latex/listings/listings.sty
+(/usr/local/texlive/2026/texmf-dist/tex/latex/listings/lstpatch.sty)
+(/usr/local/texlive/2026/texmf-dist/tex/latex/listings/lstmisc.sty)
+(/usr/local/texlive/2026/texmf-dist/tex/latex/listings/listings.cfg))
+==> First Aid for listings.sty no longer applied!
+    Expected:
+        2024/09/23 1.10c (Carsten Heinz)
+    but found:
+        2025/11/14 1.11b (Carsten Heinz)
+    so I'm assuming it got fixed.
+(/usr/local/texlive/2026/texmf-dist/tex/latex/pgf/frontendlayer/tikz.sty
+(/usr/local/texlive/2026/texmf-dist/tex/latex/pgf/basiclayer/pgf.sty
+(/usr/local/texlive/2026/texmf-dist/tex/latex/pgf/utilities/pgfrcs.sty
+(/usr/local/texlive/2026/texmf-dist/tex/generic/pgf/utilities/pgfutil-common.te
+x)
+(/usr/local/texlive/2026/texmf-dist/tex/generic/pgf/utilities/pgfutil-latex.def
+) (/usr/local/texlive/2026/texmf-dist/tex/generic/pgf/utilities/pgfrcs.code.tex
+(/usr/local/texlive/2026/texmf-dist/tex/generic/pgf/pgf.revision.tex)))
+(/usr/local/texlive/2026/texmf-dist/tex/latex/pgf/basiclayer/pgfcore.sty
+(/usr/local/texlive/2026/texmf-dist/tex/latex/pgf/systemlayer/pgfsys.sty
+(/usr/local/texlive/2026/texmf-dist/tex/generic/pgf/systemlayer/pgfsys.code.tex
+(/usr/local/texlive/2026/texmf-dist/tex/generic/pgf/utilities/pgfkeys.code.tex
+(/usr/local/texlive/2026/texmf-dist/tex/generic/pgf/utilities/pgfkeyslibraryfil
+tered.code.tex))
+(/usr/local/texlive/2026/texmf-dist/tex/generic/pgf/systemlayer/pgf.cfg)
+(/usr/local/texlive/2026/texmf-dist/tex/generic/pgf/systemlayer/pgfsys-pdftex.d
+ef
+(/usr/local/texlive/2026/texmf-dist/tex/generic/pgf/systemlayer/pgfsys-common-p
+df.def)))
+(/usr/local/texlive/2026/texmf-dist/tex/generic/pgf/systemlayer/pgfsyssoftpath.
+code.tex)
+(/usr/local/texlive/2026/texmf-dist/tex/generic/pgf/systemlayer/pgfsysprotocol.
+code.tex))
+(/usr/local/texlive/2026/texmf-dist/tex/generic/pgf/basiclayer/pgfcore.code.tex
+(/usr/local/texlive/2026/texmf-dist/tex/generic/pgf/math/pgfmath.code.tex
+(/usr/local/texlive/2026/texmf-dist/tex/generic/pgf/math/pgfmathutil.code.tex)
+(/usr/local/texlive/2026/texmf-dist/tex/generic/pgf/math/pgfmathparser.code.tex
+)
+(/usr/local/texlive/2026/texmf-dist/tex/generic/pgf/math/pgfmathfunctions.code.
+tex)
+(/usr/local/texlive/2026/texmf-dist/tex/generic/pgf/math/pgfmathfunctions.basic
+.code.tex)
+(/usr/local/texlive/2026/texmf-dist/tex/generic/pgf/math/pgfmathfunctions.trigo
+nometric.code.tex)
+(/usr/local/texlive/2026/texmf-dist/tex/generic/pgf/math/pgfmathfunctions.rando
+m.code.tex)
+(/usr/local/texlive/2026/texmf-dist/tex/generic/pgf/math/pgfmathfunctions.compa
+rison.code.tex)
+(/usr/local/texlive/2026/texmf-dist/tex/generic/pgf/math/pgfmathfunctions.base.
+code.tex)
+(/usr/local/texlive/2026/texmf-dist/tex/generic/pgf/math/pgfmathfunctions.round
+.code.tex)
+(/usr/local/texlive/2026/texmf-dist/tex/generic/pgf/math/pgfmathfunctions.misc.
+code.tex)
+(/usr/local/texlive/2026/texmf-dist/tex/generic/pgf/math/pgfmathfunctions.integ
+erarithmetics.code.tex)
+(/usr/local/texlive/2026/texmf-dist/tex/generic/pgf/math/pgfmathcalc.code.tex)
+(/usr/local/texlive/2026/texmf-dist/tex/generic/pgf/math/pgfmathfloat.code.tex)
+) (/usr/local/texlive/2026/texmf-dist/tex/generic/pgf/math/pgfint.code.tex)
+(/usr/local/texlive/2026/texmf-dist/tex/generic/pgf/basiclayer/pgfcorepoints.co
+de.tex)
+(/usr/local/texlive/2026/texmf-dist/tex/generic/pgf/basiclayer/pgfcorepathconst
+ruct.code.tex)
+(/usr/local/texlive/2026/texmf-dist/tex/generic/pgf/basiclayer/pgfcorepathusage
+.code.tex)
+(/usr/local/texlive/2026/texmf-dist/tex/generic/pgf/basiclayer/pgfcorescopes.co
+de.tex)
+(/usr/local/texlive/2026/texmf-dist/tex/generic/pgf/basiclayer/pgfcoregraphicst
+ate.code.tex)
+(/usr/local/texlive/2026/texmf-dist/tex/generic/pgf/basiclayer/pgfcoretransform
+ations.code.tex)
+(/usr/local/texlive/2026/texmf-dist/tex/generic/pgf/basiclayer/pgfcorequick.cod
+e.tex)
+(/usr/local/texlive/2026/texmf-dist/tex/generic/pgf/basiclayer/pgfcoreobjects.c
+ode.tex)
+(/usr/local/texlive/2026/texmf-dist/tex/generic/pgf/basiclayer/pgfcorepathproce
+ssing.code.tex)
+(/usr/local/texlive/2026/texmf-dist/tex/generic/pgf/basiclayer/pgfcorearrows.co
+de.tex)
+(/usr/local/texlive/2026/texmf-dist/tex/generic/pgf/basiclayer/pgfcoreshade.cod
+e.tex)
+(/usr/local/texlive/2026/texmf-dist/tex/generic/pgf/basiclayer/pgfcoreimage.cod
+e.tex)
+(/usr/local/texlive/2026/texmf-dist/tex/generic/pgf/basiclayer/pgfcoreexternal.
+code.tex)
+(/usr/local/texlive/2026/texmf-dist/tex/generic/pgf/basiclayer/pgfcorelayers.co
+de.tex)
+(/usr/local/texlive/2026/texmf-dist/tex/generic/pgf/basiclayer/pgfcoretranspare
+ncy.code.tex)
+(/usr/local/texlive/2026/texmf-dist/tex/generic/pgf/basiclayer/pgfcorepatterns.
+code.tex)
+(/usr/local/texlive/2026/texmf-dist/tex/generic/pgf/basiclayer/pgfcorerdf.code.
+tex)))
+(/usr/local/texlive/2026/texmf-dist/tex/generic/pgf/modules/pgfmoduleshapes.cod
+e.tex)
+(/usr/local/texlive/2026/texmf-dist/tex/generic/pgf/modules/pgfmoduleplot.code.
+tex)
+(/usr/local/texlive/2026/texmf-dist/tex/latex/pgf/compatibility/pgfcomp-version
+-0-65.sty)
+(/usr/local/texlive/2026/texmf-dist/tex/latex/pgf/compatibility/pgfcomp-version
+-1-18.sty))
+(/usr/local/texlive/2026/texmf-dist/tex/latex/pgf/utilities/pgffor.sty
+(/usr/local/texlive/2026/texmf-dist/tex/latex/pgf/utilities/pgfkeys.sty
+(/usr/local/texlive/2026/texmf-dist/tex/generic/pgf/utilities/pgfkeys.code.tex)
+) (/usr/local/texlive/2026/texmf-dist/tex/latex/pgf/math/pgfmath.sty
+(/usr/local/texlive/2026/texmf-dist/tex/generic/pgf/math/pgfmath.code.tex))
+(/usr/local/texlive/2026/texmf-dist/tex/generic/pgf/utilities/pgffor.code.tex))
+
+(/usr/local/texlive/2026/texmf-dist/tex/generic/pgf/frontendlayer/tikz/tikz.cod
+e.tex
+(/usr/local/texlive/2026/texmf-dist/tex/generic/pgf/libraries/pgflibraryplothan
+dlers.code.tex)
+(/usr/local/texlive/2026/texmf-dist/tex/generic/pgf/modules/pgfmodulematrix.cod
+e.tex)
+(/usr/local/texlive/2026/texmf-dist/tex/generic/pgf/frontendlayer/tikz/librarie
+s/tikzlibrarytopaths.code.tex)))
+(/usr/local/texlive/2026/texmf-dist/tex/generic/pgf/libraries/pgflibraryarrows.
+meta.code.tex)
+(/usr/local/texlive/2026/texmf-dist/tex/generic/pgf/frontendlayer/tikz/librarie
+s/tikzlibrarypositioning.code.tex)
+(/usr/local/texlive/2026/texmf-dist/tex/generic/pgf/frontendlayer/tikz/librarie
+s/tikzlibraryfit.code.tex)
+(/usr/local/texlive/2026/texmf-dist/tex/generic/pgf/frontendlayer/tikz/librarie
+s/tikzlibrarybackgrounds.code.tex)
+(/usr/local/texlive/2026/texmf-dist/tex/generic/pgf/frontendlayer/tikz/librarie
+s/tikzlibraryshapes.geometric.code.tex
+(/usr/local/texlive/2026/texmf-dist/tex/generic/pgf/libraries/shapes/pgflibrary
+shapes.geometric.code.tex))
+(/usr/local/texlive/2026/texmf-dist/tex/generic/pgf/frontendlayer/tikz/librarie
+s/tikzlibrarycalc.code.tex)
+(/usr/local/texlive/2026/texmf-dist/tex/latex/fancyhdr/fancyhdr.sty)
+(/usr/local/texlive/2026/texmf-dist/tex/latex/titlesec/titlesec.sty)
+(/usr/local/texlive/2026/texmf-dist/tex/latex/hyperref/hyperref.sty
+(/usr/local/texlive/2026/texmf-dist/tex/latex/kvsetkeys/kvsetkeys.sty)
+(/usr/local/texlive/2026/texmf-dist/tex/generic/kvdefinekeys/kvdefinekeys.sty)
+(/usr/local/texlive/2026/texmf-dist/tex/generic/pdfescape/pdfescape.sty
+(/usr/local/texlive/2026/texmf-dist/tex/generic/ltxcmds/ltxcmds.sty)
+(/usr/local/texlive/2026/texmf-dist/tex/generic/pdftexcmds/pdftexcmds.sty
+(/usr/local/texlive/2026/texmf-dist/tex/generic/infwarerr/infwarerr.sty)))
+(/usr/local/texlive/2026/texmf-dist/tex/latex/hycolor/hycolor.sty)
+(/usr/local/texlive/2026/texmf-dist/tex/latex/hyperref/nameref.sty
+(/usr/local/texlive/2026/texmf-dist/tex/latex/refcount/refcount.sty)
+(/usr/local/texlive/2026/texmf-dist/tex/generic/gettitlestring/gettitlestring.s
+ty (/usr/local/texlive/2026/texmf-dist/tex/latex/kvoptions/kvoptions.sty)))
+(/usr/local/texlive/2026/texmf-dist/tex/latex/etoolbox/etoolbox.sty)
+(/usr/local/texlive/2026/texmf-dist/tex/generic/stringenc/stringenc.sty)
+(/usr/local/texlive/2026/texmf-dist/tex/latex/hyperref/pd1enc.def)
+(/usr/local/texlive/2026/texmf-dist/tex/generic/intcalc/intcalc.sty)
+(/usr/local/texlive/2026/texmf-dist/tex/latex/hyperref/puenc.def)
+(/usr/local/texlive/2026/texmf-dist/tex/latex/url/url.sty)
+(/usr/local/texlive/2026/texmf-dist/tex/generic/bitset/bitset.sty
+(/usr/local/texlive/2026/texmf-dist/tex/generic/bigintcalc/bigintcalc.sty)))
+(/usr/local/texlive/2026/texmf-dist/tex/latex/hyperref/hpdftex.def
+(/usr/local/texlive/2026/texmf-dist/tex/latex/rerunfilecheck/rerunfilecheck.sty
+
+(/usr/local/texlive/2026/texmf-dist/tex/generic/uniquecounter/uniquecounter.sty
+))) (/usr/local/texlive/2026/texmf-dist/tex/latex/parskip/parskip.sty)
+(/usr/local/texlive/2026/texmf-dist/tex/latex/float/float.sty)
+(/usr/local/texlive/2026/texmf-dist/tex/latex/mdframed/mdframed.sty
+(/usr/local/texlive/2026/texmf-dist/tex/latex/l3packages/xparse/xparse.sty
+(/usr/local/texlive/2026/texmf-dist/tex/latex/l3kernel/expl3.sty
+(/usr/local/texlive/2026/texmf-dist/tex/latex/l3backend/l3backend-pdftex.def)))
+ (/usr/local/texlive/2026/texmf-dist/tex/latex/zref/zref-abspage.sty
+(/usr/local/texlive/2026/texmf-dist/tex/latex/zref/zref-base.sty
+(/usr/local/texlive/2026/texmf-dist/tex/generic/etexcmds/etexcmds.sty)
+(/usr/local/texlive/2026/texmf-dist/tex/latex/auxhook/auxhook.sty)))
+(/usr/local/texlive/2026/texmf-dist/tex/latex/needspace/needspace.sty)
+(/usr/local/texlive/2026/texmf-dist/tex/latex/mdframed/md-frame-0.mdf))
+(/usr/local/texlive/2026/texmf-dist/tex/latex/listings/lstlang1.sty)
+(./methodology.aux)
+*geometry* driver: auto-detecting
+*geometry* detected driver: pdftex
+(/usr/local/texlive/2026/texmf-dist/tex/context/base/mkii/supp-pdf.mkii
+[Loading MPS to PDF converter (version 2006.09.02).]
+) (/usr/local/texlive/2026/texmf-dist/tex/latex/epstopdf-pkg/epstopdf-base.sty
+(/usr/local/texlive/2026/texmf-dist/tex/latex/latexconfig/epstopdf-sys.cfg))
+(./methodology.out) (./methodology.out)
+(/usr/local/texlive/2026/texmf-dist/tex/latex/amsfonts/umsa.fd)
+(/usr/local/texlive/2026/texmf-dist/tex/latex/amsfonts/umsb.fd)
+(./methodology.toc [1{/usr/local/texlive/2026/texmf-var/fonts/map/pdftex/updmap
+/pdftex.map}{/usr/local/texlive/2026/texmf-dist/fonts/enc/dvips/cm-super/cm-sup
+er-t1.enc}]) [2]
+Overfull \hbox (123.75575pt too wide) in paragraph at lines 145--158
+ [] 
+
+Overfull \hbox (20.8813pt too wide) in paragraph at lines 183--186
+\T1/cmr/m/n/10.95 normalized-momentum chan-nels $\OMS/cmsy/m/n/10.95 !$ \T1/cmr
+/m/n/10.95 rolling win-dows $\OMS/cmsy/m/n/10.95 !$ \T1/cmr/m/n/10.95 chrono-lo
+g-i-cal train/validation/test
+[3] [4] [5]
+Overfull \hbox (4.93732pt too wide) in paragraph at lines 398--401
+[]\T1/cmr/bx/n/10 Tensor shapes. $\OML/cmm/m/it/10 X \OMS/cmsy/m/n/10 2 \U/msb/
+m/n/10 R[]$ \T1/cmr/m/n/10 where $\OML/cmm/m/it/10 B \OT1/cmr/m/n/10 = \OML/cmm
+/m/it/10 T \OMS/cmsy/m/n/10 ^^@ \OML/cmm/m/it/10 L$ \T1/cmr/m/n/10 ($\OML/cmm/m
+/it/10 T$ \T1/cmr/m/n/10 = num-ber of us-able days of his-tory); \T1/cmtt/m/n/1
+0 next_returns
+[6] [7]
+Overfull \hbox (38.05956pt too wide) in paragraph at lines 547--550
+\T1/cmr/m/n/10.95 followed by pool-ing over time (Ÿ[][]5.3[][]) to a sin-gle $\
+U/msb/m/n/10.95 R[]$ \T1/cmr/m/n/10.95 sum-mary, then the head (a sin-gle \T1/c
+mtt/m/n/10 Linear\T1/cmr/m/n/10.95 /\T1/cmtt/m/n/10 NoisyLinear
+
+Overfull \hbox (13.7378pt too wide) detected at line 553
+[][][][][] \OT1/cmr/m/n/10.95 = [][][ [][] ;  \OML/cmm/m/it/10.95 w[] \OT1/cmr/
+m/n/10.95 ][] \OMS/cmsy/m/n/10.95 2 \U/msb/m/n/10.95 R[] \OT1/cmr/m/n/10.95 ([]
+[] = [])
+[8]
+
+LaTeX Warning: Reference `sec:verification' on page 9 undefined on input line 6
+27.
+
+[9] [10] [11] [12] [13]
+Overfull \hbox (70.83922pt too wide) in paragraph at lines 1004--1010
+\T1/cmr/m/n/10.95 turns pe-nal-ized -- the Sortino vari-ant) rather than the pl
+ain stan-dard de-vi-a-tion.  []\T1/cmtt/m/n/9 models/portfolio_lstm.py:1131--11
+77
+[14]
+Overfull \hbox (99.92223pt too wide) in paragraph at lines 1081--1090
+[]\T1/cmr/bx/n/10 Rationale. \T1/cmr/m/n/10 Costs are ap-plied \T1/cmr/bx/n/10 
+net, in-side the train-ing loss it-self \T1/cmr/m/n/10 (via the dif-fer-en-tiab
+le \T1/cmtt/m/n/10 apply_transaction_costs_torch\T1/cmr/m/n/10 ),
+[15] [16]
+
+Package mdframed Warning: You got a bad break
+(mdframed)                because the last box will be empty
+(mdframed)                you have to change it manually
+(mdframed)                by changing the text, the space
+(mdframed)                or something else on input line 1245.
+
+[17] [18] [19]
+Overfull \hbox (3.0552pt too wide) in paragraph at lines 1423--1427
+[]\T1/cmr/bx/n/10 Optional com-po-nent (opt-in, de-fault off). \T1/cmtt/m/n/10 
+n_seeds $\OML/cmm/m/it/10 > \OT1/cmr/m/n/10 1$ \T1/cmr/m/n/10 (de-fault 1) trai
+ns that many independently-
+
+Overfull \hbox (47.13708pt too wide) in paragraph at lines 1423--1427
+\T1/cmr/m/n/10 seeded restarts of Port-fo-li-oL-STM (and, if en-abled, RiskL-ST
+M) on iden-ti-cal data, com-bined via \T1/cmtt/m/n/10 restart_strategy\T1/cmr/m
+/n/10 . 
+[20]
+Overfull \hbox (8.53065pt too wide) in paragraph at lines 1450--1463
+[]\T1/cmr/bx/n/10 Rationale. \T1/cmr/m/n/10 The Sharpe-ratio train-ing ob-jec-t
+ive is non-convex in the LSTM's pa-ram-e-ters (LSTM/softmax
+
+Underfull \hbox (badness 3312) in paragraph at lines 1497--1498
+[]|\T1/cmr/m/n/10.95 NoisyNet pa-ram-e-ter noise on the out-put
+
+Overfull \hbox (5.40076pt too wide) in paragraph at lines 1504--1504
+[]|\T1/cmtt/m/n/10.95 attention| 
+
+Overfull \hbox (10.73734pt too wide) in paragraph at lines 1506--1506
+[]|\T1/cmtt/m/n/10.95 covariance_estimator| 
+
+Overfull \hbox (5.07896pt too wide) in paragraph at lines 1520--1520
+[]|\T1/cmtt/m/n/10.95 risk_rolling_window| 
+
+Overfull \hbox (5.07896pt too wide) in paragraph at lines 1521--1521
+[]|\T1/cmtt/m/n/10.95 use_cross_sectional| 
+
+Underfull \hbox (badness 10000) in paragraph at lines 1523--1523
+[]|\T1/cmtt/m/n/10.95 load_portfolio \T1/cmr/m/n/10.95 /
+ [21]
+Underfull \hbox (badness 3240) in paragraph at lines 1541--1541
+[]|\T1/cmr/m/n/10.95 Sequential (not joint)
+
+Underfull \hbox (badness 1048) in paragraph at lines 1546--1546
+\T1/cmr/m/n/10.95 back-fill) for carry/vol
+
+Underfull \hbox (badness 10000) in paragraph at lines 1548--1548
+[]|\T1/cmr/m/n/10.95 Per-asset shared en-
+
+Underfull \hbox (badness 10000) in paragraph at lines 1548--1548
+\T1/cmr/m/n/10.95 coder + cross-asset
+
+Underfull \hbox (badness 10000) in paragraph at lines 1553--1553
+[]|\T1/cmtt/m/n/10.95 use_prev_weight
+
+Underfull \hbox (badness 10000) in paragraph at lines 1556--1556
+[]|\T1/cmr/m/n/10.95 NoisyNet pa-ram-e-ter
+
+Underfull \hbox (badness 10000) in paragraph at lines 1558--1558
+[]|\T1/cmr/m/n/10.95 NoisyLinear
+
+Underfull \hbox (badness 3386) in paragraph at lines 1561--1561
+[]|\T1/cmtt/m/n/10.95 CASH \T1/cmr/m/n/10.95 as a data-layer
+
+Underfull \hbox (badness 1910) in paragraph at lines 1563--1563
+[]|\T1/cmr/m/n/10.95 Three co-vari-ance es-ti-
+
+Underfull \hbox (badness 10000) in paragraph at lines 1573--1573
+[]|\T1/cmr/m/n/10.95 Chronological, test-
+
+Underfull \hbox (badness 3482) in paragraph at lines 1575--1575
+[]|\T1/cmr/m/n/10.95 Best-val-Sharpe check-
+
+Underfull \hbox (badness 10000) in paragraph at lines 1577--1577
+[]|\T1/cmr/m/n/10.95 Marginal + cross-
+
+Underfull \hbox (badness 2626) in paragraph at lines 1577--1577
+\T1/cmr/m/n/10.95 sectional risk fea-tures
+
+Underfull \hbox (badness 3895) in paragraph at lines 1582--1582
+[]|\T1/cmr/m/n/10.95 Multi-seed restarts &
+
+Underfull \hbox (badness 1038) in paragraph at lines 1584--1584
+[]|\T1/cmr/m/n/10.95 Inverse-vol bench-mark,
+ [22]
+Overfull \hbox (36.29445pt too wide) in paragraph at lines 1602--1605
+[]|\T1/cmr/m/n/10.95 Data pipeline, \T1/cmtt/m/n/10.95 PortfolioLSTM\T1/cmr/m/n
+/10.95 /\T1/cmtt/m/n/10.95 EnsemblePortfolioLSTM\T1/cmr/m/n/10.95 ,
+
+Underfull \hbox (badness 6364) in paragraph at lines 1602--1605
+\T1/cmr/m/n/10.95 trans-ac-tion costs, the full port-fo-lio train-
+
+Overfull \hbox (4.85387pt too wide) in paragraph at lines 1607--1607
+[]|\T1/cmtt/m/n/10.95 models/risk_postprocess.py| 
+
+Underfull \hbox (badness 10000) in paragraph at lines 1610--1611
+[]|\T1/cmr/m/n/10.95 FRED interest-rate down-loader (feeds
+
+Underfull \hbox (badness 1184) in paragraph at lines 1611--1612
+[]|\T1/cmr/m/n/10.95 Postgres-backed \T1/cmtt/m/n/10.95 quant.model_registry \T
+1/cmr/m/n/10.95 model
+
+Overfull \hbox (21.82898pt too wide) in paragraph at lines 1613--1613
+[]|\T1/cmtt/m/n/10.95 frontend/src/TrainingView.jsx| 
+
+Underfull \hbox (badness 10000) in paragraph at lines 1613--1614
+[]|\T1/cmr/m/n/10.95 Training con-fig-u-ra-tion form, live in-
+
+Overfull \hbox (33.14572pt too wide) in paragraph at lines 1614--1614
+[]|\T1/cmtt/m/n/10.95 frontend/src/EvaluationView.jsx| 
+ [23] [24] (./methodology.aux)
+
+LaTeX Warning: There were undefined references.
+
+ )
+(see the transcript file for additional information)</usr/local/texlive/2026/te
+xmf-dist/fonts/type1/public/amsfonts/cm/cmbx10.pfb></usr/local/texlive/2026/tex
+mf-dist/fonts/type1/public/amsfonts/cm/cmex10.pfb></usr/local/texlive/2026/texm
+f-dist/fonts/type1/public/amsfonts/cm/cmmi10.pfb></usr/local/texlive/2026/texmf
+-dist/fonts/type1/public/amsfonts/cm/cmmi6.pfb></usr/local/texlive/2026/texmf-d
+ist/fonts/type1/public/amsfonts/cm/cmmi7.pfb></usr/local/texlive/2026/texmf-dis
+t/fonts/type1/public/amsfonts/cm/cmmi8.pfb></usr/local/texlive/2026/texmf-dist/
+fonts/type1/public/amsfonts/cm/cmr10.pfb></usr/local/texlive/2026/texmf-dist/fo
+nts/type1/public/amsfonts/cm/cmr6.pfb></usr/local/texlive/2026/texmf-dist/fonts
+/type1/public/amsfonts/cm/cmr7.pfb></usr/local/texlive/2026/texmf-dist/fonts/ty
+pe1/public/amsfonts/cm/cmr8.pfb></usr/local/texlive/2026/texmf-dist/fonts/type1
+/public/amsfonts/cm/cmsy10.pfb></usr/local/texlive/2026/texmf-dist/fonts/type1/
+public/amsfonts/cm/cmsy7.pfb></usr/local/texlive/2026/texmf-dist/fonts/type1/pu
+blic/amsfonts/cm/cmsy8.pfb></usr/local/texlive/2026/texmf-dist/fonts/type1/publ
+ic/amsfonts/symbols/msbm10.pfb></usr/local/texlive/2026/texmf-dist/fonts/type1/
+public/cm-super/sfbx1000.pfb></usr/local/texlive/2026/texmf-dist/fonts/type1/pu
+blic/cm-super/sfbx1095.pfb></usr/local/texlive/2026/texmf-dist/fonts/type1/publ
+ic/cm-super/sfbx1200.pfb></usr/local/texlive/2026/texmf-dist/fonts/type1/public
+/cm-super/sfbx1440.pfb></usr/local/texlive/2026/texmf-dist/fonts/type1/public/c
+m-super/sfbx1728.pfb></usr/local/texlive/2026/texmf-dist/fonts/type1/public/cm-
+super/sfit0900.pfb></usr/local/texlive/2026/texmf-dist/fonts/type1/public/cm-su
+per/sfrm0600.pfb></usr/local/texlive/2026/texmf-dist/fonts/type1/public/cm-supe
+r/sfrm0700.pfb></usr/local/texlive/2026/texmf-dist/fonts/type1/public/cm-super/
+sfrm0800.pfb></usr/local/texlive/2026/texmf-dist/fonts/type1/public/cm-super/sf
+rm1000.pfb></usr/local/texlive/2026/texmf-dist/fonts/type1/public/cm-super/sfrm
+1095.pfb></usr/local/texlive/2026/texmf-dist/fonts/type1/public/cm-super/sfrm12
+00.pfb></usr/local/texlive/2026/texmf-dist/fonts/type1/public/cm-super/sfti1000
+.pfb></usr/local/texlive/2026/texmf-dist/fonts/type1/public/cm-super/sfti1095.p
+fb></usr/local/texlive/2026/texmf-dist/fonts/type1/public/cm-super/sftt0800.pfb
+></usr/local/texlive/2026/texmf-dist/fonts/type1/public/cm-super/sftt0900.pfb><
+/usr/local/texlive/2026/texmf-dist/fonts/type1/public/cm-super/sftt1000.pfb></u
+sr/local/texlive/2026/texmf-dist/fonts/type1/public/cm-super/sftt1095.pfb></usr
+/local/texlive/2026/texmf-dist/fonts/type1/public/cm-super/sftt1200.pfb>
+Output written on methodology.pdf (24 pages, 775413 bytes).
+Transcript written on methodology.log.

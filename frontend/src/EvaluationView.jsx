@@ -265,6 +265,16 @@ export default function EvaluationView() {
             <SeriesByPairChart title="Out-of-sample" series={result.positions} pairs={result.pairs} />
           </div>
 
+          <h2>Model coefficients (out-of-sample)</h2>
+          <div className="chart-grid">
+            <SeriesByPairChart title="Out-of-sample" series={result.coefficients} pairs={result.pairs} />
+          </div>
+          <p className="status-line" style={{ marginTop: 4 }}>
+            The coefficient the model applied to the risk-parity baseline each day, per asset (tanh in (-1, 1) for
+            long/short, or sigmoid in (0, 1) for long-only) - the model's own learned conviction signal, separate
+            from the fixed risk-parity baseline and from vol-targeting's overall leverage.
+          </p>
+
           {result.attenuation && (
             <>
               <h2>Risk attenuation factor (out-of-sample)</h2>

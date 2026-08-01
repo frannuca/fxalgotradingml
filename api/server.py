@@ -49,6 +49,7 @@ from models.portfolio_lstm import (
     apply_transaction_costs,
     load_close_prices,
     portfolio_model_name,
+    precompute_risk_parity_baseline,
     scale_weights_to_target_vol,
     sharpe_ratio,
     to_log_returns,
@@ -238,7 +239,7 @@ class TrainRequest(BaseModel):
     years: int = 8
     train_frac: float = 0.8
     test_frac: float = 0.1
-    weight_scheme: str = "softmax"
+    position_mode: str = "long_short"  # "long_short" (tanh, can go short) or "long_only" (sigmoid) - see PortfolioLSTM
     hidden_size: int = 32
     epochs: int = 300
     lr: float = 1e-3
@@ -683,10 +684,29 @@ def _predict_latest_weights(args: Namespace, model, risk_model=None) -> dict[str
             warmup_raw = feature_returns.to_numpy(dtype=np.float32)[-(lookback + prev_weight_warmup) : -1]
             warmup_windows = torch.tensor(warmup_raw).unfold(0, lookback, 1).permute(0, 2, 1)  # (prev_weight_warmup, lookback, n_assets * n_channels)
             warmup_standardized = (warmup_windows.numpy() - model.x_mean) / model.x_std
-            warmup_sequence = model.forward_sequence(torch.tensor(warmup_standardized, dtype=X.dtype, device=device))
+            # channel 0 per asset is always the raw return (see
+            # build_feature_dataframe) - needed to compute the risk-parity
+            # baseline each step's weight scales (PortfolioLSTM.forward_sequence).
+            warmup_raw_single_channel = warmup_windows[:, :, 0::n_channels].to(device)
+            # Risk-parity baseline depends only on raw returns, never on
+            # the model - solve it ONCE for this whole warmup sequence
+            # (see precompute_risk_parity_baseline) rather than inside
+            # forward_sequence.
+            warmup_baseline = precompute_risk_parity_baseline(
+                warmup_raw_single_channel,
+                getattr(args, "covariance_estimator", "sample"), getattr(args, "ewma_lambda", 0.94),
+            )
+            warmup_sequence = model.forward_sequence(
+                torch.tensor(warmup_standardized, dtype=X.dtype, device=device), risk_parity_baseline=warmup_baseline,
+            )
             prev_weight = warmup_sequence[-1].detach()  # yesterday's decision = today's ACTUAL held position
 
-        raw_weights = model(X, prev_weight.unsqueeze(0) if prev_weight is not None else None)
+        risk_parity_baseline = precompute_risk_parity_baseline(
+            X_raw, getattr(args, "covariance_estimator", "sample"), getattr(args, "ewma_lambda", 0.94),
+        )
+        raw_weights = model(
+            X, prev_weight.unsqueeze(0) if prev_weight is not None else None, risk_parity_baseline=risk_parity_baseline,
+        )
         weights = scale_weights_to_target_vol(
             raw_weights, X_raw, args.target_vol, max_leverage=args.max_leverage,
             covariance_estimator=getattr(args, "covariance_estimator", "sample"),
@@ -734,6 +754,12 @@ def evaluate(req: EvaluateRequest) -> dict:
       - positions: per-asset portfolio weight over time, out-of-sample.
       - attenuation: per-asset risk-overlay attenuation over time (only
         present when a risk_model was given).
+      - coefficients: per-asset coefficient (tanh/sigmoid(logits) - see
+        PortfolioLSTM._weights_from_coefficients) the model applied to the
+        risk-parity baseline each day, over time, out-of-sample - the
+        model's own learned conviction signal, upstream of both the
+        risk-parity baseline (fixed, un-learned) and the risk overlay's
+        attenuation (downstream of the final weight).
       - latest_weights: the model's recommended allocation for the next
         (not-yet-realized) day, using the freshest available data.
 
@@ -808,6 +834,7 @@ def evaluate(req: EvaluateRequest) -> dict:
                 },
                 "positions": _positions_payload(result.dates_val, pairs, result.weights_val),
                 "attenuation": _positions_payload(result.dates_val, pairs, result.attenuation_val),
+                "coefficients": _positions_payload(result.dates_val, pairs, result.coefficients_val),
                 "asset_returns": _asset_returns_payload(pairs, result.dates_val, result.next_returns_val),
             }
 
@@ -839,6 +866,7 @@ def evaluate(req: EvaluateRequest) -> dict:
             "histograms": {"baseline": _histogram(result.returns_val)},
             "positions": _positions_payload(result.dates_val, pairs, result.weights_val),
             "attenuation": None,
+            "coefficients": _positions_payload(result.dates_val, pairs, result.coefficients_val),
             "asset_returns": _asset_returns_payload(pairs, result.dates_val, result.next_returns_val),
         }
     except KeyError as exc:

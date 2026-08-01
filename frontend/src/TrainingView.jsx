@@ -9,7 +9,7 @@ const DEFAULT_FORM = {
   years: 8,
   train_frac: 0.8,
   test_frac: 0.1,
-  weight_scheme: "softmax",
+  position_mode: "long_short",
   hidden_size: 32,
   epochs: 300,
   lr: 0.001,
@@ -188,11 +188,14 @@ export default function TrainingView() {
             <NumField label="Train fraction (of non-test data)" name="train_frac" step="0.05" value={form.train_frac} onChange={updateField} />
             <NumField label="Test fraction (held out, most recent)" name="test_frac" step="0.05" value={form.test_frac} onChange={updateField} />
             <SelectField
-              label="Weight scheme"
-              name="weight_scheme"
-              value={form.weight_scheme}
+              label="Position mode"
+              name="position_mode"
+              value={form.position_mode}
               onChange={updateField}
-              options={[["softmax", "Long-only (softmax)"], ["tanh_norm", "Long/short (tanh)"]]}
+              options={[
+                ["long_short", "Long/short (tanh, can go short)"],
+                ["long_only", "Long-only (sigmoid, scales down only)"],
+              ]}
             />
             <NumField label="Hidden size" name="hidden_size" value={form.hidden_size} onChange={updateField} />
             <NumField label="Epochs" name="epochs" value={form.epochs} onChange={updateField} />
@@ -381,6 +384,14 @@ export default function TrainingView() {
               lets the network learn which days in the window matter most for the current decision.
             </p>
           )}
+          <p className="status-line" style={{ marginTop: 4 }}>
+            Per asset, the allocator's FINAL weight is a fixed, un-learned risk-parity (inverse-volatility,
+            long-only) baseline multiplied by a coefficient the network predicts - it only ever decides direction
+            (in "long/short" mode) and conviction per asset, never how much capital an asset gets when fully
+            committed. "Long/short" allows the coefficient to go negative (tanh, in (-1, 1)); "long-only" restricts
+            it to (0, 1) (sigmoid), so the baseline can only be scaled down, never flipped short. Volatility
+            targeting and the risk overlay still apply on top of this weight, exactly as before.
+          </p>
           {form.covariance_estimator !== "sample" && (
             <p className="status-line" style={{ marginTop: 4 }}>
               {form.covariance_estimator === "ewma"

@@ -5,7 +5,7 @@
     "years": 20,
     "train_frac": 0.8,
 
-    "weight_scheme": "softmax",
+    "position_mode": "long_only",
     "hidden_size": 64,
     "epochs": 150,
     "lr": 0.001,

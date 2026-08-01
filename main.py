@@ -16,7 +16,7 @@ restarts, persisted to the database as well as to a local .pt file:
     {
         "pairs": ["EURUSD", "GBPUSD", "USDJPY"],
         "lookback": 30,
-        "weight_scheme": "softmax",
+        "position_mode": "long_short",
         "epochs": 300,
         "target_vol": 0.20,
         "risk_overlay": true,
