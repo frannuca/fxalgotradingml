@@ -5,8 +5,8 @@ import EvaluationView from "./EvaluationView";
 export default function App() {
   return (
     <div className="app">
-      <h1>FX Portfolio</h1>
-      <p className="subtitle">LSTM portfolio allocator with a risk-attenuation overlay</p>
+      <h1>FX Direction Prediction</h1>
+      <p className="subtitle">Two-stage probabilistic predictor: independent per-asset LSTMs + a cross-asset copula LSTM</p>
 
       <nav className="app-nav">
         <NavLink to="/training" className={({ isActive }) => (isActive ? "active" : "")}>

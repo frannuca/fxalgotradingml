@@ -1,26 +1,27 @@
 {
     "pairs": ["EURUSD", "GBPUSD", "USDJPY"],
 
-    "lookback": 90,
-    "years": 20,
+    "lookback": 30,
+    "years": 8,
     "train_frac": 0.8,
     "test_frac": 0.1,
 
     "direction_horizon": 5,
     "rolling_stats_window": 20,
 
-    "hidden_size": 64,
+    "hidden_size": 16,
     "dropout": 0.1,
 
-    "epochs": 150,
+    "epochs": 60,
     "lr": 0.001,
     "weight_decay": 0.0001,
     "bce_weight": 1.0,
     "neutral_band": 0.05,
 
-    "n_seeds": 5,
+    "n_seeds": 1,
+    "device": "auto",
 
     "load_model": null,
-    "save_db": true,
-    "model_description": "direction predictor, majors"
+    "save_db": false,
+    "model_description": "CLI test run - EURUSD/GBPUSD/USDJPY"
 }

@@ -1,7 +1,24 @@
 import { useEffect, useRef, useState } from "react";
 import { getPairs, startTraining, getTrainingStatus, stopTraining } from "./api";
-import PnlChart from "./charts/PnlChart";
-import SeriesByPairChart from "./charts/SeriesByPairChart";
+import HitRateChart from "./charts/HitRateChart";
+import ColoredReturnChart from "./charts/ColoredReturnChart";
+import ProbabilityChart from "./charts/ProbabilityChart";
+import ReturnDistributionChart from "./charts/ReturnDistributionChart";
+import ConfusionMatrixTable from "./ConfusionMatrixTable";
+import { SPLIT_LABEL } from "./theme";
+import { confusionMatrixForSplit, hitAbstainedSeries, hitRateForSplit } from "./metrics";
+
+// Every feature build_feature_dataframe knows how to produce (see
+// models/portfolio_lstm.py's FEATURE_CATALOG) - "cma" is special, it
+// expands to one channel PER window pair in form.cma_windows, not one.
+const FEATURE_OPTIONS = [
+  ["log_return", "Log return"],
+  ["vol", "Rolling volatility"],
+  ["skew", "Rolling skewness"],
+  ["kurt", "Rolling excess kurtosis"],
+  ["carry", "Carry (interest-rate differential)"],
+  ["cma", "Cross moving averages (trend)"],
+];
 
 const DEFAULT_FORM = {
   pairs: [],
@@ -9,62 +26,65 @@ const DEFAULT_FORM = {
   years: 8,
   train_frac: 0.8,
   test_frac: 0.1,
-  position_mode: "long_short",
-  hidden_size: 32,
+  direction_horizon: 5,
+  rolling_stats_window: 20,
+  features: ["log_return", "vol", "skew", "kurt"],
+  cma_windows: [], // [{short, long}, ...] - UI shape; converted to [[short,long],...] on submit
+  // {pair: [other_pair, ...]} - which OTHER pairs' features also feed a
+  // given pair's own LSTM (its own features are always included
+  // regardless). DEFAULT is every pair fully independent (see
+  // models/portfolio_lstm.py's PredictionModel docstring) - a pair
+  // missing here, or with an empty list, sees ONLY its own features.
+  cross_pairs: {},
+  hidden_size: 16,
+  num_layers: 1,
+  dropout: 0.1,
+  n_attn_heads: 4,
   epochs: 300,
   lr: 0.001,
-  dropout: 0.1,
   weight_decay: 0.0001,
-  noise_std: 0.05,
-  target_vol: 0.2,
-  noisy_head: false,
-  use_prev_weight: false,
-  has_cash: false,
-  cash_return: 0.0,
-  use_carry: false,
-  vol_horizons: [],
-  encoder_type: "concat",
-  asset_combiner: "attention",
-  n_attn_heads: 2,
-  covariance_estimator: "sample",
-  ewma_lambda: 0.94,
-  pooling: "last",
-  device: "auto",
-  objective: "sharpe",
-  sharpe_window: 60,
-  cvar_alpha: 0.95,
-  cvar_kappa: 1.0,
+  bce_weight: "1.0", // free text: a single number, or comma-separated to SWEEP (see parseBceWeight)
+  neutral_band: 0.05,
   n_seeds: 1,
-  restart_strategy: "best",
-  risk_overlay: false,
-  risk_hidden_size: 16,
-  risk_epochs: 200,
-  risk_lr: 0.001,
-  max_attenuation: 0.33,
-  risk_rolling_window: 10,
-  use_cross_sectional: false,
-  transaction_cost: 0,
+  device: "auto",
   save_db: true,
   model_description: "",
 };
 
 const NUMERIC_FIELDS = new Set([
-  "lookback", "years", "train_frac", "test_frac", "hidden_size", "epochs", "lr", "dropout",
-  "weight_decay", "noise_std", "target_vol", "sharpe_window", "cvar_alpha", "cvar_kappa",
-  "n_seeds", "risk_hidden_size", "risk_epochs", "risk_lr", "max_attenuation",
-  "risk_rolling_window", "transaction_cost", "cash_return", "n_attn_heads", "ewma_lambda",
+  "lookback", "years", "train_frac", "test_frac", "direction_horizon", "rolling_stats_window",
+  "hidden_size", "num_layers", "dropout", "n_attn_heads",
+  "epochs", "lr", "weight_decay", "neutral_band",
+  "n_seeds",
 ]);
+
+// "1.0" -> 1.0 (single value); "1.0, 1.5, 2.0" -> [1.0, 1.5, 2.0] (sweep -
+// see models/portfolio_lstm.py's run_pipeline_multi_seed, which trains
+// every value under every seed and keeps whichever validated best).
+function parseBceWeight(text) {
+  const values = text.split(",").map((s) => Number(s.trim())).filter((n) => !Number.isNaN(n));
+  if (values.length === 0) return 1.0;
+  return values.length === 1 ? values[0] : values;
+}
 
 export default function TrainingView() {
   const [availablePairs, setAvailablePairs] = useState([]);
   const [form, setForm] = useState(DEFAULT_FORM);
   const [customPair, setCustomPair] = useState("");
   const [jobId, setJobId] = useState(null);
-  const [status, setStatus] = useState(null); // "pending" | "running" | "done" | "error"
+  const [status, setStatus] = useState(null); // "pending" | "running" | "done" | "error" | "stopped"
   const [progress, setProgress] = useState(null);
   const [logs, setLogs] = useState([]);
   const [interim, setInterim] = useState(null);
   const [result, setResult] = useState(null);
+  // Neutral band shown/editable in the results section, separate from
+  // form.neutral_band (which only controls what a NEW training run uses) -
+  // initialized to whatever this run was configured with, then freely
+  // adjustable to recompute hit rate/confusion matrix/colored returns
+  // client-side (see ../metrics.js) without retraining or a new request,
+  // since the band is pure postprocessing, never part of training (see
+  // models/portfolio_lstm.py's evaluate_prediction_model docstring).
+  const [displayBand, setDisplayBand] = useState(0.05);
   const [error, setError] = useState(null);
   const pollRef = useRef(null);
   const logBoxRef = useRef(null);
@@ -85,10 +105,23 @@ export default function TrainingView() {
   }
 
   function togglePair(pair) {
-    setForm((f) => ({
-      ...f,
-      pairs: f.pairs.includes(pair) ? f.pairs.filter((p) => p !== pair) : [...f.pairs, pair],
-    }));
+    setForm((f) => {
+      const wasIncluded = f.pairs.includes(pair);
+      const pairs = wasIncluded ? f.pairs.filter((p) => p !== pair) : [...f.pairs, pair];
+      // Removing a pair also drops it as a cross_pairs KEY, and out of
+      // every OTHER pair's linked list - a removed pair can't stay
+      // referenced as an input source.
+      let cross_pairs = f.cross_pairs;
+      if (wasIncluded) {
+        cross_pairs = Object.fromEntries(
+          Object.entries(f.cross_pairs)
+            .filter(([p]) => p !== pair)
+            .map(([p, others]) => [p, others.filter((o) => o !== pair)])
+            .filter(([, others]) => others.length > 0),
+        );
+      }
+      return { ...f, pairs, cross_pairs };
+    });
   }
 
   function addCustomPair() {
@@ -99,6 +132,42 @@ export default function TrainingView() {
     setCustomPair("");
   }
 
+  function toggleFeature(feature) {
+    setForm((f) => ({
+      ...f,
+      features: f.features.includes(feature) ? f.features.filter((x) => x !== feature) : [...f.features, feature],
+    }));
+  }
+
+  function addCmaWindow() {
+    setForm((f) => ({ ...f, cma_windows: [...f.cma_windows, { short: 10, long: 50 }] }));
+  }
+
+  function updateCmaWindow(index, field, value) {
+    setForm((f) => ({
+      ...f,
+      cma_windows: f.cma_windows.map((w, i) => (i === index ? { ...w, [field]: Number(value) } : w)),
+    }));
+  }
+
+  function removeCmaWindow(index) {
+    setForm((f) => ({ ...f, cma_windows: f.cma_windows.filter((_, i) => i !== index) }));
+  }
+
+  function toggleCrossPair(pair, otherPair) {
+    setForm((f) => {
+      const current = f.cross_pairs[pair] || [];
+      const updated = current.includes(otherPair) ? current.filter((p) => p !== otherPair) : [...current, otherPair];
+      const cross_pairs = { ...f.cross_pairs };
+      if (updated.length === 0) {
+        delete cross_pairs[pair];
+      } else {
+        cross_pairs[pair] = updated;
+      }
+      return { ...f, cross_pairs };
+    });
+  }
+
   async function submit(e) {
     e.preventDefault();
     setError(null);
@@ -106,12 +175,16 @@ export default function TrainingView() {
     setProgress(null);
     setLogs([]);
     setInterim(null);
-    if (form.pairs.length < 2) {
-      setError("Select at least two FX pairs.");
+    if (form.pairs.length < 1) {
+      setError("Select at least one FX pair.");
       return;
     }
     try {
-      const { job_id } = await startTraining(form);
+      const { job_id } = await startTraining({
+        ...form,
+        bce_weight: parseBceWeight(form.bce_weight),
+        cma_windows: form.cma_windows.map((w) => [w.short, w.long]),
+      });
       setJobId(job_id);
       setStatus("pending");
       pollRef.current = setInterval(async () => {
@@ -123,6 +196,7 @@ export default function TrainingView() {
         if (job.status === "done") {
           clearInterval(pollRef.current);
           setResult(job.result);
+          setDisplayBand(job.result.neutral_band);
         } else if (job.status === "error") {
           clearInterval(pollRef.current);
           setError(job.error);
@@ -146,11 +220,20 @@ export default function TrainingView() {
 
   const allPairs = Array.from(new Set([...availablePairs, ...form.pairs]));
   const isBusy = status === "pending" || status === "running";
-  // The backend appends "CASH" as one more asset when has_cash is on (see
-  // models/portfolio_lstm.py's _prepare_data) - result.positions_train/
-  // attenuation_train etc. include a "CASH" series, so the pairs list used
-  // to render them must too, or that line is silently omitted.
-  const chartPairs = form.has_cash ? [...form.pairs, "CASH"] : form.pairs;
+
+  // Recomputed from raw probability + realized label (see ../metrics.js)
+  // every time displayBand changes - the band never touches training, so
+  // this is the ONLY place it's actually applied to this result.
+  const hitRate = result && {
+    train: hitRateForSplit(result.probabilities.train, result.pairs, displayBand),
+    val: hitRateForSplit(result.probabilities.val, result.pairs, displayBand),
+    test: hitRateForSplit(result.probabilities.test, result.pairs, displayBand),
+  };
+  const confusionMatrix = result && {
+    train: confusionMatrixForSplit(result.probabilities.train, result.pairs, displayBand),
+    val: confusionMatrixForSplit(result.probabilities.val, result.pairs, displayBand),
+    test: confusionMatrixForSplit(result.probabilities.test, result.pairs, displayBand),
+  };
 
   return (
     <div>
@@ -181,163 +264,23 @@ export default function TrainingView() {
         </div>
 
         <div className="panel">
-          <h2 style={{ marginTop: 0 }}>Data &amp; portfolio allocator</h2>
+          <h2 style={{ marginTop: 0 }}>Data &amp; features</h2>
           <div className="form-grid">
             <NumField label="Lookback (days)" name="lookback" value={form.lookback} onChange={updateField} />
             <NumField label="Years of history" name="years" value={form.years} onChange={updateField} />
             <NumField label="Train fraction (of non-test data)" name="train_frac" step="0.05" value={form.train_frac} onChange={updateField} />
             <NumField label="Test fraction (held out, most recent)" name="test_frac" step="0.05" value={form.test_frac} onChange={updateField} />
-            <SelectField
-              label="Position mode"
-              name="position_mode"
-              value={form.position_mode}
+            <NumField
+              label="Direction horizon (forward days)"
+              name="direction_horizon"
+              value={form.direction_horizon}
               onChange={updateField}
-              options={[
-                ["long_short", "Long/short (tanh, can go short)"],
-                ["long_only", "Long-only (sigmoid, scales down only)"],
-              ]}
             />
-            <NumField label="Hidden size" name="hidden_size" value={form.hidden_size} onChange={updateField} />
-            <NumField label="Epochs" name="epochs" value={form.epochs} onChange={updateField} />
-            <NumField label="Learning rate" name="lr" step="0.0001" value={form.lr} onChange={updateField} />
-            <NumField label="Dropout" name="dropout" step="0.01" value={form.dropout} onChange={updateField} />
-            <NumField label="Weight decay" name="weight_decay" step="0.0001" value={form.weight_decay} onChange={updateField} />
-            <NumField label="Noise std" name="noise_std" step="0.01" value={form.noise_std} onChange={updateField} />
-            <NumField label="Target volatility" name="target_vol" step="0.01" value={form.target_vol} onChange={updateField} />
-            <SelectField
-              label="Covariance estimator (vol targeting)"
-              name="covariance_estimator"
-              value={form.covariance_estimator}
+            <NumField
+              label="Rolling stats window (vol/skew/kurtosis)"
+              name="rolling_stats_window"
+              value={form.rolling_stats_window}
               onChange={updateField}
-              options={[
-                ["sample", "Sample covariance (original)"],
-                ["ewma", "EWMA (RiskMetrics-style)"],
-                ["ledoit_wolf", "Ledoit-Wolf shrinkage"],
-              ]}
-            />
-            {form.covariance_estimator === "ewma" && (
-              <NumField label="EWMA lambda (decay)" name="ewma_lambda" step="0.01" value={form.ewma_lambda} onChange={updateField} />
-            )}
-            <NumField label="Transaction cost (bps)" name="transaction_cost" step="0.5" value={form.transaction_cost} onChange={updateField} />
-            <SelectField
-              label="Training objective"
-              name="objective"
-              value={form.objective}
-              onChange={updateField}
-              options={[
-                ["sharpe", "Rolling-window Sharpe (Sortino-style)"],
-                ["kelly", "Log-wealth (Kelly criterion)"],
-                ["cvar", "Mean-CVaR"],
-              ]}
-            />
-            {form.objective === "sharpe" && (
-              <NumField label="Sharpe window (days)" name="sharpe_window" value={form.sharpe_window} onChange={updateField} />
-            )}
-            {form.objective === "cvar" && (
-              <>
-                <NumField label="CVaR confidence" name="cvar_alpha" step="0.01" value={form.cvar_alpha} onChange={updateField} />
-                <NumField label="CVaR risk weight (kappa)" name="cvar_kappa" step="0.1" value={form.cvar_kappa} onChange={updateField} />
-              </>
-            )}
-            <label className="field checkbox">
-              <input
-                type="checkbox"
-                checked={form.noisy_head}
-                onChange={(e) => setForm((f) => ({ ...f, noisy_head: e.target.checked }))}
-              />
-              Noisy output head (NoisyNet)
-            </label>
-            <label className="field checkbox">
-              <input
-                type="checkbox"
-                checked={form.use_prev_weight}
-                onChange={(e) => setForm((f) => ({ ...f, use_prev_weight: e.target.checked }))}
-              />
-              Feed previous weight into allocator
-            </label>
-            <label className="field checkbox">
-              <input
-                type="checkbox"
-                checked={form.has_cash}
-                onChange={(e) => setForm((f) => ({ ...f, has_cash: e.target.checked }))}
-              />
-              Add cash as an asset
-            </label>
-            {form.has_cash && (
-              <NumField label="Cash return (daily)" name="cash_return" step="0.0001" value={form.cash_return} onChange={updateField} />
-            )}
-            <label className="field checkbox">
-              <input
-                type="checkbox"
-                checked={form.use_carry}
-                onChange={(e) => setForm((f) => ({ ...f, use_carry: e.target.checked }))}
-              />
-              Add FX carry (interest-rate differential)
-            </label>
-            <label className="field">
-              Vol-normalized return horizons (days, comma-separated)
-              <input
-                type="text"
-                value={form.vol_horizons.join(",")}
-                onChange={(e) =>
-                  setForm((f) => ({
-                    ...f,
-                    vol_horizons: e.target.value
-                      .split(",")
-                      .map((s) => parseInt(s.trim(), 10))
-                      .filter((n) => Number.isFinite(n) && n > 0),
-                  }))
-                }
-                placeholder="e.g. 5,20"
-              />
-            </label>
-            <SelectField
-              label="Encoder architecture"
-              name="encoder_type"
-              value={form.encoder_type}
-              onChange={updateField}
-              options={[
-                ["concat", "Concatenated input (one LSTM over all assets)"],
-                ["per_asset", "Shared per-asset encoder + cross-asset attention"],
-              ]}
-            />
-            {form.encoder_type === "per_asset" && (
-              <>
-                <SelectField
-                  label="Cross-asset combiner"
-                  name="asset_combiner"
-                  value={form.asset_combiner}
-                  onChange={updateField}
-                  options={[
-                    ["attention", "Self-attention across assets"],
-                    ["mean", "Mean-pool across assets"],
-                  ]}
-                />
-                {form.asset_combiner === "attention" && (
-                  <NumField label="Attention heads" name="n_attn_heads" value={form.n_attn_heads} onChange={updateField} />
-                )}
-              </>
-            )}
-            <SelectField
-              label="Time pooling (both networks)"
-              name="pooling"
-              value={form.pooling}
-              onChange={updateField}
-              options={[
-                ["last", "Last hidden state (h_n[-1])"],
-                ["attention", "Attention pooling over all timesteps"],
-              ]}
-            />
-            <SelectField
-              label="Compute device"
-              name="device"
-              value={form.device}
-              onChange={updateField}
-              options={[
-                ["auto", "Auto (Metal/MPS GPU if available, else CPU)"],
-                ["cpu", "CPU"],
-                ["mps", "Force Metal (MPS) GPU"],
-              ]}
             />
           </div>
           <p className="status-line" style={{ marginTop: 4 }}>
@@ -346,143 +289,149 @@ export default function TrainingView() {
             generalization. Of what remains, the oldest {(form.train_frac * 100).toFixed(0)}% is train and the rest
             is validation (which DOES influence best-epoch checkpoint selection).
           </p>
-          {form.has_cash && (
-            <p className="status-line" style={{ marginTop: 4 }}>
-              Adds "CASH" as one more asset the allocator can hold (constant daily return above, zero by default) -
-              lets it de-risk directly instead of relying only on the risk overlay. Enable both to compare: does the
-              risk overlay still help once the allocator can just hold cash?
-            </p>
-          )}
-          {(form.use_carry || form.vol_horizons.length > 0) && (
-            <p className="status-line" style={{ marginTop: 4 }}>
-              Adds extra per-asset input channels alongside the raw return: carry (base minus quote interest rate,
-              from FRED via data/rates_downloader.py) and/or each horizon's trailing cumulative-return-over-vol
-              ratio - more context per asset, without changing the allocator's output (still one weight per asset).
-            </p>
-          )}
-          {form.use_prev_weight && (
-            <p className="status-line" style={{ marginTop: 4 }}>
-              The allocator sees its own previous day's position alongside each window, so it can learn whether a
-              rebalance is worth its transaction cost - pairs naturally with "Transaction cost" above. Training and
-              evaluation become a genuine day-by-day recurrence instead of one parallel batch, so this is
-              meaningfully slower.
-            </p>
-          )}
-          {form.encoder_type === "per_asset" && (
-            <p className="status-line" style={{ marginTop: 4 }}>
-              One shared LSTM encodes each asset's own window independently, then assets{" "}
-              {form.asset_combiner === "attention" ? "attend to each other" : "share a mean-pooled market context"}{" "}
-              before a shared per-asset head produces each asset's weight - unlike the concatenated design, this
-              treats every asset with the same learned weights (permutation-invariant), rather than tying one input
-              column to one specific asset.
-            </p>
-          )}
-          {form.pooling === "attention" && (
-            <p className="status-line" style={{ marginTop: 4 }}>
-              Both the allocator and (if enabled) the risk overlay summarize their lookback window with learned
-              attention pooling over every timestep's hidden state, instead of just the LSTM's final hidden state -
-              lets the network learn which days in the window matter most for the current decision.
-            </p>
-          )}
+          <h3 style={{ marginBottom: 6 }}>Features</h3>
+          <div className="pair-picker">
+            {FEATURE_OPTIONS.map(([key, label]) => (
+              <span
+                key={key}
+                className={`pair-chip${form.features.includes(key) ? " selected" : ""}`}
+                onClick={() => toggleFeature(key)}
+              >
+                {label}
+              </span>
+            ))}
+          </div>
           <p className="status-line" style={{ marginTop: 4 }}>
-            Per asset, the allocator's FINAL weight is a fixed, un-learned risk-parity (inverse-volatility,
-            long-only) baseline multiplied by a coefficient the network predicts - it only ever decides direction
-            (in "long/short" mode) and conviction per asset, never how much capital an asset gets when fully
-            committed. "Long/short" allows the coefficient to go negative (tanh, in (-1, 1)); "long-only" restricts
-            it to (0, 1) (sigmoid), so the baseline can only be scaled down, never flipped short. Volatility
-            targeting and the risk overlay still apply on top of this weight, exactly as before.
+            Each selected feature becomes one input channel per pair (see models/portfolio_lstm.py's
+            FEATURE_CATALOG) - "Rolling volatility/skewness/kurtosis" use the {form.rolling_stats_window}-day window
+            above; "Carry" is the interest-rate differential (FRED); "Cross moving averages" adds a trend/momentum
+            channel PER window pair below (short-window mean return minus long-window mean return - positive when
+            the recent trend runs above the longer-run one).
           </p>
-          {form.covariance_estimator !== "sample" && (
-            <p className="status-line" style={{ marginTop: 4 }}>
-              {form.covariance_estimator === "ewma"
-                ? "Volatility targeting weights recent days more heavily (exponential decay) instead of treating every day in the lookback window equally - reacts faster to a genuine vol regime change."
-                : "Volatility targeting shrinks the sample covariance toward a well-conditioned target using the analytically optimal Ledoit-Wolf intensity - avoids the near-singular covariance estimates that can otherwise produce extreme leverage on a coincidentally calm window."}
-            </p>
+          {form.features.includes("cma") && (
+            <div style={{ marginTop: 8 }}>
+              {form.cma_windows.map((w, i) => (
+                <div key={i} style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 6 }}>
+                  <div className="field" style={{ maxWidth: 100 }}>
+                    <label>Short window</label>
+                    <input type="number" value={w.short} onChange={(e) => updateCmaWindow(i, "short", e.target.value)} />
+                  </div>
+                  <div className="field" style={{ maxWidth: 100 }}>
+                    <label>Long window</label>
+                    <input type="number" value={w.long} onChange={(e) => updateCmaWindow(i, "long", e.target.value)} />
+                  </div>
+                  <button type="button" className="secondary" onClick={() => removeCmaWindow(i)} style={{ alignSelf: "end" }}>
+                    Remove
+                  </button>
+                </div>
+              ))}
+              <button type="button" className="secondary" onClick={addCmaWindow}>Add CMA window</button>
+              {form.cma_windows.length === 0 && (
+                <p className="status-line" style={{ marginTop: 4, color: "#b45309" }}>
+                  "Cross moving averages" is selected but no windows are configured - add at least one.
+                </p>
+              )}
+            </div>
           )}
-          {form.objective === "sharpe" && (
-            <p className="status-line" style={{ marginTop: 10 }}>
-              Scores the mean Sortino-style ratio over overlapping {form.sharpe_window}-day windows of the
-              training period (not one ratio over the whole period) - not convex, but directly comparable to the
-              Sharpe numbers reported elsewhere.
+        </div>
+
+        {form.pairs.length > 1 && (
+          <div className="panel">
+            <h2 style={{ marginTop: 0 }}>Cross-asset inputs</h2>
+            <p className="status-line" style={{ marginTop: 0 }}>
+              By DEFAULT every pair's own LSTM sees ONLY its own features - fully independent, no cross-asset
+              mixing. Link a pair to OTHER pairs below to also feed their full feature blocks into that pair's own
+              LSTM (its own features are always included regardless) - see models/portfolio_lstm.py's
+              PredictionModel docstring.
             </p>
-          )}
-          {form.objective === "kelly" && (
-            <p className="status-line" style={{ marginTop: 10 }}>
-              Maximizes expected log-wealth growth (Kelly criterion) - convex in the portfolio weights, no extra
-              tunable weight, and targets long-run compounded growth rather than a single-period ratio.
-            </p>
-          )}
-          {form.objective === "cvar" && (
-            <p className="status-line" style={{ marginTop: 10 }}>
-              Maximizes mean return net of a CVaR tail-risk penalty (average loss on the worst {" "}
-              {((1 - form.cvar_alpha) * 100).toFixed(0)}% of days, weighted by kappa) - convex, at the cost of a
-              fixed risk-aversion weight (kappa) to combine return and tail risk into one objective.
-            </p>
-          )}
+            {form.pairs.map((pair) => (
+              <div key={pair} style={{ marginBottom: 10 }}>
+                <strong style={{ fontSize: 13 }}>{pair}</strong>'s LSTM also sees:
+                <div className="pair-picker" style={{ marginTop: 4 }}>
+                  {form.pairs.filter((p) => p !== pair).map((other) => (
+                    <span
+                      key={other}
+                      className={`pair-chip${(form.cross_pairs[pair] || []).includes(other) ? " selected" : ""}`}
+                      onClick={() => toggleCrossPair(pair, other)}
+                    >
+                      {other}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        <div className="panel">
+          <h2 style={{ marginTop: 0 }}>Architecture</h2>
+          <div className="form-grid">
+            <NumField label="Hidden size" name="hidden_size" value={form.hidden_size} onChange={updateField} />
+            <NumField label="LSTM layers" name="num_layers" value={form.num_layers} onChange={updateField} />
+            <NumField label="Dropout" name="dropout" step="0.01" value={form.dropout} onChange={updateField} />
+            <NumField label="Attention heads" name="n_attn_heads" value={form.n_attn_heads} onChange={updateField} />
+          </div>
           <p className="status-line" style={{ marginTop: 4 }}>
-            Whichever epoch has the best validation Sharpe (always the plain, whole-period metric) is kept at the
-            end instead of always the last one - aimed at generalizing better out-of-sample instead of maximizing
-            the in-sample fit.
+            Each asset's own LSTM is followed by a CAUSAL self-attention layer over the time axis (day k can only
+            attend to days ≤ k, preserving the no-look-ahead property every day's supervision relies on), then
+            outputs a heteroscedastic (μ, σ) pair at every day in the window: μ is the predicted conditional mean
+            z-score, σ its predicted conditional std. P(positive) = Φ(μ / (σ · σ̂)) - the probit link, rescaled by a
+            validation-fit calibration factor σ̂ - is what the probability/hit rate/confusion matrix below are
+            computed from. The whole network is deterministic - no NoisyNet head, no input-noise regularization.
+            "Attention heads" must divide "Hidden size" evenly.
           </p>
-          {form.noisy_head && (
-            <p className="status-line" style={{ marginTop: 4 }}>
-              Noisy head adds learnable weight noise (resampled every training step) to the portfolio's output
-              layer, and to the risk overlay's output layer when enabled below - composes with "Noise std" above.
-              Deterministic at evaluation time.
-            </p>
-          )}
+        </div>
+
+        <div className="panel">
+          <h2 style={{ marginTop: 0 }}>Training</h2>
+          <div className="form-grid">
+            <NumField label="Epochs" name="epochs" value={form.epochs} onChange={updateField} />
+            <NumField label="Learning rate" name="lr" step="0.0001" value={form.lr} onChange={updateField} />
+            <NumField label="Weight decay" name="weight_decay" step="0.0001" value={form.weight_decay} onChange={updateField} />
+            <div className="field">
+              <label>BCE direction weight (comma-separated to sweep)</label>
+              <input
+                type="text"
+                value={form.bce_weight}
+                onChange={(e) => setForm((f) => ({ ...f, bce_weight: e.target.value }))}
+                placeholder="e.g. 1.0  or  1.0, 1.5, 1.75, 2.0, 3.0"
+              />
+            </div>
+            <NumField label="Neutral band (abstention half-width)" name="neutral_band" step="0.01" value={form.neutral_band} onChange={updateField} />
+          </div>
+          <p className="status-line" style={{ marginTop: 4 }}>
+            Every asset's LSTM trains FULLY INDEPENDENTLY: its own optimizer, its own loss - never averaged or
+            shared with any other asset's - Gaussian NLL (fits the full predictive distribution) plus "BCE direction
+            weight" × a binary cross-entropy term on the implied direction probability. The BCE term is the
+            anti-collapse fix: a bare regression loss is minimized by the label's unconditional mean - one sign for
+            everything when the target is barely predictable - while BCE is minimized by matching each sample's OWN
+            sign, so any discriminating feature gets pulled into spreading μ across zero. Applied densely, over
+            every day in every window, not just the last one. Each asset's own checkpoint is restored from ITS OWN
+            best validation epoch independently, too - one asset's convergence never drags another's along.
+          </p>
+          <p className="status-line" style={{ marginTop: 4 }}>
+            Enter several comma-separated values to SWEEP the BCE weight alongside the seeds below: every value is
+            trained under every seed (same initial weights across the sweep, so only the value differs) and
+            whichever validated best wins - first per seed, then overall.
+          </p>
+          <p className="status-line" style={{ marginTop: 4 }}>
+            "Neutral band": probabilities within 0.5 ± this half-width are snapped to exactly 0.5 - the model
+            ABSTAINS instead of making a near-coin-flip call. Hit rate/confusion-matrix metrics below are then
+            computed over decided samples only, alongside a coverage metric (how often the model actually speaks) -
+            accuracy and coverage must be read together. 0 disables abstention entirely.
+          </p>
         </div>
 
         <div className="panel">
           <h2 style={{ marginTop: 0 }}>Multi-seed restarts</h2>
           <div className="form-grid">
             <NumField label="Number of seeds" name="n_seeds" value={form.n_seeds} onChange={updateField} />
-            <SelectField
-              label="Restart strategy"
-              name="restart_strategy"
-              value={form.restart_strategy}
-              onChange={updateField}
-              options={[["best", "Best of restarts"], ["ensemble", "Ensemble average"]]}
-            />
           </div>
-        </div>
-
-        <div className="panel">
-          <h2 style={{ marginTop: 0 }}>
-            <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
-              <input
-                type="checkbox"
-                checked={form.risk_overlay}
-                onChange={(e) => setForm((f) => ({ ...f, risk_overlay: e.target.checked }))}
-              />
-              Risk-attenuation overlay
-            </label>
-          </h2>
-          {form.risk_overlay && (
-            <div className="form-grid">
-              <NumField label="Risk hidden size" name="risk_hidden_size" value={form.risk_hidden_size} onChange={updateField} />
-              <NumField label="Risk epochs" name="risk_epochs" value={form.risk_epochs} onChange={updateField} />
-              <NumField label="Risk learning rate" name="risk_lr" step="0.0001" value={form.risk_lr} onChange={updateField} />
-              <NumField label="Max attenuation floor" name="max_attenuation" step="0.01" value={form.max_attenuation} onChange={updateField} />
-              <NumField label="Risk rolling window" name="risk_rolling_window" value={form.risk_rolling_window} onChange={updateField} />
-              <label className="field checkbox">
-                <input
-                  type="checkbox"
-                  checked={form.use_cross_sectional}
-                  onChange={(e) => setForm((f) => ({ ...f, use_cross_sectional: e.target.checked }))}
-                />
-                Add cross-sectional correlation features
-              </label>
-            </div>
-          )}
-          {form.risk_overlay && form.use_cross_sectional && (
-            <p className="status-line" style={{ marginTop: 4 }}>
-              Adds 3 portfolio-wide signals from the rolling cross-asset correlation matrix (average pairwise
-              correlation, correlation dispersion, top eigenvalue share) alongside the existing per-asset
-              std/skew/kurtosis - lets the attenuation head see market-wide risk concentration, not just each
-              asset's own marginal risk.
-            </p>
-          )}
+          <p className="status-line" style={{ marginTop: 4 }}>
+            Trains this many independent restarts and keeps whichever had the lowest validation log loss (not hit
+            rate - see the model's own docs for why a saturating accuracy metric is the wrong thing to compare
+            restarts on).
+          </p>
         </div>
 
         <div className="panel">
@@ -522,13 +471,14 @@ export default function TrainingView() {
       </form>
 
       {status === "stopped" && (
-        <p className="status-line">Training stopped - nothing was saved. The charts/log below show where it left off.</p>
+        <p className="status-line">Training stopped - nothing was saved. The log below shows where it left off.</p>
       )}
 
       {progress && (status === "running" || status === "pending" || status === "done" || status === "stopped") && (
         <div className="panel">
           <h3 style={{ marginBottom: 6 }}>
             Progress{progress.n_seeds > 1 ? ` — restart ${progress.seed_index}/${progress.n_seeds}` : ""}
+            {progress.n_lambdas > 1 ? ` — bce_weight ${progress.lambda_index}/${progress.n_lambdas}` : ""}
             {" "}— epoch {progress.epoch}/{progress.total_epochs}
           </h3>
           <div className="progress-track">
@@ -537,48 +487,15 @@ export default function TrainingView() {
           <div className="progress-percent">{progress.percent.toFixed(1)}%</div>
 
           {interim && (
-            <div style={{ marginTop: 16 }}>
-              <PnlChart
-                title={
-                  (interim.stage === "risk_overlay" ? "Risk overlay training" : "Portfolio training") +
-                  ` — in-sample, epoch ${interim.epoch}/${interim.total_epochs}` +
-                  ` (Sharpe ${interim.sharpe.toFixed(2)})`
-                }
-                pnl={{ dates: interim.cumulative_pnl.map((_, i) => i), live: interim.cumulative_pnl }}
-                seriesKeys={["live"]}
-                height={260}
-              />
-            </div>
-          )}
-
-          {interim && interim.val_cumulative_pnl && (
-            <div style={{ marginTop: 16 }}>
-              <PnlChart
-                title={
-                  (interim.stage === "risk_overlay" ? "Risk overlay training" : "Portfolio training") +
-                  ` — validation, epoch ${interim.epoch}/${interim.total_epochs}` +
-                  ` (Sharpe ${interim.val_sharpe.toFixed(2)})`
-                }
-                pnl={{ dates: interim.val_cumulative_pnl.map((_, i) => i), live: interim.val_cumulative_pnl }}
-                seriesKeys={["live"]}
-                height={260}
-              />
-            </div>
-          )}
-
-          {interim && interim.test_cumulative_pnl && (
-            <div style={{ marginTop: 16 }}>
-              <PnlChart
-                title={
-                  (interim.stage === "risk_overlay" ? "Risk overlay training" : "Portfolio training") +
-                  ` — test, epoch ${interim.epoch}/${interim.total_epochs}` +
-                  ` (Sharpe ${interim.test_sharpe.toFixed(2)})`
-                }
-                pnl={{ dates: interim.test_cumulative_pnl.map((_, i) => i), live: interim.test_cumulative_pnl }}
-                seriesKeys={["live"]}
-                height={260}
-              />
-            </div>
+            <table className="weights-table" style={{ marginTop: 12 }}>
+              <thead>
+                <tr><th></th><th>Train</th>{interim.val_loss != null && <th>Validation</th>}</tr>
+              </thead>
+              <tbody>
+                <tr><td>Loss (NLL + BCE)</td><td>{interim.train_loss.toFixed(4)}</td>{interim.val_loss != null && <td>{interim.val_loss.toFixed(4)}</td>}</tr>
+                <tr><td>Decision-day hit rate</td><td>{(interim.train_hit_rate * 100).toFixed(1)}%</td>{interim.val_hit_rate != null && <td>{(interim.val_hit_rate * 100).toFixed(1)}%</td>}</tr>
+              </tbody>
+            </table>
           )}
 
           <h3 style={{ marginTop: 16, marginBottom: 6 }}>Training log</h3>
@@ -602,111 +519,91 @@ export default function TrainingView() {
             <strong>Training complete.</strong>
             <table>
               <tbody>
-                <tr><td>Portfolio model saved as</td><td><code>{result.portfolio_model_name}</code></td></tr>
-                {result.risk_model_name && (
-                  <tr><td>Risk model saved as</td><td><code>{result.risk_model_name}</code></td></tr>
-                )}
+                <tr><td>Model saved as</td><td><code>{result.model_name}</code></td></tr>
               </tbody>
             </table>
           </div>
 
-          <h2>Sharpe ratio</h2>
           <div className="panel">
-            <table className="weights-table">
-              <thead>
-                <tr>
-                  <th></th>
-                  <th>Raw</th>
-                  <th>Vol-targeted</th>
-                  {result.risk_model_name && <th>With risk overlay</th>}
-                </tr>
-              </thead>
-              <tbody>
-                <tr>
-                  <td>In-sample</td>
-                  <td>{result.train_sharpe_raw.toFixed(3)}</td>
-                  <td>{result.train_sharpe_vol_targeted.toFixed(3)}</td>
-                  {result.risk_model_name && <td>{result.train_sharpe_with_risk.toFixed(3)}</td>}
-                </tr>
-                <tr>
-                  <td>Validation</td>
-                  <td>{result.val_sharpe_raw.toFixed(3)}</td>
-                  <td>{result.val_sharpe_vol_targeted.toFixed(3)}</td>
-                  {result.risk_model_name && <td>{result.val_sharpe_with_risk.toFixed(3)}</td>}
-                </tr>
-                <tr>
-                  <td>Test</td>
-                  <td>{result.test_sharpe_raw.toFixed(3)}</td>
-                  <td>{result.test_sharpe_vol_targeted.toFixed(3)}</td>
-                  {result.risk_model_name && <td>{result.test_sharpe_with_risk.toFixed(3)}</td>}
-                </tr>
-              </tbody>
-            </table>
-          </div>
-
-          <h2>Cumulative PnL</h2>
-          <div className="chart-grid">
-            <PnlChart
-              title="In-sample"
-              pnl={result.pnl_train}
-              seriesKeys={
-                result.risk_model_name
-                  ? ["vol_targeted", "with_risk", "benchmark"]
-                  : ["vol_targeted", "benchmark"]
-              }
-            />
-            <PnlChart
-              title="Validation"
-              pnl={result.pnl_val}
-              seriesKeys={
-                result.risk_model_name
-                  ? ["vol_targeted", "with_risk", "benchmark"]
-                  : ["vol_targeted", "benchmark"]
-              }
-            />
-            <PnlChart
-              title="Test"
-              pnl={result.pnl_test}
-              seriesKeys={
-                result.risk_model_name
-                  ? ["vol_targeted", "with_risk", "benchmark"]
-                  : ["vol_targeted", "benchmark"]
-              }
-            />
-          </div>
-          <p className="status-line" style={{ marginTop: 4 }}>
-            "Inverse-vol benchmark" is a simple, un-learned risk-parity allocator (weight each asset inversely to its
-            own trailing volatility), rescaled to match the MODEL's own realized volatility on each split
-            separately - so the comparison isolates whether the learned allocation adds value, not just whether the
-            model happened to run hotter or colder than the benchmark.
-          </p>
-
-          <h2>Cumulative FX pair returns</h2>
-          <div className="chart-grid">
-            <SeriesByPairChart
-              title="Full history (dashed line marks out-of-sample start)"
-              series={result.asset_returns}
-              pairs={chartPairs}
-              splitDate={result.asset_returns.split_date}
-              height={340}
-            />
-          </div>
-
-          <h2>Portfolio positions</h2>
-          <div className="chart-grid">
-            <SeriesByPairChart title="In-sample" series={result.positions_train} pairs={chartPairs} />
-            <SeriesByPairChart title="Out-of-sample" series={result.positions_val} pairs={chartPairs} />
-          </div>
-
-          {result.risk_model_name && (
-            <>
-              <h2>Risk attenuation factor</h2>
-              <div className="chart-grid">
-                <SeriesByPairChart title="In-sample" series={result.attenuation_train} pairs={chartPairs} />
-                <SeriesByPairChart title="Out-of-sample" series={result.attenuation_val} pairs={chartPairs} />
+            <h2 style={{ marginTop: 0 }}>Neutral band</h2>
+            <div className="form-grid">
+              <div className="field">
+                <label>Abstention half-width around p=0.5</label>
+                <input
+                  type="number"
+                  step="0.01"
+                  min="0"
+                  max="0.5"
+                  value={displayBand}
+                  onChange={(e) => setDisplayBand(Number(e.target.value))}
+                />
               </div>
-            </>
-          )}
+            </div>
+            <p className="status-line" style={{ marginTop: 4 }}>
+              Pure postprocessing - never part of training (see the model's own docs). Everything below is
+              recomputed live from this model's raw predicted probabilities as you change it, with no retraining and
+              no new request. Trained with {result.neutral_band.toFixed(2)}.
+            </p>
+          </div>
+
+          <h2>Hit rate</h2>
+          <div className="chart-grid">
+            <HitRateChart pairs={result.pairs} hitRate={hitRate} />
+          </div>
+
+          <h2>Confusion matrix</h2>
+          <ConfusionMatrixTable pairs={result.pairs} confusionMatrix={confusionMatrix} />
+
+          <h2>Cumulative returns (colored by prediction hit/miss)</h2>
+          {["train", "val", "test"].map((split) => (
+            <div key={split}>
+              <h3>{SPLIT_LABEL[split]}</h3>
+              <div className="chart-grid">
+                {result.pairs.map((pair) => {
+                  const { probability, label } = result.probabilities[split][pair];
+                  const { hit, abstained } = hitAbstainedSeries(probability, label, displayBand);
+                  return (
+                    <ColoredReturnChart
+                      key={pair}
+                      title={pair}
+                      dates={result.cumulative_returns[split].dates}
+                      series={{ cumulative: result.cumulative_returns[split][pair].cumulative, hit, abstained }}
+                    />
+                  );
+                })}
+              </div>
+            </div>
+          ))}
+
+          <h2>Predicted probability</h2>
+          {["train", "val", "test"].map((split) => (
+            <div key={split}>
+              <h3>{SPLIT_LABEL[split]}</h3>
+              <div className="chart-grid">
+                {result.pairs.map((pair) => (
+                  <ProbabilityChart
+                    key={pair}
+                    title={pair}
+                    dates={result.probabilities[split].dates}
+                    series={result.probabilities[split][pair]}
+                    band={displayBand}
+                  />
+                ))}
+              </div>
+            </div>
+          ))}
+
+          <h2>Forecasted vs actual return distribution</h2>
+          {["train", "val", "test"].map((split) => (
+            <div key={split}>
+              <h3>{SPLIT_LABEL[split]}</h3>
+              <div className="chart-grid">
+                {result.pairs.map((pair) => (
+                  <ReturnDistributionChart key={pair} title={pair} series={result.distribution[split][pair]} />
+                ))}
+              </div>
+            </div>
+          ))}
         </>
       )}
     </div>
@@ -718,19 +615,6 @@ function NumField({ label, name, value, onChange, step = "1" }) {
     <div className="field">
       <label>{label}</label>
       <input type="number" step={step} value={value} onChange={(e) => onChange(name, e.target.value)} />
-    </div>
-  );
-}
-
-function SelectField({ label, name, value, onChange, options }) {
-  return (
-    <div className="field">
-      <label>{label}</label>
-      <select value={value} onChange={(e) => onChange(name, e.target.value)}>
-        {options.map(([val, text]) => (
-          <option key={val} value={val}>{text}</option>
-        ))}
-      </select>
     </div>
   );
 }

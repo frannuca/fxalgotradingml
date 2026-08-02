@@ -1,8 +1,8 @@
-"""FastAPI backend for the FX portfolio / risk-overlay pipeline.
+"""FastAPI backend for the FX direction-prediction pipeline.
 
-Thin HTTP wrapper around models/portfolio_lstm.py and models/risk_lstm.py -
-no business logic lives here, just request/response shaping so the React
-frontend (frontend/) has a JSON API to call.
+Thin HTTP wrapper around models/portfolio_lstm.py - no business logic
+lives here, just request/response shaping so the React frontend
+(frontend/) has a JSON API to call.
 
 Endpoints
 ---------
@@ -12,11 +12,11 @@ GET  /api/models             - list models saved in quant.model_registry
 POST /api/train               - kick off a training run (background job)
 GET  /api/train/{job_id}     - poll a training job's status/result
 POST /api/train/{job_id}/stop - request an in-progress job stop early
-POST /api/evaluate            - load model(s) by name and run inference:
-                                 returns PnL series (risk-weighted baseline
-                                 vs with-risk-overlay vs with-risk+costs),
-                                 return histograms, and the model's
-                                 recommended weights for the next day.
+POST /api/evaluate            - load a model by name and run inference:
+                                 returns per-asset hit rate, confusion
+                                 matrices, cumulative-return series (with
+                                 per-day hit/miss), and the model's
+                                 predicted probabilities for the next day.
 
 Run with (from the repo root):
     uvicorn api.server:app --reload --port 8000
@@ -43,27 +43,20 @@ from data.db import get_connection
 from data.fx_downloader import MAJOR_FX_PAIRS
 from models.portfolio_lstm import (
     DEFAULT_CONFIG,
+    DEFAULT_FEATURES,
     TrainingStopped,
     _epoch_report_callback,
     _stop_check_callback,
-    apply_transaction_costs,
+    apply_neutral_band,
+    build_feature_dataframe,
+    confusion_matrix_metrics,
     load_close_prices,
-    portfolio_model_name,
-    precompute_risk_parity_baseline,
-    scale_weights_to_target_vol,
-    sharpe_ratio,
+    prediction_model_name,
+    probit,
     to_log_returns,
 )
 
-# Number of sequential decisions to "warm up" a use_prev_weight=True
-# model's recurrence with, before predicting the actual next-day weight -
-# see _predict_latest_weights. Arbitrary but small: prev is detached
-# between steps (see PortfolioLSTM.forward_sequence), so this only needs
-# enough steps for the (approximate, since the true historical position
-# isn't observable here) recurrence to settle, not a long context window.
-PREV_WEIGHT_WARMUP_DAYS = 20
-
-app = FastAPI(title="FX Portfolio API")
+app = FastAPI(title="FX Direction Prediction API")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # local dev only - tighten before deploying anywhere shared
@@ -121,16 +114,13 @@ def list_models() -> list[dict]:
     """List every model saved in quant.model_registry, newest first - the
     frontend's model picker (for the Evaluation view) reads this.
 
-    Includes each model's own `pairs` and (for portfolio/portfolio_ensemble
-    models) `lookback`, decoded from its checkpoint blob, so the frontend
-    can auto-select the FX pairs and display the sequence length a chosen
-    model was actually trained on, instead of requiring the user to supply
-    values that must match it exactly - see api/server.py's evaluate()/
-    models/portfolio_lstm.py's load_pipeline() for why the model's own
-    pairs/lookback are authoritative over anything a caller might guess.
-    Risk models don't store their own lookback (it's a property of the
-    portfolio pipeline they were trained alongside), so `lookback` is null
-    for `model_type` "risk"/"risk_ensemble".
+    Includes each model's own `pairs` and `lookback`, decoded from its
+    checkpoint blob, so the frontend can auto-select the FX pairs and
+    display the sequence length a chosen model was actually trained on,
+    instead of requiring the user to supply values that must match it
+    exactly - see api/server.py's evaluate()/models/portfolio_lstm.py's
+    load_pipeline() for why the model's own pairs/lookback are
+    authoritative over anything a caller might guess.
     """
     with get_connection() as conn, conn.cursor() as cur:
         cur.execute(
@@ -169,18 +159,25 @@ _JOBS: dict[str, dict[str, Any]] = {}
 # that thread correctly attributed to that job, with no cross-job mixing.
 _current_job_id: contextvars.ContextVar[str | None] = contextvars.ContextVar("current_job_id", default=None)
 
-_EPOCH_RE = re.compile(r"epoch (\d+)/(\d+)")
-_RESTART_RE = re.compile(r"restart (\d+)/(\d+) \(seed=(\d+)\)")
+# Training runs every asset's LSTM fully independently (own optimizer, own
+# loss - see models/portfolio_lstm.py's train_prediction_model) but on a
+# SHARED epoch counter, one phase per (seed, bce_weight) combo (see
+# run_pipeline_multi_seed - every bce_weight value is swept under every
+# seed) - captured from its own log lines ("--- restart %d/%d (seed=%d),
+# bce_weight %s (%d/%d) ---" and "epoch %d/%d - train loss ...") so the
+# progress bar can track progress across the WHOLE sweep, not just seeds.
+_EPOCH_RE = re.compile(r"epoch (\d+)/(\d+) - train")
+_RESTART_RE = re.compile(r"restart (\d+)/(\d+) \(seed=\d+\), bce_weight \S+ \((\d+)/(\d+)\)")
 _MAX_LOG_LINES = 500
 
 
 class _JobLogHandler(logging.Handler):
     """Captures the training pipeline's EXISTING logger.info(...) calls
-    (models/portfolio_lstm.py's and models/risk_lstm.py's per-epoch and
-    per-restart progress lines) into the current job's state - so the
-    frontend's polling GET /api/train/{job_id} can show a live log window
-    and a progress bar, without any changes to the training loops
-    themselves (they already log exactly this, for the CLI's benefit).
+    (models/portfolio_lstm.py's per-epoch and per-restart progress lines)
+    into the current job's state - so the frontend's polling
+    GET /api/train/{job_id} can show a live log window and a progress bar,
+    without any changes to the training loops themselves (they already
+    log exactly this, for the CLI's benefit).
     """
 
     def emit(self, record: logging.LogRecord) -> None:
@@ -196,13 +193,18 @@ class _JobLogHandler(logging.Handler):
             del logs[: len(logs) - _MAX_LOG_LINES]
 
         progress = job.setdefault(
-            "progress", {"seed_index": 1, "n_seeds": 1, "epoch": 0, "total_epochs": 1, "percent": 0.0},
+            "progress", {
+                "seed_index": 1, "n_seeds": 1, "lambda_index": 1, "n_lambdas": 1,
+                "epoch": 0, "total_epochs": 1, "percent": 0.0,
+            },
         )
 
         restart_match = _RESTART_RE.search(message)
         if restart_match:
             progress["seed_index"] = int(restart_match.group(1))
             progress["n_seeds"] = int(restart_match.group(2))
+            progress["lambda_index"] = int(restart_match.group(3))
+            progress["n_lambdas"] = int(restart_match.group(4))
             progress["epoch"] = 0
             self._update_percent(progress)
             return
@@ -215,18 +217,24 @@ class _JobLogHandler(logging.Handler):
 
     @staticmethod
     def _update_percent(progress: dict) -> None:
+        # Total units of work is every (seed, bce_weight) combo, not just
+        # seeds - a sweep of N lambdas under each seed is N times the work
+        # a single value would be, and the bar must reflect that instead
+        # of resetting to the SAME per-seed share for every lambda (which
+        # would make it visibly jump backward each time a new lambda
+        # starts).
         n_seeds = max(progress["n_seeds"], 1)
+        n_lambdas = max(progress["n_lambdas"], 1)
         total_epochs = max(progress["total_epochs"], 1)
-        completed_seeds_fraction = (progress["seed_index"] - 1) / n_seeds
-        current_seed_fraction = (progress["epoch"] / total_epochs) / n_seeds
-        progress["percent"] = round((completed_seeds_fraction + current_seed_fraction) * 100, 1)
+        total_combos = n_seeds * n_lambdas
+        completed_combos = (progress["seed_index"] - 1) * n_lambdas + (progress["lambda_index"] - 1)
+        current_combo_fraction = (progress["epoch"] / total_epochs) / total_combos
+        progress["percent"] = round((completed_combos / total_combos + current_combo_fraction) * 100, 1)
 
 
 # Attach once, to the shared "models" ancestor logger - INFO records from
-# models.portfolio_lstm's and models.risk_lstm's own loggers (each named
-# after their module) propagate up to it by default, so this single
-# handler sees every training job's progress regardless of which of the
-# two modules is actually doing the logging at that moment.
+# models.portfolio_lstm's own logger propagate up to it by default, so
+# this single handler sees every training job's progress.
 _job_log_handler = _JobLogHandler()
 _job_log_handler.setFormatter(logging.Formatter("%(message)s"))
 logging.getLogger("models").addHandler(_job_log_handler)
@@ -239,264 +247,237 @@ class TrainRequest(BaseModel):
     years: int = 8
     train_frac: float = 0.8
     test_frac: float = 0.1
-    position_mode: str = "long_short"  # "long_short" (tanh, can go short) or "long_only" (sigmoid) - see PortfolioLSTM
-    hidden_size: int = 32
+    direction_horizon: int = 5  # forward days the z-score label (see make_sequences) looks
+    rolling_stats_window: int = 20  # trailing window for rolling vol/skew/kurtosis input features + z-score label normalization
+    # Which per-pair input channels to build (see models/portfolio_lstm.py's
+    # FEATURE_CATALOG: "log_return", "vol", "skew", "kurt", "carry", "cma").
+    features: list[str] = ["log_return", "vol", "skew", "kurt"]
+    cma_windows: list[list[int]] = []  # [[short, long], ...] - only used if "cma" is in `features`
+    # Architecture: N independent per-asset LSTMs, each followed by a
+    # CAUSAL self-attention layer over the time axis (see AssetLSTM/
+    # PredictionModel) - no weights shared between assets. By DEFAULT
+    # every pair's LSTM sees ONLY its own features - fully independent, no
+    # cross-asset mixing. `cross_pairs` (a {pair: [other_pair, ...]} dict)
+    # opts specific pairs INTO also seeing specific other pairs' full
+    # feature blocks (own features are always included regardless).
+    # Fully deterministic - no NoisyNet head, no input-noise regularization.
+    cross_pairs: dict[str, list[str]] = {}
+    hidden_size: int = 16
+    num_layers: int = 1
+    dropout: float = 0.1
+    n_attn_heads: int = 4  # attention heads per asset's causal self-attention layer - hidden_size must divide evenly
+    # Training (see train_prediction_model): every asset's LSTM trains
+    # fully independently - its own optimizer, its own loss.
     epochs: int = 300
     lr: float = 1e-3
-    dropout: float = 0.1
     weight_decay: float = 1e-4
-    noise_std: float = 0.05
-    target_vol: float = 0.20
-    noisy_head: bool = False
-    use_prev_weight: bool = False
-    has_cash: bool = False
-    cash_return: float = 0.0
-    use_carry: bool = False
-    vol_horizons: list[int] = []
-    encoder_type: str = "concat"  # "concat" or "per_asset" - see PortfolioLSTM's docstring
-    asset_combiner: str = "attention"  # "attention" or "mean" - only used when encoder_type="per_asset"
-    n_attn_heads: int = 2
-    covariance_estimator: str = "sample"  # "sample", "ewma", or "ledoit_wolf" - see estimate_covariance
-    ewma_lambda: float = 0.94
-    pooling: str = "last"  # "last" or "attention" - see TemporalAttentionPool; applies to both networks
-    device: str = "auto"  # "auto" (Metal/MPS on Apple Silicon, else CUDA, else CPU), "cpu", "mps", or "cuda" - see get_device
-    objective: str = "sharpe"  # "sharpe", "kelly", or "cvar" - see models/portfolio_lstm.py's compute_training_loss
-    sharpe_window: int = 60
-    cvar_alpha: float = 0.95
-    cvar_kappa: float = 1.0
+    # Weight of the BCE direction term (see direction_bce) - the
+    # anti-mean-collapse term. Either a single value, or a list to SWEEP
+    # (e.g. [1.0, 1.5, 1.75, 2.0, 3.0]) - see run_pipeline_multi_seed,
+    # which trains every value under every seed and keeps whichever
+    # validated best, per seed and then overall.
+    bce_weight: float | list[float] = 1.0
+    neutral_band: float = 0.05  # abstention half-width around p=0.5 (see apply_neutral_band); 0 disables
     n_seeds: int = 1
-    restart_strategy: str = "best"
-    risk_overlay: bool = False
-    risk_hidden_size: int = 16
-    risk_epochs: int = 200
-    risk_lr: float = 1e-3
-    max_attenuation: float = 0.33
-    risk_rolling_window: int = 10
-    use_cross_sectional: bool = False
-    transaction_cost: float = 0.0
+    device: str = "auto"  # "auto" (Metal/MPS on Apple Silicon, else CUDA, else CPU), "cpu", "mps", or "cuda" - see get_device
     save_db: bool = True
     model_description: str = ""
 
 
-def _series_payload(dates, **named_arrays: np.ndarray) -> dict:
-    """Build a {dates: [...], <name>: [...], ...} dict that's directly
-    JSON-serializable and easy for the frontend to zip into chart points."""
-    payload: dict[str, Any] = {"dates": [str(d.date()) if hasattr(d, "date") else str(d) for d in dates]}
-    for name, arr in named_arrays.items():
-        payload[name] = np.asarray(arr).tolist()
-    return payload
+def _hit_rate_payload(pairs: list[str], hit_rate: np.ndarray) -> dict:
+    """Build a {<pair>: rate, ...} dict from a (n_assets,) array - one
+    scalar directional hit rate per asset (see PredictionResult's
+    docstring on hit_rate_train)."""
+    hit_rate = np.asarray(hit_rate)
+    return {pair: float(hit_rate[i]) for i, pair in enumerate(pairs)}
 
 
-def _positions_payload(dates, pairs: list[str], weights: np.ndarray) -> dict:
-    """Build a {dates: [...], <pair>: [...], ...} dict from a (n_days,
-    n_assets) array - one series per pair, for a per-asset line chart
-    (used for both portfolio POSITIONS and per-asset ATTENUATION)."""
-    payload: dict[str, Any] = {"dates": [str(d.date()) if hasattr(d, "date") else str(d) for d in dates]}
-    weights = np.asarray(weights)
-    for i, pair in enumerate(pairs):
-        payload[pair] = weights[:, i].tolist()
-    return payload
-
-
-def _asset_returns_payload(
-    pairs: list[str], dates_val, next_returns_val: np.ndarray, dates_train=None, next_returns_train: np.ndarray = None,
+def _confusion_matrix_payload(
+    pairs: list[str], probabilities: np.ndarray, labels: np.ndarray, neutral_band: float = 0.0,
 ) -> dict:
-    """Cumulative log-return of each underlying FX pair itself (not the
-    portfolio's PnL) - lets the frontend show what the market actually did,
-    for context alongside the portfolio/position charts.
-
-    If `dates_train`/`next_returns_train` are given (Training view: full
-    history), the cumulative sum runs continuously across train+val
-    concatenated, and `split_date` marks where the out-of-sample period
-    begins (for a vertical marker line). Without them (Evaluation view:
-    out-of-sample only, matching that view's scope), it's just the
-    validation-period cumulative return with no split_date.
+    """Build a {<pair>: {tp, fp, tn, fn, abstained, coverage, accuracy,
+    precision, recall, specificity, f1}, ...} dict - the full per-asset
+    confusion-matrix breakdown (see models/portfolio_lstm.py's
+    confusion_matrix_metrics), for the Training/Evaluation views'
+    confusion-matrix table. With a neutral band, tp/fp/tn/fn and every
+    derived metric cover DECIDED samples only; `abstained` counts the
+    no-call days and `coverage` their complement's share, so the frontend
+    can show accuracy and coverage side by side.
     """
-    if dates_train is not None:
-        all_dates = list(dates_train) + list(dates_val)
-        all_returns = np.concatenate([next_returns_train, next_returns_val], axis=0)
-    else:
-        all_dates = list(dates_val)
-        all_returns = np.asarray(next_returns_val)
+    metrics = confusion_matrix_metrics(probabilities, labels, neutral_band=neutral_band)
+    return {
+        pair: {
+            "tp": int(metrics["tp"][i]), "fp": int(metrics["fp"][i]),
+            "tn": int(metrics["tn"][i]), "fn": int(metrics["fn"][i]),
+            "abstained": int(metrics["abstained"][i]),
+            "coverage": float(metrics["coverage"][i]),
+            "accuracy": float(metrics["accuracy"][i]),
+            "precision": float(metrics["precision"][i]),
+            "recall": float(metrics["recall"][i]),
+            "specificity": float(metrics["specificity"][i]),
+            "f1": float(metrics["f1"][i]),
+        }
+        for i, pair in enumerate(pairs)
+    }
 
-    payload = _positions_payload(all_dates, pairs, np.cumsum(all_returns, axis=0))
-    if dates_train is not None and len(dates_val):
-        first_val_date = dates_val[0]
-        payload["split_date"] = str(first_val_date.date()) if hasattr(first_val_date, "date") else str(first_val_date)
-    else:
-        payload["split_date"] = None
+
+def _cumulative_return_payload(dates, pairs: list[str], next_returns: np.ndarray) -> dict:
+    """Build a {dates: [...], <pair>: {cumulative: [...]}, ...} dict: each
+    asset's own cumulative (single-day-ahead) log-return path. Deliberately
+    does NOT compute hit/abstained here - that requires a neutral band (see
+    apply_neutral_band), which is pure postprocessing (see
+    evaluate_prediction_model's docstring), not baked into anything at
+    evaluation time - the frontend computes hit/abstained itself, from
+    _probability_payload's raw probability + realized label, against
+    whatever band the user currently has selected (so it can recolor this
+    same chart for a different band without a new request - see
+    frontend/src/metrics.js).
+    """
+    payload: dict[str, Any] = {"dates": [str(d.date()) if hasattr(d, "date") else str(d) for d in dates]}
+    cumulative = np.cumsum(np.asarray(next_returns), axis=0)
+    for i, pair in enumerate(pairs):
+        payload[pair] = {"cumulative": cumulative[:, i].tolist()}
     return payload
+
+
+def _probability_payload(dates, pairs: list[str], probabilities: np.ndarray, direction_labels: np.ndarray) -> dict:
+    """Build a {dates: [...], <pair>: {probability: [...], label: [...]}, ...}
+    dict: each asset's own predicted probability path (RAW - see
+    evaluate_prediction_model's docstring, NOT neutral-band-snapped)
+    alongside the realized direction label for the SAME date - together,
+    everything a caller needs to derive hit/miss/abstained or a full
+    confusion matrix for ANY neutral band, without another request (see
+    frontend/src/metrics.js, which is what the Training/Evaluation pages'
+    neutral-band control actually recomputes against client-side).
+    """
+    payload: dict[str, Any] = {"dates": [str(d.date()) if hasattr(d, "date") else str(d) for d in dates]}
+    probabilities = np.asarray(probabilities)
+    direction_labels = np.asarray(direction_labels)
+    for i, pair in enumerate(pairs):
+        payload[pair] = {"probability": probabilities[:, i].tolist(), "label": direction_labels[:, i].tolist()}
+    return payload
+
+
+def _distribution_payload(pairs: list[str], z_labels: np.ndarray, mu: np.ndarray, sigma: np.ndarray) -> dict:
+    """Build a {<pair>: {actual: [...], forecasted: [...]}, ...} dict for
+    the "forecasted vs actual" distribution histograms: `actual` is the
+    realized decision-day z-score (data.z_labels_*, see PredictionResult);
+    `forecasted` draws ONE random sample from EACH row's own model-implied
+    N(mu_i, sigma_i) (sigma already calibrated by sigma_hat, see
+    evaluate_prediction_model) - the same length/pairing as `actual`, so a
+    caller can histogram both and compare shape/spread/skew directly. If
+    the model's predictive distributions are well-calibrated, the two
+    histograms should look statistically similar even though no individual
+    pair of values need match.
+    """
+    z_labels = np.asarray(z_labels)
+    mu = np.asarray(mu)
+    sigma = np.asarray(sigma)
+    forecasted = np.random.default_rng().normal(mu, sigma)
+    return {
+        pair: {"actual": z_labels[:, i].tolist(), "forecasted": forecasted[:, i].tolist()}
+        for i, pair in enumerate(pairs)
+    }
 
 
 def _run_training_job(job_id: str, config: dict) -> None:
-    """Runs on a background thread - trains PortfolioLSTM (and, if
-    risk_overlay was requested, then trains RiskLSTM SEPARATELY on top of
-    it - see models/risk_lstm.py's run_pipeline_multi_seed), always saves
-    locally, and to quant.model_registry if save_db was requested, then
-    records the result: Sharpe ratios, in-sample AND out-of-sample PnL
-    series, per-asset positions, and (with a risk overlay) per-asset
-    attenuation - everything the Training view plots once the job is done.
+    """Runs on a background thread - trains a PredictionModel (every
+    asset's LSTM together - see models/portfolio_lstm.py's own docstring),
+    always saves locally, and to quant.model_registry if save_db was
+    requested, then records the result: per-asset hit rate, confusion
+    matrices, and cumulative-return series (with per-day hit/miss) for all
+    three splits - everything the Training view plots once the job is
+    done.
     """
     _current_job_id.set(job_id)  # scopes _JobLogHandler's capture to this thread/job for its whole lifetime
 
     def _interim_callback(
-        stage: str, epoch: int, epochs: int, train_returns: np.ndarray,
-        val_returns: np.ndarray | None, test_returns: np.ndarray | None = None,
+        stage: str, epoch: int, epochs: int, train_loss: float, train_hit_rate: float,
+        val_loss: float | None = None, val_hit_rate: float | None = None,
     ) -> None:
         """Registered below via _epoch_report_callback - called from INSIDE
-        train_portfolio_model/train_risk_model's own epoch loop (same
-        ~10%-of-epochs cadence as their progress logging), so the Training
-        view can show live-updating in-sample, validation, AND test PnL/
-        Sharpe charts instead of only a progress bar and log text.
-        `val_returns`/`test_returns` are None whenever the caller didn't
-        have that split to report (test_returns in particular is None
-        whenever test_frac=0 - no test split configured).
+        train_prediction_model's own epoch loop (same ~10%-of-epochs
+        cadence as its progress logging), so the Training view can show a
+        live-updating loss/hit-rate curve instead of only a progress bar
+        and log text. `stage` is always "train" now (kept as a field for
+        payload-shape stability).
         """
         job = _JOBS.get(job_id)
         if job is None:
             return
         interim = {
-            "stage": stage,
-            "epoch": epoch,
-            "total_epochs": epochs,
-            "cumulative_pnl": np.cumsum(train_returns).tolist(),
-            "sharpe": float(sharpe_ratio(torch.tensor(train_returns))),
+            "stage": stage, "epoch": epoch, "total_epochs": epochs,
+            "train_loss": train_loss, "train_hit_rate": train_hit_rate,
         }
-        if val_returns is not None:
-            interim["val_cumulative_pnl"] = np.cumsum(val_returns).tolist()
-            interim["val_sharpe"] = float(sharpe_ratio(torch.tensor(val_returns)))
-        if test_returns is not None:
-            interim["test_cumulative_pnl"] = np.cumsum(test_returns).tolist()
-            interim["test_sharpe"] = float(sharpe_ratio(torch.tensor(test_returns)))
+        if val_loss is not None:
+            interim["val_loss"] = val_loss
+            interim["val_hit_rate"] = val_hit_rate
         job["interim"] = interim
+        history = job.setdefault("interim_history", [])
+        history.append(interim)
+        if len(history) > 1000:
+            del history[: len(history) - 1000]
 
     _epoch_report_callback.set(_interim_callback)
     _stop_check_callback.set(lambda: _JOBS.get(job_id, {}).get("stop_requested", False))
     _JOBS[job_id]["status"] = "running"
     try:
-        args = Namespace(**{**DEFAULT_CONFIG, **config, "load_portfolio": None, "load_risk": None})
+        args = Namespace(**{**DEFAULT_CONFIG, **config, "load_model": None})
 
-        if args.risk_overlay:
-            from models.risk_lstm import risk_model_name, run_pipeline_multi_seed as run_risk_overlay_pipeline
+        from models.portfolio_lstm import run_pipeline_multi_seed
 
-            result = run_risk_overlay_pipeline(args)
-            result.portfolio_result.model.save_model(
-                x_mean=result.portfolio_result.x_mean, x_std=result.portfolio_result.x_std,
-                pairs=result.portfolio_result.pairs, lookback=result.portfolio_result.lookback,
-                use_carry=args.use_carry, vol_horizons=args.vol_horizons,
-            )
-            result.risk_model.save_model(pairs=result.portfolio_result.pairs)
+        result = run_pipeline_multi_seed(args)
+        pairs = result.pairs
+        result.model.save_model(
+            x_mean=result.x_mean, x_std=result.x_std, pairs=result.pairs, lookback=result.lookback,
+            features=args.features, cma_windows=args.cma_windows,
+            sigma_hat=result.sigma_hat, neutral_band=result.neutral_band,
+        )
 
-            portfolio_name = portfolio_model_name(args)
-            risk_name = risk_model_name(args)
-            if args.save_db:
-                result.portfolio_result.model.save_to_db(
-                    portfolio_name,
-                    x_mean=result.portfolio_result.x_mean, x_std=result.portfolio_result.x_std,
-                    pairs=result.portfolio_result.pairs, lookback=result.portfolio_result.lookback,
-                    use_carry=args.use_carry, vol_horizons=args.vol_horizons,
-                    description=args.model_description,
-                )
-                result.risk_model.save_to_db(
-                    risk_name, pairs=result.portfolio_result.pairs, description=args.model_description,
-                )
-
-            pr = result.portfolio_result
-            pairs = pr.pairs  # the model's OWN pairs (includes "CASH" when has_cash was used) - not args.pairs
-            _JOBS[job_id]["result"] = {
-                "portfolio_model_name": portfolio_name,
-                "risk_model_name": risk_name,
-                "train_sharpe_raw": float(sharpe_ratio(torch.tensor(pr.returns_train_unscaled))),
-                "train_sharpe_vol_targeted": float(sharpe_ratio(torch.tensor(result.returns_train_raw))),
-                "train_sharpe_with_risk": float(sharpe_ratio(torch.tensor(result.returns_train_scaled))),
-                "val_sharpe_raw": float(sharpe_ratio(torch.tensor(pr.returns_val_unscaled))),
-                "val_sharpe_vol_targeted": float(sharpe_ratio(torch.tensor(result.returns_val_raw))),
-                "val_sharpe_with_risk": float(sharpe_ratio(torch.tensor(result.returns_val_scaled))),
-                "test_sharpe_raw": float(sharpe_ratio(torch.tensor(pr.returns_test_unscaled))),
-                "test_sharpe_vol_targeted": float(sharpe_ratio(torch.tensor(result.returns_test_raw))),
-                "test_sharpe_with_risk": float(sharpe_ratio(torch.tensor(result.returns_test_scaled))),
-                "pnl_train": _series_payload(
-                    result.dates_train,
-                    vol_targeted=np.cumsum(result.returns_train_raw),
-                    with_risk=np.cumsum(result.returns_train_scaled),
-                    benchmark=np.cumsum(result.benchmark_returns_train),
-                ),
-                "pnl_val": _series_payload(
-                    result.dates_val,
-                    vol_targeted=np.cumsum(result.returns_val_raw),
-                    with_risk=np.cumsum(result.returns_val_scaled),
-                    benchmark=np.cumsum(result.benchmark_returns_val),
-                ),
-                "pnl_test": _series_payload(
-                    result.dates_test,
-                    vol_targeted=np.cumsum(result.returns_test_raw),
-                    with_risk=np.cumsum(result.returns_test_scaled),
-                    benchmark=np.cumsum(result.benchmark_returns_test),
-                ),
-                # Aligned to result.dates_train/dates_val/dates_test
-                # (make_risk_sequences drops the first
-                # `risk_rolling_window - 1` samples of each split) - NOT
-                # pr.dates_train/pr.weights_train, which are longer, so
-                # positions/attenuation stay on the same axis.
-                "positions_train": _positions_payload(result.dates_train, pairs, result.weights_train),
-                "positions_val": _positions_payload(result.dates_val, pairs, result.weights_val),
-                "attenuation_train": _positions_payload(result.dates_train, pairs, result.attenuation_train),
-                "attenuation_val": _positions_payload(result.dates_val, pairs, result.attenuation_val),
-                "asset_returns": _asset_returns_payload(
-                    pairs, pr.dates_val, pr.next_returns_val, pr.dates_train, pr.next_returns_train,
-                ),
-            }
-        else:
-            from models.portfolio_lstm import run_pipeline_multi_seed
-
-            result = run_pipeline_multi_seed(args)
-            pairs = result.pairs  # the model's OWN pairs (includes "CASH" when has_cash was used) - not args.pairs
-            result.model.save_model(
-                x_mean=result.x_mean, x_std=result.x_std, pairs=result.pairs, lookback=result.lookback,
-                use_carry=args.use_carry, vol_horizons=args.vol_horizons,
+        name = prediction_model_name(args)
+        if args.save_db:
+            result.model.save_to_db(
+                name, x_mean=result.x_mean, x_std=result.x_std, pairs=result.pairs, lookback=result.lookback,
+                features=args.features, cma_windows=args.cma_windows, description=args.model_description,
+                sigma_hat=result.sigma_hat, neutral_band=result.neutral_band,
             )
 
-            portfolio_name = portfolio_model_name(args)
-            if args.save_db:
-                result.model.save_to_db(
-                    portfolio_name, x_mean=result.x_mean, x_std=result.x_std,
-                    pairs=result.pairs, lookback=result.lookback,
-                    use_carry=args.use_carry, vol_horizons=args.vol_horizons,
-                    description=args.model_description,
-                )
-
-            _JOBS[job_id]["result"] = {
-                "portfolio_model_name": portfolio_name,
-                "risk_model_name": None,
-                "train_sharpe_raw": float(sharpe_ratio(torch.tensor(result.returns_train_unscaled))),
-                "train_sharpe_vol_targeted": float(sharpe_ratio(torch.tensor(result.returns_train))),
-                "train_sharpe_with_risk": None,
-                "val_sharpe_raw": float(sharpe_ratio(torch.tensor(result.returns_val_unscaled))),
-                "val_sharpe_vol_targeted": float(sharpe_ratio(torch.tensor(result.returns_val))),
-                "val_sharpe_with_risk": None,
-                "test_sharpe_raw": float(sharpe_ratio(torch.tensor(result.returns_test_unscaled))),
-                "test_sharpe_vol_targeted": float(sharpe_ratio(torch.tensor(result.returns_test))),
-                "test_sharpe_with_risk": None,
-                "pnl_train": _series_payload(
-                    result.dates_train, vol_targeted=np.cumsum(result.returns_train),
-                    benchmark=np.cumsum(result.benchmark_returns_train),
-                ),
-                "pnl_val": _series_payload(
-                    result.dates_val, vol_targeted=np.cumsum(result.returns_val),
-                    benchmark=np.cumsum(result.benchmark_returns_val),
-                ),
-                "pnl_test": _series_payload(
-                    result.dates_test, vol_targeted=np.cumsum(result.returns_test),
-                    benchmark=np.cumsum(result.benchmark_returns_test),
-                ),
-                "positions_train": _positions_payload(result.dates_train, pairs, result.weights_train),
-                "positions_val": _positions_payload(result.dates_val, pairs, result.weights_val),
-                "attenuation_train": None,
-                "attenuation_val": None,
-                "asset_returns": _asset_returns_payload(
-                    pairs, result.dates_val, result.next_returns_val, result.dates_train, result.next_returns_train,
-                ),
-            }
+        _JOBS[job_id]["result"] = {
+            "model_name": name,
+            "pairs": pairs,
+            # Initial value for the frontend's neutral-band control - the
+            # band this training run was configured with. hit_rate/
+            # confusion_matrix below are computed at THIS band purely as
+            # the initial display; probabilities/cumulative_returns carry
+            # everything needed to recompute both for a different band
+            # entirely client-side (see _probability_payload's docstring).
+            "neutral_band": result.neutral_band,
+            "hit_rate": {
+                "train": _hit_rate_payload(pairs, result.hit_rate_train),
+                "val": _hit_rate_payload(pairs, result.hit_rate_val),
+                "test": _hit_rate_payload(pairs, result.hit_rate_test),
+            },
+            "confusion_matrix": {
+                "train": _confusion_matrix_payload(pairs, result.probabilities_train, result.direction_labels_train, result.neutral_band),
+                "val": _confusion_matrix_payload(pairs, result.probabilities_val, result.direction_labels_val, result.neutral_band),
+                "test": _confusion_matrix_payload(pairs, result.probabilities_test, result.direction_labels_test, result.neutral_band),
+            },
+            "cumulative_returns": {
+                "train": _cumulative_return_payload(result.dates_train, pairs, result.next_returns_train),
+                "val": _cumulative_return_payload(result.dates_val, pairs, result.next_returns_val),
+                "test": _cumulative_return_payload(result.dates_test, pairs, result.next_returns_test),
+            },
+            "probabilities": {
+                "train": _probability_payload(result.dates_train, pairs, result.probabilities_train, result.direction_labels_train),
+                "val": _probability_payload(result.dates_val, pairs, result.probabilities_val, result.direction_labels_val),
+                "test": _probability_payload(result.dates_test, pairs, result.probabilities_test, result.direction_labels_test),
+            },
+            "distribution": {
+                "train": _distribution_payload(pairs, result.z_labels_train, result.mu_train, result.sigma_train),
+                "val": _distribution_payload(pairs, result.z_labels_val, result.mu_val, result.sigma_val),
+                "test": _distribution_payload(pairs, result.z_labels_test, result.mu_test, result.sigma_test),
+            },
+        }
 
         # The last CAPTURED epoch log line may fall short of the true final
         # epoch (it's only logged every epochs//10 epochs), so snap the bar
@@ -523,6 +504,7 @@ def start_training(req: TrainRequest) -> dict:
     request, so the frontend polls GET /api/train/{job_id} instead.
     """
     job_id = str(uuid.uuid4())
+    n_lambdas = len(req.bce_weight) if isinstance(req.bce_weight, list) else 1
     _JOBS[job_id] = {
         "status": "pending",
         "result": None,
@@ -530,10 +512,12 @@ def start_training(req: TrainRequest) -> dict:
         "logs": [],
         "progress": {
             "seed_index": 1, "n_seeds": req.n_seeds,
-            "epoch": 0, "total_epochs": req.risk_epochs if req.risk_overlay else req.epochs,
+            "lambda_index": 1, "n_lambdas": n_lambdas,
+            "epoch": 0, "total_epochs": req.epochs,
             "percent": 0.0,
         },
-        "interim": None,  # live in-sample PnL/Sharpe snapshot, updated during training - see _run_training_job
+        "interim": None,  # live train/val loss+hit-rate snapshot, updated during training - see _run_training_job
+        "interim_history": [],
         "stop_requested": False,
     }
     thread = threading.Thread(target=_run_training_job, args=(job_id, req.model_dump()), daemon=True)
@@ -576,168 +560,73 @@ class EvaluateRequest(BaseModel):
     trained model itself (restored from its checkpoint, see
     models/portfolio_lstm.py's load_pipeline), not free evaluation
     parameters. Only what's genuinely evaluation-time - how much history to
-    fetch, how much of it counts as the scored/"recent" window, and
-    reporting-only knobs - is exposed here.
+    fetch and how the train/val/test split is drawn - is exposed here.
     """
 
-    portfolio_model: str  # a quant.model_registry name, or a local .pt path
-    risk_model: str | None = None  # same; omit to evaluate PortfolioLSTM alone
+    model_name: str  # a quant.model_registry name, or a local .pt path
     years: int = 8
     train_frac: float = 0.8
     test_frac: float = 0.1
-    target_vol: float = 0.20
-    transaction_cost: float = 0.0
 
 
-def _histogram(values: np.ndarray, bins: int = 30) -> dict:
-    """Bin `values` server-side (numpy) so the frontend just renders bars,
-    with no statistics logic duplicated in JS."""
-    counts, edges = np.histogram(np.asarray(values), bins=bins)
-    return {"counts": counts.tolist(), "bin_edges": edges.tolist()}
+def _predict_latest_probabilities(args: Namespace, model) -> dict[str, float]:
+    """Compute the model's predicted probability for the NEXT (as-yet-
+    unrealized) `direction_horizon`-day-forward outcome, using the most
+    recent `lookback`-day window of real data - distinct from the
+    historical validation/test-period probabilities (which are for
+    backtesting): this is "run the model on today's window".
 
-
-def _predict_latest_weights(args: Namespace, model, risk_model=None) -> dict[str, float]:
-    """Compute the model's recommended weights for the NEXT (as-yet-
-    unrealized) day, using the most recent `lookback`-day window of real
-    data - distinct from the historical validation-period weights (which
-    are for backtesting): this is "run the model to get today's position".
-
-    Uses `model.pairs`/`model.lookback` - restored from the model's own
-    checkpoint - rather than `args.pairs`/`args.lookback` (whatever the
-    request/UI asked for), so the fetched data, window length, and returned
-    weight labels always match what the model was actually trained on.
-
-    When `risk_model` is given, builds its make_risk_sequences()-equivalent
-    input for this single live window: an extra `risk_model.rolling_window
-    - 1` days of history beyond `lookback` are fetched so the SAME
-    per-asset weighted-PnL + rolling-moments features the model was trained
-    on (see models/risk_lstm.py's make_risk_sequences) can be computed here
-    too, using TODAY's own decided weight (consistent with how each
-    training sample uses its own decision weight, not a different day's).
-
-    When `model.use_prev_weight` is True, tomorrow's decision also needs
-    today's ACTUAL held position as an input (see PortfolioLSTM.forward) -
-    not available directly, so a short PREV_WEIGHT_WARMUP_DAYS-day
-    recurrence is run first (forward_sequence, starting flat) purely to
-    arrive at a plausible current position; only its LAST output is used
-    (prev is detached between steps - see forward_sequence - so this
-    warmup doesn't need to be long to be accurate, just enough for the
-    detached recurrence to reach a steady position).
+    Uses `model.pairs`/`model.lookback`/`model.features`/`model.cma_windows`
+    - restored from the model's own checkpoint - rather than anything from
+    the request, so the fetched data, window length, and returned feature
+    set always match what the model was actually trained on.
     """
     pairs = model.pairs
     lookback = model.lookback
     # model may live on an accelerator (MPS/CUDA - see
     # models/portfolio_lstm.get_device); every tensor built below is moved
-    # to match before being passed to model()/risk_model() - this is a
-    # single tiny inference call, so there's no real GPU benefit, but it
-    # must still land on whatever device the (possibly GPU-trained) model
-    # actually lives on or the forward pass would raise a device-mismatch error.
+    # to match before being passed to model() - this is a single tiny
+    # inference call, so there's no real GPU benefit, but it must still
+    # land on whatever device the (possibly GPU-trained) model actually
+    # lives on or the forward pass would raise a device-mismatch error.
     device = next(model.parameters()).device
-    use_carry = getattr(model, "use_carry", False)
-    vol_horizons = getattr(model, "vol_horizons", [])
-    n_channels = 1 + int(use_carry) + len(vol_horizons)
-    extra_days = (risk_model.rolling_window - 1) if risk_model is not None else 0
-    prev_weight_warmup = PREV_WEIGHT_WARMUP_DAYS if getattr(model, "use_prev_weight", False) else 0
-    min_days = lookback + extra_days + prev_weight_warmup
+    features = getattr(model, "features", None) or list(DEFAULT_FEATURES)
+    cma_windows = getattr(model, "cma_windows", None) or []
+    rolling_stats_window = getattr(args, "rolling_stats_window", 20) or 20
+    min_days = lookback + rolling_stats_window
 
-    # "CASH" (see has_cash/_prepare_data) has no real ticker - has no price
-    # history to fetch. Strip it before load_close_prices, then add it back
-    # as a constant-return column (cash_return isn't persisted on the model
-    # checkpoint - see DEFAULT_CONFIG's docstring on cash_return - so, like
-    # _prepare_data, this trusts the CURRENT request's args.cash_return,
-    # not something baked in at training time), reordered to match
-    # model.pairs exactly.
-    real_pairs = [p for p in pairs if p != "CASH"]
-    prices = load_close_prices(real_pairs, years=args.years)
+    prices = load_close_prices(pairs, years=args.years)
     returns = to_log_returns(prices)
-    if "CASH" in pairs:
-        returns = returns.copy()
-        returns["CASH"] = getattr(args, "cash_return", 0.0)
-        returns = returns[pairs]
     if len(returns) < min_days:
         raise ValueError(
             f"Only {len(returns)} days of history available for {pairs}, but this model needs "
             f"the most recent {min_days} days - increase 'years' to fetch more history."
         )
-    last_window_raw = returns.to_numpy(dtype=np.float32)[-lookback:]  # (lookback, n_assets) - raw returns only
 
-    if n_channels > 1:
-        from models.portfolio_lstm import build_feature_dataframe
-
-        feature_returns = build_feature_dataframe(returns, pairs, use_carry, vol_horizons, args.years)
-    else:
-        feature_returns = returns
+    feature_returns = build_feature_dataframe(returns, pairs, features, rolling_stats_window, cma_windows, args.years)
     last_window_features = feature_returns.to_numpy(dtype=np.float32)[-lookback:]  # (lookback, n_assets * n_channels)
-
-    X = torch.tensor((last_window_features - model.x_mean) / model.x_std, device=device).unsqueeze(0)  # (1, lookback, n_assets * n_channels)
-    X_raw = torch.tensor(last_window_raw, device=device).unsqueeze(0)  # raw returns only - for vol-targeting/risk features
+    X = torch.tensor((last_window_features - model.x_mean) / model.x_std, device=device).unsqueeze(0)
 
     model.eval()
     with torch.no_grad():
-        prev_weight = None
-        if prev_weight_warmup > 0:
-            # `lookback + prev_weight_warmup - 1` days of FEATURES, ending
-            # the day BEFORE today's own window ends, sliding a lookback-day
-            # window step=1 across them gives exactly `prev_weight_warmup`
-            # sequential decisions whose LAST one ends exactly at
-            # "yesterday" - i.e. the decision immediately preceding today's.
-            warmup_raw = feature_returns.to_numpy(dtype=np.float32)[-(lookback + prev_weight_warmup) : -1]
-            warmup_windows = torch.tensor(warmup_raw).unfold(0, lookback, 1).permute(0, 2, 1)  # (prev_weight_warmup, lookback, n_assets * n_channels)
-            warmup_standardized = (warmup_windows.numpy() - model.x_mean) / model.x_std
-            # channel 0 per asset is always the raw return (see
-            # build_feature_dataframe) - needed to compute the risk-parity
-            # baseline each step's weight scales (PortfolioLSTM.forward_sequence).
-            warmup_raw_single_channel = warmup_windows[:, :, 0::n_channels].to(device)
-            # Risk-parity baseline depends only on raw returns, never on
-            # the model - solve it ONCE for this whole warmup sequence
-            # (see precompute_risk_parity_baseline) rather than inside
-            # forward_sequence.
-            warmup_baseline = precompute_risk_parity_baseline(
-                warmup_raw_single_channel,
-                getattr(args, "covariance_estimator", "sample"), getattr(args, "ewma_lambda", 0.94),
-            )
-            warmup_sequence = model.forward_sequence(
-                torch.tensor(warmup_standardized, dtype=X.dtype, device=device), risk_parity_baseline=warmup_baseline,
-            )
-            prev_weight = warmup_sequence[-1].detach()  # yesterday's decision = today's ACTUAL held position
-
-        risk_parity_baseline = precompute_risk_parity_baseline(
-            X_raw, getattr(args, "covariance_estimator", "sample"), getattr(args, "ewma_lambda", 0.94),
-        )
-        raw_weights = model(
-            X, prev_weight.unsqueeze(0) if prev_weight is not None else None, risk_parity_baseline=risk_parity_baseline,
-        )
-        weights = scale_weights_to_target_vol(
-            raw_weights, X_raw, args.target_vol, max_leverage=args.max_leverage,
-            covariance_estimator=getattr(args, "covariance_estimator", "sample"),
-            ewma_lambda=getattr(args, "ewma_lambda", 0.94),
-        )
-        if risk_model is not None:
-            from models.risk_lstm import cross_sectional_features, rolling_moments
-
-            extended_raw = returns.to_numpy(dtype=np.float32)[-min_days:]  # (lookback + rolling_window - 1, n_assets)
-            extended = torch.tensor(extended_raw, device=device).unsqueeze(0)  # (1, extended_len, n_assets)
-            weighted = extended * weights.unsqueeze(1)  # (1, extended_len, n_assets) - TODAY's weight, broadcast
-            moments = rolling_moments(weighted, risk_model.rolling_window)      # (1, lookback, 3*n_assets)
-            aligned_returns = weighted[:, risk_model.rolling_window - 1:, :]    # (1, lookback, n_assets)
-            features = torch.cat([aligned_returns, moments], dim=-1)           # (1, lookback, 4*n_assets)
-            if getattr(risk_model, "use_cross_sectional", False):
-                # Same RAW (unweighted) extended window used for moments'
-                # weighted series - see cross_sectional_features' docstring
-                # for why correlation structure uses raw, not weighted, returns.
-                # Computed on CPU regardless of `device`: it uses
-                # torch.linalg.eigvalsh, which MPS does not implement
-                # (confirmed: "aten::_linalg_eigh.eigenvalues... not
-                # currently implemented for the MPS device") - then moved
-                # back to match `features` before concatenating.
-                cross_sectional = cross_sectional_features(extended.cpu(), risk_model.rolling_window).to(device)  # (1, lookback, 3)
-                features = torch.cat([features, cross_sectional], dim=-1)      # (1, lookback, 4*n_assets + 3)
-
-            risk_model.eval()
-            attenuation = risk_model(features, weights)
-            weights = weights * attenuation
-
-    return {pair: float(w) for pair, w in zip(pairs, weights[0].cpu().numpy())}
+        # model(X) returns (mu, sigma), dense over every day in the window
+        # (see PredictionModel's docstring) - only the LAST timestep (the
+        # "decision day") is used here, matching backtest reporting.
+        # probit(mu / (sigma * sigma_hat)) converts them to a CALIBRATED
+        # probability - sigma_hat is the validation-fit standardized-
+        # residual std persisted in the checkpoint (see
+        # evaluate_prediction_model's docstring on calibration); there's
+        # no validation set here to refit it against (this is a single
+        # live window), so the training-time estimate is reused as-is.
+        sigma_hat = getattr(model, "sigma_hat", np.ones(len(pairs), dtype=np.float32))
+        sigma_hat_t = torch.as_tensor(sigma_hat, device=device, dtype=torch.float32)
+        mu, sigma = model(X)
+        probs = probit(mu[:, -1, :] / (sigma[:, -1, :] * sigma_hat_t)).cpu().numpy()
+    # Same abstention rule the backtest metrics used (see
+    # apply_neutral_band): inside the band the model reports exactly 0.5 -
+    # an explicit "no call today", not a weak directional lean.
+    probs = apply_neutral_band(probs, getattr(model, "neutral_band", 0.0))
+    return {pair: float(p) for pair, p in zip(pairs, probs[0])}
 
 
 @app.post("/api/evaluate")
@@ -745,31 +634,23 @@ def evaluate(req: EvaluateRequest) -> dict:
     """Load a previously-trained model (by quant.model_registry name or
     local path) and run it purely for inference - no training happens.
     Returns everything the Evaluation view plots:
-      - pnl: cumulative baseline ("risk-weighted", pre-attenuation) vs
-        with-risk-overlay vs with-risk-overlay-and-transaction-costs vs the
-        inverse-vol ("risk-weighted") benchmark, vol-matched to the model,
-        vs model-minus-benchmark - out-of-sample only.
-      - sharpe: matching Sharpe ratios for each series.
-      - histograms: return distributions for baseline and with-risk.
-      - positions: per-asset portfolio weight over time, out-of-sample.
-      - attenuation: per-asset risk-overlay attenuation over time (only
-        present when a risk_model was given).
-      - coefficients: per-asset coefficient (tanh/sigmoid(logits) - see
-        PortfolioLSTM._weights_from_coefficients) the model applied to the
-        risk-parity baseline each day, over time, out-of-sample - the
-        model's own learned conviction signal, upstream of both the
-        risk-parity baseline (fixed, un-learned) and the risk overlay's
-        attenuation (downstream of the final weight).
-      - latest_weights: the model's recommended allocation for the next
-        (not-yet-realized) day, using the freshest available data.
+      - hit_rate: per-asset directional hit rate for train/val/test.
+      - confusion_matrix: per-asset TP/FP/TN/FN + accuracy/precision/
+        recall/specificity/F1 for train/val/test.
+      - cumulative_returns: per-asset cumulative (single-day-ahead) return
+        path for train/val/test, with a parallel per-day hit/miss boolean
+        array for coloring.
+      - latest_probabilities: the model's predicted probability per asset
+        for the next (not-yet-realized) `direction_horizon`-day outcome,
+        using the freshest available data.
 
     `pairs` and `lookback` are deliberately NOT accepted from `req` - both
     are recovered from the loaded model's own checkpoint (see
     models/portfolio_lstm.py's load_pipeline), since they're properties of
     the trained model, not free evaluation parameters. Only `years` (how
     much history to fetch) is caller-controlled; if it's not enough to
-    cover the model's own sequence length, load_pipeline/_predict_latest_weights
-    raise a ValueError, turned into a 400 below.
+    cover the model's own sequence length, load_pipeline/
+    _predict_latest_probabilities raise a ValueError, turned into a 400 below.
     """
     args = Namespace(**{
         **DEFAULT_CONFIG,
@@ -778,101 +659,50 @@ def evaluate(req: EvaluateRequest) -> dict:
         "years": req.years,
         "train_frac": req.train_frac,
         "test_frac": req.test_frac,
-        "target_vol": req.target_vol,
-        "load_portfolio": req.portfolio_model,
-        "load_risk": req.risk_model,
+        "load_model": req.model_name,
     })
 
     try:
-        if req.risk_model:
-            from models.risk_lstm import run_pipeline_multi_seed as run_risk_overlay_pipeline
-
-            result = run_risk_overlay_pipeline(args)  # load_portfolio+load_risk set -> pure inference, no training
-            pairs = result.portfolio_result.pairs  # the model's own stored pairs, restored by load_pipeline
-
-            # result.weights_val/next_returns_val/dates_val are ALIGNED to
-            # the risk model's own valid range (make_risk_sequences drops
-            # the first `risk_rolling_window - 1` samples) - NOT
-            # result.portfolio_result's own (longer) arrays, which would
-            # silently misalign against result.attenuation_val's length.
-            final_weights_val = result.weights_val * result.attenuation_val
-            net_returns_val = apply_transaction_costs(
-                final_weights_val, result.returns_val_scaled, req.transaction_cost,
-            )
-
-            latest_weights = _predict_latest_weights(
-                args, result.portfolio_result.model, result.risk_model,
-            )
-
-            # "Model" here is the FINAL, realistic series (attenuated AND net
-            # of transaction costs) - compared against the inverse-vol
-            # ("risk-weighted"), un-learned benchmark (see
-            # portfolio_lstm.inverse_vol_benchmark_returns/vol_match_benchmark),
-            # vol-matched to THIS model on this same out-of-sample period.
-            model_minus_benchmark_val = net_returns_val - result.benchmark_returns_val
-
-            return {
-                "pairs": pairs,
-                "latest_weights": latest_weights,
-                "pnl": _series_payload(
-                    result.dates_val,
-                    baseline=np.cumsum(result.returns_val_raw),
-                    with_risk=np.cumsum(result.returns_val_scaled),
-                    with_risk_and_costs=np.cumsum(net_returns_val),
-                    benchmark=np.cumsum(result.benchmark_returns_val),
-                    model_minus_benchmark=np.cumsum(model_minus_benchmark_val),
-                ),
-                "sharpe": {
-                    "baseline": float(sharpe_ratio(torch.tensor(result.returns_val_raw))),
-                    "with_risk": float(sharpe_ratio(torch.tensor(result.returns_val_scaled))),
-                    "with_risk_and_costs": float(sharpe_ratio(torch.tensor(net_returns_val))),
-                    "benchmark": float(sharpe_ratio(torch.tensor(result.benchmark_returns_val))),
-                },
-                "histograms": {
-                    "baseline": _histogram(result.returns_val_raw),
-                    "with_risk": _histogram(result.returns_val_scaled),
-                },
-                "positions": _positions_payload(result.dates_val, pairs, result.weights_val),
-                "attenuation": _positions_payload(result.dates_val, pairs, result.attenuation_val),
-                "coefficients": _positions_payload(result.dates_val, pairs, result.coefficients_val),
-                "asset_returns": _asset_returns_payload(pairs, result.dates_val, result.next_returns_val),
-            }
-
         from models.portfolio_lstm import run_pipeline_multi_seed
 
-        result = run_pipeline_multi_seed(args)  # load_portfolio set -> pure inference, no training
+        result = run_pipeline_multi_seed(args)  # load_model set -> pure inference, no training
         pairs = result.pairs
-        latest_weights = _predict_latest_weights(args, result.model)
-
-        # No risk overlay here, so "model" is the vol-targeted series
-        # (labeled "baseline" above for historical reasons - see the
-        # docstring) - compared against the inverse-vol benchmark,
-        # vol-matched to it on this same out-of-sample period.
-        model_minus_benchmark_val = result.returns_val - result.benchmark_returns_val
+        latest_probabilities = _predict_latest_probabilities(args, result.model)
 
         return {
             "pairs": pairs,
-            "latest_weights": latest_weights,
-            "pnl": _series_payload(
-                result.dates_val,
-                baseline=np.cumsum(result.returns_val),
-                benchmark=np.cumsum(result.benchmark_returns_val),
-                model_minus_benchmark=np.cumsum(model_minus_benchmark_val),
-            ),
-            "sharpe": {
-                "baseline": float(sharpe_ratio(torch.tensor(result.returns_val))),
-                "benchmark": float(sharpe_ratio(torch.tensor(result.benchmark_returns_val))),
+            "latest_probabilities": latest_probabilities,
+            "neutral_band": result.neutral_band,  # initial value for the frontend's neutral-band control - see start_training's result dict
+            "hit_rate": {
+                "train": _hit_rate_payload(pairs, result.hit_rate_train),
+                "val": _hit_rate_payload(pairs, result.hit_rate_val),
+                "test": _hit_rate_payload(pairs, result.hit_rate_test),
             },
-            "histograms": {"baseline": _histogram(result.returns_val)},
-            "positions": _positions_payload(result.dates_val, pairs, result.weights_val),
-            "attenuation": None,
-            "coefficients": _positions_payload(result.dates_val, pairs, result.coefficients_val),
-            "asset_returns": _asset_returns_payload(pairs, result.dates_val, result.next_returns_val),
+            "confusion_matrix": {
+                "train": _confusion_matrix_payload(pairs, result.probabilities_train, result.direction_labels_train, result.neutral_band),
+                "val": _confusion_matrix_payload(pairs, result.probabilities_val, result.direction_labels_val, result.neutral_band),
+                "test": _confusion_matrix_payload(pairs, result.probabilities_test, result.direction_labels_test, result.neutral_band),
+            },
+            "cumulative_returns": {
+                "train": _cumulative_return_payload(result.dates_train, pairs, result.next_returns_train),
+                "val": _cumulative_return_payload(result.dates_val, pairs, result.next_returns_val),
+                "test": _cumulative_return_payload(result.dates_test, pairs, result.next_returns_test),
+            },
+            "probabilities": {
+                "train": _probability_payload(result.dates_train, pairs, result.probabilities_train, result.direction_labels_train),
+                "val": _probability_payload(result.dates_val, pairs, result.probabilities_val, result.direction_labels_val),
+                "test": _probability_payload(result.dates_test, pairs, result.probabilities_test, result.direction_labels_test),
+            },
+            "distribution": {
+                "train": _distribution_payload(pairs, result.z_labels_train, result.mu_train, result.sigma_train),
+                "val": _distribution_payload(pairs, result.z_labels_val, result.mu_val, result.sigma_val),
+                "test": _distribution_payload(pairs, result.z_labels_test, result.mu_test, result.sigma_test),
+            },
         }
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=f"Model not found: {exc}") from exc
     except ValueError as exc:
         # e.g. "not enough history for this model's sequence length" - a
-        # clear, actionable error from load_pipeline/_predict_latest_weights,
-        # not a 500.
+        # clear, actionable error from load_pipeline/
+        # _predict_latest_probabilities, not a 500.
         raise HTTPException(status_code=400, detail=str(exc)) from exc

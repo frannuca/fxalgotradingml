@@ -1,33 +1,48 @@
-"""Single entry point for the FX portfolio / risk-overlay pipeline.
+"""Single entry point for the FX direction-prediction pipeline.
 
 Usage
 -----
     python main.py path/to/config.json
 
-The JSON file is the ONLY input - every training/evaluation option (data,
-architecture, regularization, volatility targeting, the risk overlay,
-multi-seed restarts, save/load, plot output paths) is a key in it. Any key
+The JSON file is the ONLY input - every option (data, architecture,
+regularization, multi-seed restarts, save/load) is a key in it. Any key
 left out falls back to models.portfolio_lstm.DEFAULT_CONFIG's default.
 Only "pairs" has no default and must always be provided.
 
-Example config - risk overlay on top of an ensemble of 5 PortfolioLSTM
-restarts, persisted to the database as well as to a local .pt file:
+Example config - carry and a moving-average-crossover feature added, one
+pair (EURUSD) also linked to GBPUSD/USDJPY's own features, 5 restarts,
+persisted to the database as well as to a local .pt file:
 
     {
         "pairs": ["EURUSD", "GBPUSD", "USDJPY"],
         "lookback": 30,
-        "position_mode": "long_short",
-        "epochs": 300,
-        "target_vol": 0.20,
-        "risk_overlay": true,
-        "risk_hidden_size": 16,
-        "risk_epochs": 200,
-        "risk_rolling_window": 10,
+        "direction_horizon": 5,
+        "features": ["log_return", "vol", "skew", "kurt", "carry", "cma"],
+        "cma_windows": [[10, 50]],
+        "cross_pairs": {"EURUSD": ["GBPUSD", "USDJPY"]},
         "n_seeds": 5,
-        "restart_strategy": "ensemble",
         "save_db": true,
-        "model_description": "EUR/GBP/JPY majors, 30d lookback, ensemble-of-5",
-        "output": "models/risk_pnl.png"
+        "model_description": "EUR/GBP/JPY majors, 30d lookback, carry + cma"
+    }
+
+`"features"` (see models/portfolio_lstm.py's FEATURE_CATALOG) selects
+which per-pair input channels to build; `"cma_windows"` is only used if
+`"cma"` is in `"features"`. `"cross_pairs"` (a `{pair: [other_pair, ...]}`
+dict) is the ONLY way cross-asset information ever reaches a pair's own
+LSTM - by DEFAULT (`{}`) every pair's LSTM sees ONLY its own features,
+fully independent; a pair not listed as a `cross_pairs` key stays fully
+independent even if OTHER pairs are configured.
+
+"bce_weight" also accepts a LIST instead of a single number, to SWEEP it
+alongside the seeds (see models/portfolio_lstm.py's
+run_pipeline_multi_seed): every value is trained under every seed (same
+initial weights across the sweep, so only the value differs) and
+whichever validated best wins, per seed and then overall -
+
+    {
+        "pairs": ["EURUSD", "GBPUSD", "USDJPY"],
+        "n_seeds": 5,
+        "bce_weight": [1.0, 1.5, 1.75, 2.0, 3.0]
     }
 
 A minimal config just needs "pairs" - everything else takes its default:
@@ -36,28 +51,25 @@ A minimal config just needs "pairs" - everything else takes its default:
 
 To load a previously-trained model instead of training (see
 models/portfolio_lstm.py's DEFAULT_CONFIG and data/model_registry.py),
-set "load_portfolio" (and/or "load_risk") to either a local .pt file path
-or a name previously saved with "save_db": true.
+set "load_model" to either a local .pt file path or a name previously
+saved with "save_db": true.
 
 What happens, in order:
 1. Load the config, merge over defaults, validate "pairs" is present.
-2. Train (or load) PortfolioLSTM via models/portfolio_lstm.py's
-   run_pipeline_multi_seed - completely independent of the risk overlay,
-   whatever "n_seeds"/"restart_strategy"/"objective" apply, they apply to
-   PortfolioLSTM alone. If "risk_overlay" is true, that (now fixed, frozen)
-   result is then handed to models/risk_lstm.py's run_pipeline_multi_seed,
-   which trains (or loads) RiskLSTM SEPARATELY on top of it to improve its
-   realized Sharpe (see that module's docstring) - the risk overlay never
-   feeds back into how PortfolioLSTM itself was trained.
+2. Train (or load) the PredictionModel via models/portfolio_lstm.py's
+   run_pipeline_multi_seed - N independent per-asset LSTMs (by default
+   each sees only its own features; "cross_pairs" opts specific pairs into
+   also seeing specific others'), each trained with its OWN optimizer and
+   loss, fully independently of every other asset - see that module's own
+   docstring.
 3. Save whatever was freshly trained to a local .pt file, and, if
-   "save_db" is true, also to Postgres (quant.model_registry) under a name
-   derived from the config's characteristics (see portfolio_model_name()/
-   risk_model_name()) - printed so it can be reused in a later config's
-   "load_portfolio"/"load_risk".
-4. Print Sharpe ratios (raw / vol-targeted / attenuated as applicable).
-5. Save plots: cumulative PnL always; for a risk overlay, also
-   position-vs-attenuation and the out-of-sample vol-matched 3-way
-   comparison.
+   "save_db" is true, also to Postgres (quant.model_registry) under a
+   name derived from the config's characteristics (see
+   prediction_model_name()) - printed so it can be reused in a later
+   config's "load_model".
+4. Print per-asset hit rate and the full confusion-matrix breakdown
+   (precision/recall/specificity/F1, plus abstained/coverage - see
+   apply_neutral_band) for train, validation, and test.
 """
 
 from __future__ import annotations
@@ -68,13 +80,10 @@ from argparse import Namespace
 
 from models.portfolio_lstm import (
     DEFAULT_CONFIG,
-    portfolio_model_name,
-    run_pipeline_multi_seed as run_portfolio_pipeline,
+    prediction_model_name,
+    run_pipeline_multi_seed,
 )
-from models.portfolio_postprocess import (
-    plot_pnl as plot_portfolio_pnl,
-    print_sharpe_ratios as print_portfolio_sharpe_ratios,
-)
+from models.portfolio_postprocess import print_confusion_matrices, print_hit_rates
 
 
 def load_config(path: str) -> Namespace:
@@ -90,76 +99,29 @@ def load_config(path: str) -> Namespace:
     return Namespace(**config)
 
 
-def run_portfolio_only(args: Namespace) -> None:
-    """Train (or load) PortfolioLSTM alone: save, print Sharpe, plot PnL."""
-    result = run_portfolio_pipeline(args)
+def run(args: Namespace) -> None:
+    """Train (or load) the PredictionModel: save, print hit rate and
+    confusion matrices."""
+    result = run_pipeline_multi_seed(args)
 
-    if not args.load_portfolio:
+    if not args.load_model:
         result.model.save_model(
             x_mean=result.x_mean, x_std=result.x_std, pairs=result.pairs, lookback=result.lookback,
+            features=getattr(args, "features", None), cma_windows=getattr(args, "cma_windows", None),
+            sigma_hat=result.sigma_hat, neutral_band=result.neutral_band,
         )
     if args.save_db:
-        name = portfolio_model_name(args)
+        name = prediction_model_name(args)
         result.model.save_to_db(
             name, x_mean=result.x_mean, x_std=result.x_std, pairs=result.pairs, lookback=result.lookback,
+            features=getattr(args, "features", None), cma_windows=getattr(args, "cma_windows", None),
             description=args.model_description,
+            sigma_hat=result.sigma_hat, neutral_band=result.neutral_band,
         )
-        print(f"Persisted portfolio model to database as {name!r}")
+        print(f"Persisted model to database as {name!r}")
 
-    print_portfolio_sharpe_ratios(result)
-    plot_portfolio_pnl(result, args.output)
-
-
-def run_with_risk_overlay(args: Namespace) -> None:
-    """Train (or load) PortfolioLSTM, then train (or load) RiskLSTM
-    SEPARATELY on top of it (see models/risk_lstm.py's run_pipeline_multi_seed):
-    save, print Sharpe, plot PnL + position/attenuation + the vol-matched
-    comparison.
-
-    Deferred import: models/risk_lstm.py imports from models/portfolio_lstm.py
-    at module load time, so importing it back at this module's top level
-    would be a circular import.
-    """
-    from models.risk_lstm import risk_model_name, run_pipeline_multi_seed as run_risk_overlay_pipeline
-    from models.risk_postprocess import (
-        plot_pnl as plot_risk_pnl,
-        plot_position_and_scaling,
-        plot_return_histograms,
-        plot_transaction_cost_pnl,
-        plot_vol_matched_pnl,
-        print_sharpe_ratios as print_risk_sharpe_ratios,
-    )
-
-    result = run_risk_overlay_pipeline(args)
-
-    if not args.load_portfolio:
-        result.portfolio_result.model.save_model(
-            x_mean=result.portfolio_result.x_mean, x_std=result.portfolio_result.x_std,
-            pairs=result.portfolio_result.pairs, lookback=result.portfolio_result.lookback,
-        )
-    if not args.load_risk:
-        result.risk_model.save_model(pairs=result.portfolio_result.pairs)
-    if args.save_db:
-        portfolio_name = portfolio_model_name(args)
-        result.portfolio_result.model.save_to_db(
-            portfolio_name,
-            x_mean=result.portfolio_result.x_mean, x_std=result.portfolio_result.x_std,
-            pairs=result.portfolio_result.pairs, lookback=result.portfolio_result.lookback,
-            description=args.model_description,
-        )
-        risk_name = risk_model_name(args)
-        result.risk_model.save_to_db(
-            risk_name, pairs=result.portfolio_result.pairs, description=args.model_description,
-        )
-        print(f"Persisted portfolio model to database as {portfolio_name!r}")
-        print(f"Persisted risk model to database as {risk_name!r}")
-
-    print_risk_sharpe_ratios(result)
-    plot_risk_pnl(result, args.output)
-    plot_position_and_scaling(result, args.position_output)
-    plot_vol_matched_pnl(result, args.vol_matched_output, target_vol=args.target_vol)
-    plot_return_histograms(result, args.histogram_output)
-    plot_transaction_cost_pnl(result, args.transaction_cost_output, transaction_cost_bps=args.transaction_cost)
+    print_hit_rates(result)
+    print_confusion_matrices(result)
 
 
 def main() -> None:
@@ -168,11 +130,7 @@ def main() -> None:
         sys.exit(1)
 
     args = load_config(sys.argv[1])
-
-    if args.risk_overlay:
-        run_with_risk_overlay(args)
-    else:
-        run_portfolio_only(args)
+    run(args)
 
 
 if __name__ == "__main__":

@@ -1,79 +1,63 @@
-"""Postprocessing for the LSTM portfolio allocator: plot cumulative PnL and
-print the Sharpe ratio, for both the in-sample (train) and out-of-sample
-(validation) periods.
+"""Postprocessing for the direction predictor: print per-asset hit rate
+and confusion-matrix metrics for train/validation/test.
 
 Kept in its own file so training/data logic (models/portfolio_lstm.py)
-stays separate from presentation (matplotlib, printouts). This module is a
-LIBRARY - it has no CLI of its own; main.py at the repo root calls these
-functions after running models/portfolio_lstm.py's or models/risk_lstm.py's
-pipeline, so the plot and Sharpe ratio always reflect the exact model that
-was just trained/loaded.
+stays separate from presentation (printouts). This module is a LIBRARY -
+it has no CLI of its own; main.py at the repo root calls these functions
+after running models/portfolio_lstm.py's pipeline, so the printout always
+reflects the exact model that was just trained/loaded.
+
+Neutral band: result.probabilities_* may contain exact 0.5 values - the
+model's explicit ABSTENTIONS (see portfolio_lstm.apply_neutral_band).
+Every metric printed here is computed over decided samples only, with a
+`coverage` column showing how often the model made a call at all -
+accuracy and coverage must always be read together.
 """
 
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 
-import matplotlib.pyplot as plt
-import numpy as np
-import torch
+from models.portfolio_lstm import PredictionResult, confusion_matrix_metrics
 
-from models.portfolio_lstm import PortfolioResult, sharpe_ratio
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
 
-def print_sharpe_ratios(result: PortfolioResult) -> None:
-    """Print in-sample and out-of-sample Sharpe ratio and cumulative PnL."""
-    train_sharpe = float(sharpe_ratio(torch.tensor(result.returns_train)))
-    val_sharpe = float(sharpe_ratio(torch.tensor(result.returns_val)))
-    print(f"In-sample (train) Sharpe ratio:      {train_sharpe:.3f} | cumulative PnL {result.returns_train.sum():.4f}")
-    print(f"Out-of-sample (validation) Sharpe ratio: {val_sharpe:.3f} | cumulative PnL {result.returns_val.sum():.4f}")
+def print_hit_rates(result: PredictionResult) -> None:
+    """Print per-asset hit rate (over DECIDED samples - see
+    portfolio_lstm._decided_hit_rate) for all three splits, plus the mean
+    across assets."""
+    print(f"{'pair':<10}{'train':>8}{'val':>8}{'test':>8}")
+    for i, pair in enumerate(result.pairs):
+        print(f"{pair:<10}{result.hit_rate_train[i]:>8.3f}{result.hit_rate_val[i]:>8.3f}{result.hit_rate_test[i]:>8.3f}")
+    print(f"{'mean':<10}{result.hit_rate_train.mean():>8.3f}{result.hit_rate_val.mean():>8.3f}{result.hit_rate_test.mean():>8.3f}")
+    if result.neutral_band > 0:
+        print(f"(hit rates exclude abstentions: neutral band = 0.5 +/- {result.neutral_band:.3f})")
 
 
-def _suffixed_path(path: str, suffix: str) -> str:
-    """Insert `suffix` before the file extension, e.g.
-    ("pnl.png", "insample") -> "pnl_insample.png"."""
-    p = Path(path)
-    return str(p.with_name(f"{p.stem}_{suffix}{p.suffix}"))
-
-
-def _plot_single(dates, cumulative_pnl, title: str, output_path: str) -> None:
-    """Draw one cumulative-PnL line chart and save it to `output_path`."""
-    fig, ax = plt.subplots(figsize=(12, 5))
-    ax.plot(dates, cumulative_pnl, color="black", linewidth=1)
-    ax.axhline(0, color="gray", linewidth=0.8, linestyle="--")
-    ax.set_title(title)
-    ax.set_xlabel("date")
-    ax.set_ylabel("cumulative log-return P&L")
-    fig.autofmt_xdate()
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=150)
-    logger.info("Saved plot to %s", output_path)
-
-
-def plot_pnl(result: PortfolioResult, output_path: str) -> None:
-    """Plot cumulative PnL (cumsum of realized portfolio log returns) as two
-    SEPARATE figures - one for the in-sample (train) period, one for the
-    out-of-sample (validation) period - each saved to its own file derived
-    from `output_path`.
-    """
-    train_sharpe = float(sharpe_ratio(torch.tensor(result.returns_train)))
-    val_sharpe = float(sharpe_ratio(torch.tensor(result.returns_val)))
-
-    _plot_single(
-        dates=result.dates_train,
-        cumulative_pnl=np.cumsum(result.returns_train),
-        title=f"In-sample (train) cumulative PnL - Sharpe {train_sharpe:.2f}",
-        output_path=_suffixed_path(output_path, "insample"),
-    )
-    _plot_single(
-        dates=result.dates_val,
-        cumulative_pnl=np.cumsum(result.returns_val),
-        title=f"Out-of-sample (validation) cumulative PnL - Sharpe {val_sharpe:.2f}",
-        output_path=_suffixed_path(output_path, "outsample"),
-    )
-
-
+def print_confusion_matrices(result: PredictionResult) -> None:
+    """Print the full confusion-matrix breakdown (counts + derived
+    metrics: accuracy, precision, recall, specificity, F1) for each split,
+    one asset per row - over DECIDED samples only, with `abst` (abstained
+    count) and `cover` (coverage) columns showing how often the model
+    actually made a call (see this module's docstring)."""
+    band = result.neutral_band
+    splits = [
+        ("train", result.probabilities_train, result.direction_labels_train),
+        ("validation", result.probabilities_val, result.direction_labels_val),
+        ("test", result.probabilities_test, result.direction_labels_test),
+    ]
+    for split_name, probs, labels in splits:
+        print(f"\n--- {split_name} ---")
+        metrics = confusion_matrix_metrics(probs, labels, neutral_band=band)
+        print(
+            f"{'pair':<10}{'TP':>6}{'FP':>6}{'TN':>6}{'FN':>6}{'abst':>6}"
+            f"{'cover':>8}{'acc':>8}{'prec':>8}{'recall':>8}{'spec':>8}{'f1':>8}"
+        )
+        for i, pair in enumerate(result.pairs):
+            print(
+                f"{pair:<10}{metrics['tp'][i]:>6}{metrics['fp'][i]:>6}{metrics['tn'][i]:>6}{metrics['fn'][i]:>6}"
+                f"{metrics['abstained'][i]:>6}{metrics['coverage'][i]:>8.3f}"
+                f"{metrics['accuracy'][i]:>8.3f}{metrics['precision'][i]:>8.3f}{metrics['recall'][i]:>8.3f}"
+                f"{metrics['specificity'][i]:>8.3f}{metrics['f1'][i]:>8.3f}"
+            )

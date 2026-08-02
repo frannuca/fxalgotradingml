@@ -22,14 +22,13 @@ logger = logging.getLogger(__name__)
 def build_model_name(model_type: str, **characteristics: object) -> str:
     """Build a deterministic model name from `model_type` plus whatever
     characteristic arguments distinguish this training run - e.g. for a
-    portfolio model: pairs, weight_scheme, lookback, hidden_size,
-    target_vol; for a risk model, also risk_hidden_size, risk_rolling_window,
-    max_attenuation.
+    prediction model (see models/portfolio_lstm.py's prediction_model_name):
+    pairs, lookback, direction_horizon, features, hidden_size.
 
     Sorted by key so argument order never changes the resulting name, and
     list/tuple values (e.g. `pairs`) are joined so the name stays a single
     readable token - e.g.
-        portfolio_hidden_size=32_lookback=30_pairs=EURUSD-GBPUSD_target_vol=0.2_weight_scheme=softmax
+        prediction_direction_horizon=5_features=kurt-log_return-skew-vol_lookback=30_pairs=EURUSD-GBPUSD
     """
     parts = [model_type]
     for key in sorted(characteristics):
@@ -43,8 +42,8 @@ def build_model_name(model_type: str, **characteristics: object) -> str:
 def save_model_blob(name: str, blob: bytes, model_type: str, description: str = "") -> None:
     """Upsert a serialized model checkpoint into quant.model_registry.
     `blob` is the raw bytes of a torch.save() checkpoint (identical format
-    to the local .pt file - see models/portfolio_lstm.py's/models/risk_lstm.py's
-    save_model() methods).
+    to the local .pt file - see models/portfolio_lstm.py's PredictionModel.
+    save_model() method).
     """
     with get_connection() as conn, conn.cursor() as cur:
         cur.execute(
