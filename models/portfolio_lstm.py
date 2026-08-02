@@ -88,6 +88,7 @@ from torch import nn
 
 from data.db import get_time_series, upsert_pairs
 from data.fx_downloader import FXDownloader, MAJOR_FX_PAIRS
+from models.portfolio_pnl import DEFAULT_TARGET_VOL
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -294,34 +295,49 @@ def rolling_moment_features(returns: pd.DataFrame, window: int) -> pd.DataFrame:
 #: Every feature build_feature_dataframe knows how to produce, in this
 #: FIXED canonical order (a caller's `features` list is a SELECTION out of
 #: this catalog, not an ordering directive - avoids ambiguity over where
-#: "cma"'s multiple expanded columns would land relative to the rest).
-#: "cma" is special: it contributes one channel PER (short, long) window
-#: pair in `cma_windows`, not just one - see n_channels_per_pair.
-FEATURE_CATALOG: tuple[str, ...] = ("log_return", "vol", "skew", "kurt", "carry", "cma")
+#: "cma"'s/"bandpass"'s multiple expanded columns would land relative to
+#: the rest). "cma" and "bandpass" are both special: each contributes one
+#: channel PER (short, long) window pair in cma_windows/bandpass_windows
+#: respectively, not just one - see n_channels_per_pair.
+FEATURE_CATALOG: tuple[str, ...] = ("log_return", "vol", "skew", "kurt", "carry", "cma", "bandpass")
 
 #: Default feature selection - matches this module's original always-on
-#: set (raw return + rolling vol/skew/kurtosis), with carry and CMAs both
-#: opt-in.
+#: set (raw return + rolling vol/skew/kurtosis), with carry/cma/bandpass
+#: all opt-in.
 DEFAULT_FEATURES: list[str] = ["log_return", "vol", "skew", "kurt"]
 
 #: Default (short, long) trailing windows for "cma" (see
 #: cross_moving_averages) when "cma" is selected but no windows are given.
 DEFAULT_CMA_WINDOWS: list[tuple[int, int]] = [[10, 50]]
 
+#: Default (short, long) PERIODS (days) for "bandpass" (see
+#: butterworth_bandpass_features) when "bandpass" is selected but no
+#: windows are given.
+DEFAULT_BANDPASS_WINDOWS: list[tuple[int, int]] = [[10, 50]]
 
-def n_channels_per_pair(features: list[str], cma_windows: list | None = None) -> int:
+#: Default Butterworth filter order (see butterworth_bandpass_features) -
+#: higher = steeper rolloff/more selective, but more phase lag and more
+#: ringing; lower = faster reaction, less noise rejection.
+DEFAULT_BANDPASS_ORDER: int = 3
+
+
+def n_channels_per_pair(
+    features: list[str], cma_windows: list | None = None, bandpass_windows: list | None = None,
+) -> int:
     """How many input channels build_feature_dataframe produces PER PAIR
     for this feature selection: every base feature in FEATURE_CATALOG
-    contributes exactly one channel; "cma" instead contributes one channel
-    PER (short, long) window pair in `cma_windows` (zero if "cma" isn't
-    selected, regardless of what `cma_windows` contains).
+    contributes exactly one channel; "cma"/"bandpass" instead each
+    contribute one channel PER (short, long) window pair in
+    `cma_windows`/`bandpass_windows` respectively (zero if that feature
+    isn't selected, regardless of what its windows list contains).
     """
     unknown = set(features) - set(FEATURE_CATALOG)
     if unknown:
         raise ValueError(f"Unknown feature(s) {sorted(unknown)} - choose from {FEATURE_CATALOG}")
-    base = sum(1 for f in features if f != "cma")
+    base = sum(1 for f in features if f not in ("cma", "bandpass"))
     cma_count = len(cma_windows or []) if "cma" in features else 0
-    return base + cma_count
+    bandpass_count = len(bandpass_windows or []) if "bandpass" in features else 0
+    return base + cma_count + bandpass_count
 
 
 def cross_moving_averages(returns: pd.DataFrame, cma_windows: list) -> dict:
@@ -333,6 +349,11 @@ def cross_moving_averages(returns: pd.DataFrame, cma_windows: list) -> dict:
     crossing above a slow one signals a new uptrend). Purely trailing
     (min_periods=window, no bfill - same "exclude rather than paper over"
     policy as make_sequences' trailing_vol), so it never looks ahead.
+
+    See butterworth_bandpass_features for a faster-reacting alternative -
+    an SMA difference is a crude, high-lag approximation of a band-pass
+    filter; a proper Butterworth design gets comparable noise rejection
+    with less lag, at the cost of being harder to reason about by eye.
 
     Returns a dict keyed by (pair, short, long) -> pd.Series aligned to
     `returns`'s own index.
@@ -349,6 +370,72 @@ def cross_moving_averages(returns: pd.DataFrame, cma_windows: list) -> dict:
     return out
 
 
+def butterworth_bandpass_features(returns: pd.DataFrame, bandpass_windows: list, order: int = 3) -> dict:
+    """For each (short_period, long_period) pair - DAYS, the band of cycle
+    lengths to pass, same short/long framing as cross_moving_averages' own
+    windows - a CAUSAL Butterworth band-pass filter of each pair's log
+    returns, via `scipy.signal.lfilter` applied FORWARD-ONLY.
+
+    Deliberately NOT `scipy.signal.filtfilt`: filtfilt is the usual way
+    Butterworth filters get applied (it runs the filter forward then
+    backward to cancel phase distortion entirely), but that's NON-CAUSAL -
+    the backward pass uses samples AFTER the point being filtered, which
+    would leak future returns into today's feature value. `lfilter` keeps
+    every output strictly a function of past and current samples only,
+    the same causality guarantee every other feature/label in this module
+    (trailing_vol, rolling_moment_features, cross_moving_averages,
+    AssetLSTM's own causal attention mask) already has to hold - at the
+    cost of some unavoidable phase lag, since a genuinely causal filter
+    can never fully cancel it. It still reacts FASTER than
+    cross_moving_averages (an SMA-difference, itself a crude high-lag
+    band-pass) for a comparable amount of noise rejection, because a
+    proper Butterworth design achieves its passband/stopband shape far
+    more efficiently than differencing two plain averages - that's the
+    actual point of using one.
+
+    `short_period` sets the HIGH cutoff (the fastest cycle length that
+    still passes); `long_period` sets the LOW cutoff (cycles slower than
+    this - i.e. the long-run trend/DC component - are removed).
+    `order` (default 3, see DEFAULT_BANDPASS_ORDER) trades lag against
+    selectivity: higher = steeper rolloff and more noise rejection but
+    more phase lag and more ringing; lower = faster reaction, noisier.
+
+    The first `long_period` rows of each column are set to NaN (the
+    filter's own transient response hasn't had enough history to settle
+    over that little data yet - the same "need at least this many days"
+    logic as a `long_period`-day rolling window) - left for the caller
+    (build_feature_dataframe) to ffill/fillna(0.0), same as every other
+    rolling-window input feature.
+
+    Returns a dict keyed by (pair, short_period, long_period) ->
+    pd.Series aligned to `returns`'s own index.
+    """
+    from scipy.signal import butter, lfilter
+
+    nyquist = 0.5  # cycles/day, for once-daily-sampled data (sampling rate = 1/day)
+    out = {}
+    for short_period, long_period in bandpass_windows:
+        if not (0 < short_period < long_period):
+            raise ValueError(
+                f"bandpass_windows short period ({short_period}) must be > 0 and < long period ({long_period})"
+            )
+        low = (1.0 / long_period) / nyquist
+        high = (1.0 / short_period) / nyquist
+        if not (0 < low < high < 1):
+            raise ValueError(
+                f"bandpass_windows [{short_period}, {long_period}] gives an invalid normalized passband "
+                f"({low:.4f}, {high:.4f}) - short_period must be > {1 / nyquist:.0f} days (the Nyquist limit for "
+                f"daily data), and long_period must be finite."
+            )
+        b, a = butter(order, [low, high], btype="bandpass")
+        for pair in returns.columns:
+            filtered = lfilter(b, a, returns[pair].to_numpy(dtype=np.float64))
+            series = pd.Series(filtered, index=returns.index, dtype=np.float32)
+            series.iloc[:long_period] = np.nan
+            out[(pair, short_period, long_period)] = series
+    return out
+
+
 def build_feature_dataframe(
     returns: pd.DataFrame,
     pairs: list[str],
@@ -356,12 +443,15 @@ def build_feature_dataframe(
     rolling_stats_window: int,
     cma_windows: list,
     years: int,
+    bandpass_windows: list | None = None,
+    bandpass_order: int = DEFAULT_BANDPASS_ORDER,
 ) -> pd.DataFrame:
     """Build PredictionModel's actual (wider) input feature set: for each
     pair, in order, whichever of [raw log return, rolling vol, rolling
-    skew, rolling kurtosis, carry, cma...] are selected in `features` (see
-    FEATURE_CATALOG for the fixed column order) - deliberately ASSET-MAJOR
-    (all of one asset's channels together, then the next asset's).
+    skew, rolling kurtosis, carry, cma, bandpass...] are selected in
+    `features` (see FEATURE_CATALOG for the fixed column order) -
+    deliberately ASSET-MAJOR (all of one asset's channels together, then
+    the next asset's).
 
     Which of these channels actually feed a given asset's OWN AssetLSTM is
     a SEPARATE question, decided by `cross_pairs` at the PredictionModel
@@ -370,10 +460,12 @@ def build_feature_dataframe(
     down to what one asset's LSTM actually sees happens later, in
     PredictionModel.forward().
     """
-    n_channels = n_channels_per_pair(features, cma_windows)
+    bandpass_windows = bandpass_windows or []
+    n_channels = n_channels_per_pair(features, cma_windows, bandpass_windows)
     moments = rolling_moment_features(returns, rolling_stats_window) if any(f in features for f in ("vol", "skew", "kurt")) else None
     carry = load_carry(pairs, years, returns.index) if "carry" in features else None
     cmas = cross_moving_averages(returns, cma_windows) if "cma" in features else None
+    bandpasses = butterworth_bandpass_features(returns, bandpass_windows, bandpass_order) if "bandpass" in features else None
 
     features_df = pd.DataFrame(index=returns.index)
     for pair in pairs:
@@ -390,6 +482,9 @@ def build_feature_dataframe(
         if "cma" in features:
             for short, long_ in cma_windows:
                 features_df[f"{pair}_cma_{short}_{long_}"] = cmas[(pair, short, long_)]
+        if "bandpass" in features:
+            for short, long_ in bandpass_windows:
+                features_df[f"{pair}_bp_{short}_{long_}"] = bandpasses[(pair, short, long_)]
 
     # Rolling-window features leave NaN at the very start (not enough
     # trailing history yet) - forward-fill (for any mid-series gaps) then
@@ -733,6 +828,8 @@ class PredictionModel(nn.Module):
         self, x_mean: np.ndarray, x_std: np.ndarray, pairs: list[str], lookback: int,
         features: list[str] | None = None, cma_windows: list | None = None,
         sigma_hat: np.ndarray | None = None, neutral_band: float = 0.0,
+        target_vol: float = DEFAULT_TARGET_VOL,
+        bandpass_windows: list | None = None, bandpass_order: int = DEFAULT_BANDPASS_ORDER,
     ) -> dict:
         """Build the checkpoint dict shared by save_model() (-> local file)
         and save_to_db() (-> quant.model_registry blob).
@@ -774,11 +871,19 @@ class PredictionModel(nn.Module):
             "lookback": lookback,
             "features": list(features) if features is not None else list(DEFAULT_FEATURES),
             "cma_windows": [list(w) for w in (cma_windows or [])],
+            "bandpass_windows": [list(w) for w in (bandpass_windows or [])],
+            "bandpass_order": int(bandpass_order),
             "sigma_hat": torch.as_tensor(sigma_hat if sigma_hat is not None else np.ones(self.n_assets, dtype=np.float32)),
             # Half-width of the abstention region around p=0.5 (see
             # apply_neutral_band) - persisted so live inference abstains
             # exactly the way the reported backtest metrics did.
             "neutral_band": float(neutral_band),
+            # Annualized volatility the evaluation-mode portfolio PnL
+            # calculator (models/portfolio_pnl.py) scales this model's
+            # positions to - a property of how the model is meant to be
+            # traded, not a free evaluation-time parameter, so it's
+            # persisted the same way as neutral_band above.
+            "target_vol": float(target_vol),
         }
 
     @classmethod
@@ -801,10 +906,13 @@ class PredictionModel(nn.Module):
         model.lookback = checkpoint["lookback"]
         model.features = checkpoint.get("features", list(DEFAULT_FEATURES))
         model.cma_windows = checkpoint.get("cma_windows", [])
+        model.bandpass_windows = checkpoint.get("bandpass_windows", [])
+        model.bandpass_order = int(checkpoint.get("bandpass_order", DEFAULT_BANDPASS_ORDER))
         n_assets = checkpoint["config"]["n_assets"]
         sigma_hat = checkpoint.get("sigma_hat")
         model.sigma_hat = sigma_hat.numpy() if sigma_hat is not None else np.ones(n_assets, dtype=np.float32)
         model.neutral_band = float(checkpoint.get("neutral_band", 0.0))
+        model.target_vol = float(checkpoint.get("target_vol", DEFAULT_TARGET_VOL))
         return model
 
     def save_model(
@@ -812,6 +920,8 @@ class PredictionModel(nn.Module):
         x_mean: np.ndarray, x_std: np.ndarray, pairs: list[str], lookback: int,
         features: list[str] | None = None, cma_windows: list | None = None,
         sigma_hat: np.ndarray | None = None, neutral_band: float = 0.0,
+        target_vol: float = DEFAULT_TARGET_VOL,
+        bandpass_windows: list | None = None, bandpass_order: int = DEFAULT_BANDPASS_ORDER,
     ) -> None:
         """Persist every asset's trained LSTM weights, architecture
         config (including per-asset cross_pairs input slicing), input
@@ -820,7 +930,13 @@ class PredictionModel(nn.Module):
         a self-contained checkpoint load_model() can rebuild and run
         calibrated inference from without retraining.
         """
-        torch.save(self._checkpoint_dict(x_mean, x_std, pairs, lookback, features, cma_windows, sigma_hat, neutral_band), path)
+        torch.save(
+            self._checkpoint_dict(
+                x_mean, x_std, pairs, lookback, features, cma_windows, sigma_hat, neutral_band, target_vol,
+                bandpass_windows, bandpass_order,
+            ),
+            path,
+        )
         logger.info("Saved model weights to %s", path)
 
     def save_to_db(
@@ -828,6 +944,8 @@ class PredictionModel(nn.Module):
         x_mean: np.ndarray, x_std: np.ndarray, pairs: list[str], lookback: int,
         features: list[str] | None = None, cma_windows: list | None = None,
         sigma_hat: np.ndarray | None = None, neutral_band: float = 0.0,
+        target_vol: float = DEFAULT_TARGET_VOL,
+        bandpass_windows: list | None = None, bandpass_order: int = DEFAULT_BANDPASS_ORDER,
         description: str = "",
     ) -> None:
         """Serialize the same checkpoint save_model() would write, and
@@ -837,7 +955,13 @@ class PredictionModel(nn.Module):
         from data.model_registry import save_model_blob
 
         buffer = io.BytesIO()
-        torch.save(self._checkpoint_dict(x_mean, x_std, pairs, lookback, features, cma_windows, sigma_hat, neutral_band), buffer)
+        torch.save(
+            self._checkpoint_dict(
+                x_mean, x_std, pairs, lookback, features, cma_windows, sigma_hat, neutral_band, target_vol,
+                bandpass_windows, bandpass_order,
+            ),
+            buffer,
+        )
         save_model_blob(name, buffer.getvalue(), model_type="prediction", description=description)
 
     @classmethod
@@ -1319,6 +1443,14 @@ DEFAULT_CONFIG: dict = {
     # moving-average crossover / trend signal in return space).
     "features": list(DEFAULT_FEATURES),
     "cma_windows": [],  # e.g. [[10, 50], [20, 100]] - only used if "cma" is in "features"
+    # (short, long) period-in-days pairs for a causal Butterworth band-pass
+    # filter (see butterworth_bandpass_features) - a faster-reacting
+    # trend-strength alternative to "cma"; only used if "bandpass" is in
+    # "features". Uses scipy.signal.lfilter (forward-only), NEVER filtfilt
+    # (zero-phase/non-causal - would leak future samples into today's
+    # feature value).
+    "bandpass_windows": [],
+    "bandpass_order": DEFAULT_BANDPASS_ORDER,
     # Architecture: N independent per-asset LSTMs, each followed by a
     # CAUSAL self-attention layer over the time axis (see AssetLSTM/
     # PredictionModel) - no parameters shared between assets. By DEFAULT
@@ -1337,11 +1469,11 @@ DEFAULT_CONFIG: dict = {
     # Attention heads per asset's causal self-attention layer (see
     # AssetLSTM) - hidden_size must be divisible by this.
     "n_attn_heads": 4,
-    # Joint training (see train_prediction_model): every asset's LSTM
-    # trained together, one optimizer over every parameter, one combined
-    # loss - Gaussian NLL on (mu, sigma) + `bce_weight` * BCE on the
-    # implied direction probability probit(mu/sigma), applied densely
-    # over every day in the window, not just the decision day.
+    # Training (see train_prediction_model): every asset's LSTM trains
+    # FULLY INDEPENDENTLY - its own optimizer, its own loss (Gaussian NLL
+    # on (mu, sigma) + `bce_weight` * BCE on the implied direction
+    # probability probit(mu/sigma)), applied densely over every day in the
+    # window, not just the decision day.
     "epochs": 300,
     "lr": 1e-3,
     "weight_decay": 1e-4,
@@ -1362,6 +1494,12 @@ DEFAULT_CONFIG: dict = {
     # only, alongside a `coverage` metric (how often the model speaks).
     # 0.0 disables abstention entirely.
     "neutral_band": 0.05,
+    # Annualized volatility the evaluation-mode portfolio PnL calculator
+    # (models/portfolio_pnl.py) scales this model's risk-parity-weighted,
+    # probability-modulated positions to (a property of how the model is
+    # meant to be traded, persisted alongside it - see
+    # PredictionModel._checkpoint_dict).
+    "target_vol": DEFAULT_TARGET_VOL,
     # Multi-seed restarts: train `n_seeds` independent PredictionModels
     # and keep whichever restart had the lowest validation log loss.
     "n_seeds": 1,
@@ -1433,6 +1571,8 @@ def _prepare_data(
     lookback: int | None = None,
     features: list[str] | None = None,
     cma_windows: list | None = None,
+    bandpass_windows: list | None = None,
+    bandpass_order: int | None = None,
 ) -> _PreparedData:
     """Load data (via db.py), build sequences, split by time, and
     standardize - everything a training (or inference) run needs that
@@ -1442,12 +1582,12 @@ def _prepare_data(
     are used as-is instead of being freshly fit - inference must
     standardize new data exactly the way the loaded model was trained.
 
-    If `pairs`/`lookback`/`features`/`cma_windows` are given, they OVERRIDE
-    args.pairs/args.lookback/args.features/args.cma_windows - used when
-    loading a saved model, whose checkpoint carries the exact values it
-    was trained with (see PredictionModel._from_checkpoint/load_pipeline
-    below); a loaded model's own stored values must win over whatever a
-    caller passes in.
+    If `pairs`/`lookback`/`features`/`cma_windows`/`bandpass_windows`/
+    `bandpass_order` are given, they OVERRIDE the matching `args.*` value -
+    used when loading a saved model, whose checkpoint carries the exact
+    values it was trained with (see PredictionModel._from_checkpoint/
+    load_pipeline below); a loaded model's own stored values must win over
+    whatever a caller passes in.
     """
     if pairs is None:
         pairs = list(dict.fromkeys(args.pairs))  # de-duplicate, keep order
@@ -1457,6 +1597,10 @@ def _prepare_data(
         features = getattr(args, "features", None) or list(DEFAULT_FEATURES)
     if cma_windows is None:
         cma_windows = getattr(args, "cma_windows", None) or []
+    if bandpass_windows is None:
+        bandpass_windows = getattr(args, "bandpass_windows", None) or []
+    if bandpass_order is None:
+        bandpass_order = getattr(args, "bandpass_order", None) or DEFAULT_BANDPASS_ORDER
 
     logger.info("Loading %s via db.py", pairs)
     prices = load_close_prices(pairs, years=args.years)
@@ -1472,8 +1616,10 @@ def _prepare_data(
             f"rolling_stats_window {rolling_stats_window}) - increase 'years' to fetch more history."
         )
 
-    n_channels = n_channels_per_pair(features, cma_windows)
-    feature_returns = build_feature_dataframe(returns, pairs, features, rolling_stats_window, cma_windows, args.years)
+    n_channels = n_channels_per_pair(features, cma_windows, bandpass_windows)
+    feature_returns = build_feature_dataframe(
+        returns, pairs, features, rolling_stats_window, cma_windows, args.years, bandpass_windows, bandpass_order,
+    )
 
     X, next_returns, z_labels, dates = make_sequences(
         returns, lookback=lookback, feature_returns=feature_returns, direction_horizon=direction_horizon,
@@ -1758,6 +1904,7 @@ def load_pipeline(args: argparse.Namespace) -> PredictionResult:
     data = _prepare_data(
         args, x_mean=model.x_mean, x_std=model.x_std, pairs=model.pairs, lookback=model.lookback,
         features=getattr(model, "features", None), cma_windows=getattr(model, "cma_windows", None),
+        bandpass_windows=getattr(model, "bandpass_windows", None), bandpass_order=getattr(model, "bandpass_order", None),
     )
     # load_prediction_model_auto reconstructs the checkpoint on CPU
     # (torch.load(..., map_location="cpu")) regardless of what device it

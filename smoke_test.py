@@ -173,9 +173,10 @@ with tempfile.TemporaryDirectory() as d:
                      pairs=pairs, lookback=lookback,
                      features=["log_return", "vol", "skew", "kurt"], cma_windows=[],
                      sigma_hat=np.array([1.1, 0.9, 1.0], dtype=np.float32),
-                     neutral_band=0.07)
+                     neutral_band=0.07, target_vol=0.15)
     loaded = pl.PredictionModel.load_model(path)
     assert loaded.neutral_band == 0.07
+    assert loaded.target_vol == 0.15
     assert np.allclose(loaded.sigma_hat, [1.1, 0.9, 1.0])
     assert loaded.included_indices == model.included_indices
     with torch.no_grad():
@@ -203,5 +204,125 @@ sweep_args = argparse.Namespace(**{
 sweep_result = pl.run_pipeline_multi_seed(sweep_args)
 assert sweep_result.hit_rate_val.shape == (len(sweep_pairs),)
 print("7. bce_weight sweep OK (2 seeds x 3 values)")
+
+# --- 8. butterworth_bandpass_features: causal band-pass filter, channel expansion ---
+bp_dates = pd.bdate_range("2020-01-01", periods=400)
+bp_returns = pd.DataFrame(np.random.randn(400, 2) * 0.005, index=bp_dates, columns=["A", "B"])
+
+# 8a. channel-count expansion: "bandpass" contributes one channel PER
+# (short, long) window pair, same as "cma".
+n_ch = pl.n_channels_per_pair(["log_return", "bandpass"], bandpass_windows=[[10, 50], [20, 100]])
+assert n_ch == 1 + 2, f"expected 1 base channel + 2 bandpass channels, got {n_ch}"
+print("8a. n_channels_per_pair OK: one channel per bandpass window pair")
+
+# 8b. causality: perturbing FUTURE returns must not change any PAST
+# filtered value - the same guarantee cross_moving_averages/trailing_vol/
+# rolling_moment_features already hold, and the whole reason lfilter (not
+# filtfilt) is used.
+bp_before = pl.butterworth_bandpass_features(bp_returns, [[10, 50]], order=3)
+bp_returns_perturbed = bp_returns.copy()
+bp_returns_perturbed.iloc[300:] += 5.0
+bp_after = pl.butterworth_bandpass_features(bp_returns_perturbed, [[10, 50]], order=3)
+before_series = bp_before[("A", 10, 50)].iloc[:300]
+after_series = bp_after[("A", 10, 50)].iloc[:300]
+assert np.allclose(before_series.to_numpy(), after_series.to_numpy(), equal_nan=True), (
+    "a future perturbation changed a PAST bandpass filter output - lfilter causality is broken"
+)
+print("8b. butterworth_bandpass_features OK: causal (past outputs unaffected by a future perturbation)")
+
+# 8c. reacts faster than an equivalent CMA crossover to a step change (the
+# actual point of using a proper band-pass design instead of an SMA
+# difference): both are pure trend-CHANGE detectors (a band-pass removes
+# the DC/long-run level entirely, same as a CMA crossover eventually
+# settling back to 0 once the step ages out of both windows), so "reacts
+# faster" is measured as fewer days to reach ITS OWN peak magnitude after
+# a sudden regime flip - a CMA crossover ramps linearly over ~short_window
+# days as the short SMA fills with the new level; a proper Butterworth
+# design gets there faster for the same passband.
+step_returns = pd.DataFrame(np.zeros((300, 1)), columns=["A"])
+step_returns.iloc[150:, 0] = 0.01  # sudden sustained regime shift
+bp_step = pl.butterworth_bandpass_features(step_returns, [[10, 50]], order=3)[("A", 10, 50)]
+cma_step = pl.cross_moving_averages(step_returns, [[10, 50]])[("A", 10, 50)]
+bp_peak_day = int(bp_step.iloc[150:].abs().to_numpy().argmax())
+cma_peak_day = int(cma_step.iloc[150:].abs().to_numpy().argmax())
+assert bp_peak_day < cma_peak_day, (
+    f"bandpass should reach its own peak magnitude faster than an equivalent CMA crossover "
+    f"({bp_peak_day}d vs {cma_peak_day}d)"
+)
+print(f"8c. butterworth_bandpass_features OK: peaks {bp_peak_day}d after a regime shift vs CMA's {cma_peak_day}d")
+
+# 8d. invalid windows are rejected (short >= long, or below the Nyquist floor).
+try:
+    pl.butterworth_bandpass_features(bp_returns, [[50, 10]])
+    raise AssertionError("short_period >= long_period should have raised ValueError")
+except ValueError:
+    pass
+try:
+    pl.butterworth_bandpass_features(bp_returns, [[1, 50]])  # short_period=1 is at/above the Nyquist limit for daily data
+    raise AssertionError("short_period at the Nyquist limit should have raised ValueError")
+except ValueError:
+    pass
+print("8d. butterworth_bandpass_features OK: invalid windows rejected")
+
+# --- 9. portfolio_pnl: risk parity, causal covariance, target-vol scaling ---
+from models import portfolio_pnl as pp
+
+# 9a. equal-risk-contribution: on a correlated 3-asset covariance matrix,
+# weights must sum to 1 and every asset's risk contribution (w_i * (Cw)_i)
+# must be equal - NOT just inverse-vol (which would ignore correlation).
+cov3 = np.array([[0.04, 0.01, 0.02], [0.01, 0.09, 0.015], [0.02, 0.015, 0.16]])
+w = pp.risk_parity_weights(cov3)
+contrib = w * (cov3 @ w)
+assert abs(w.sum() - 1.0) < 1e-6
+assert np.allclose(contrib, contrib[0], rtol=1e-3), f"risk contributions not equalized: {contrib}"
+assert (w > 0).all(), "risk parity should be long-only"
+assert np.allclose(pp.risk_parity_weights(np.array([[0.05]])), [1.0]), "single-asset risk parity must be all-in"
+print("9a. risk_parity_weights OK: sums to 1, equalizes risk contribution, single-asset trivial case")
+
+# 9b. rolling_covariance_matrices is causal: perturbing FUTURE returns must
+# not change any PAST covariance matrix.
+rng = np.random.default_rng(0)
+T, n = 200, 3
+base = rng.normal(0, 0.01, size=(T, 1))
+returns = base * rng.normal(1, 0.3, size=(1, n)) + rng.normal(0, 0.005, size=(T, n))
+cov_before = pp.rolling_covariance_matrices(returns, window=60)
+returns_perturbed = returns.copy()
+returns_perturbed[100:] += 5.0
+cov_after = pp.rolling_covariance_matrices(returns_perturbed, window=60)
+assert np.allclose(cov_before[:100], cov_after[:100], equal_nan=True), "future perturbation leaked into a past covariance matrix"
+print("9b. rolling_covariance_matrices OK: past matrices unaffected by a future perturbation")
+
+# 9c. compute_portfolio: realized vol of the modulated book should land in
+# the neighborhood of target_vol (it's an ex-ante scale, not exact - actual
+# realized vol will drift, but shouldn't be wildly off), and the strategy
+# actually shorts when probabilities lean negative.
+probs = 0.5 + 0.15 * np.sign(rng.normal(size=(T, n)))
+target_vol = 0.10
+out = pp.compute_portfolio(probs, returns, direction_horizon=5, target_vol=target_vol, cov_window=60)
+valid = ~np.isnan(out["positions_modulated"]).any(axis=1)
+assert valid.sum() > T // 2, "too many NaN days in a 200-day series with a 60-day cov window"
+realized_vol = float(np.std(out["pnl_modulated"][valid])) * np.sqrt(pp.TRADING_DAYS_PER_YEAR)
+assert 0.02 < realized_vol < 0.5, f"realized vol {realized_vol:.3f} is nowhere near target_vol {target_vol}"
+some_negative = (out["positions_modulated"][valid] < 0).any()
+assert some_negative, "modulated positions should go short when a pair's probability signal is negative"
+assert (out["positions_baseline"][valid] >= 0).all(), "unmodulated risk-parity baseline must stay long-only"
+print(f"9c. compute_portfolio OK: realized annualized vol {realized_vol:.3f} near target {target_vol}, shorts when signal is negative")
+
+# 9d. latest_position: today's probability should move the position in the
+# right direction relative to the SAME history (the direction_horizon-day
+# smoothing dilutes a single day's signal - see compute_portfolio's
+# docstring - so this compares bullish vs. bearish today rather than
+# asserting an absolute sign).
+bullish_today = pp.latest_position(
+    probs, returns, np.array([0.9, 0.9, 0.9], dtype=np.float32), direction_horizon=5, target_vol=target_vol, cov_window=60,
+)
+bearish_today = pp.latest_position(
+    probs, returns, np.array([0.1, 0.1, 0.1], dtype=np.float32), direction_horizon=5, target_vol=target_vol, cov_window=60,
+)
+assert bullish_today["position_modulated"].shape == (n,)
+assert (bullish_today["position_modulated"] > bearish_today["position_modulated"]).all(), (
+    "a more bullish today's probability should size a larger (or less negative) position, same history"
+)
+print("9d. latest_position OK: today's probability moves the booked position in the right direction")
 
 print("\nALL SMOKE TESTS PASSED")

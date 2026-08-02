@@ -193,13 +193,25 @@ positive).
   `FEATURE_CATALOG` for the full list (also `"carry"`: the interest-rate
   differential, base minus quote, from FRED via
   `data/rates_downloader.py` - the single best-documented FX predictor;
-  and `"cma"`: see below).
+  `"cma"` and `"bandpass"`: see below).
 - `cma_windows` (default `[]`, e.g. `[[10, 50], [20, 100]]`): only used if
   `"cma"` is in `features` - one input channel PER `[short, long]` window
   pair, each `rolling_mean(returns, short) - rolling_mean(returns, long)`
   (see `cross_moving_averages`) - a trailing moving-average-crossover /
   trend signal in return space, positive when the recent trend runs above
   the longer-run one.
+- `bandpass_windows`/`bandpass_order` (default `[]`/`3`): only used if
+  `"bandpass"` is in `features` - one input channel PER `[short_period,
+  long_period]` (in days), a CAUSAL Butterworth band-pass filter of returns
+  (see `butterworth_bandpass_features`) - a faster-reacting alternative to
+  a CMA crossover for the same window pair. Uses `scipy.signal.lfilter`
+  (forward-only), deliberately NOT `filtfilt` (the usual zero-phase way to
+  apply a Butterworth filter) - `filtfilt` runs the filter backward too,
+  which would leak future returns into today's feature value.
+  `short_period` sets the fastest cycle length that still passes (the high
+  cutoff); `long_period` sets the slowest (the low cutoff - removes the
+  long-run trend/DC component). `bandpass_order` (default 3) trades lag
+  against selectivity - higher rolls off more sharply but adds phase lag.
 - `cross_pairs` (default `{}`): see above - which OTHER pairs' feature
   blocks additionally feed a given pair's own LSTM.
 - `n_attn_heads` (default 4): attention heads in each asset's causal
@@ -445,6 +457,39 @@ run. Loads the model purely for inference (no training) and shows the
 same hit rate/confusion matrix/colored cumulative-return charts, plus the
 model's predicted probability per asset for the next (not-yet-realized)
 day.
+
+**Portfolio PnL calculator** (`models/portfolio_pnl.py`, evaluation-only -
+never touches training): turns a model's per-asset probabilities into a
+long/short book.
+
+1. **Risk parity**: each day's realized returns (trailing 60-day window,
+   causal - never looks at the day being sized) fit a covariance matrix;
+   `risk_parity_weights` solves for the long-only, sum-to-1 weights that
+   equalize every asset's contribution to total portfolio variance (not
+   just inverse-vol - it accounts for correlation).
+2. **Probability modulation**: each risk-parity weight is multiplied by
+   that asset's signal `(p - 0.5) * 2` (so `p < 0.5` flips the position
+   short, magnitude scaled by conviction).
+3. **Horizon smoothing**: the portfolio rebalances daily, but the
+   probability forecasts a `direction_horizon`-day-forward move, so
+   consecutive days' signals are heavily overlapping forecasts. The
+   modulated weight is smoothed with a trailing `direction_horizon`-day
+   moving average before scaling - the standard treatment for
+   overlapping-horizon forecasts - so the book reflects the model's
+   persistent view rather than day-to-day jitter in exactly when the
+   window rolled.
+4. **Target-vol scaling**: the smoothed weight is scaled so the book's own
+   `w' C w` hits a configured annualized `target_vol` (10% by default) -
+   a model property, set at training time and persisted in its checkpoint
+   alongside `neutral_band`, so evaluation always uses what the model was
+   actually meant to be traded at.
+
+The unmodulated risk-parity weights (no probability signal, same
+target-vol scaling) are shown alongside as a baseline for comparison. The
+Evaluation page plots both, per asset and as whole-book cumulative PnL,
+for train/val/test, and shows a "today's position" table - the
+not-yet-booked position and probability per asset a trader would book for
+today's EoD, sized from the freshest available data.
 
 See `api/server.py`'s module docstring for the full endpoint list
 (`GET /api/pairs`, `POST /api/quotes/refresh`, `GET /api/models`,

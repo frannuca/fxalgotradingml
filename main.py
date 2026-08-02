@@ -27,7 +27,10 @@ persisted to the database as well as to a local .pt file:
 
 `"features"` (see models/portfolio_lstm.py's FEATURE_CATALOG) selects
 which per-pair input channels to build; `"cma_windows"` is only used if
-`"cma"` is in `"features"`. `"cross_pairs"` (a `{pair: [other_pair, ...]}`
+`"cma"` is in `"features"`, and `"bandpass_windows"`/`"bandpass_order"`
+only if `"bandpass"` is (a faster-reacting, causal Butterworth-filter
+alternative to "cma" for the same [short, long] window pair - see
+butterworth_bandpass_features). `"cross_pairs"` (a `{pair: [other_pair, ...]}`
 dict) is the ONLY way cross-asset information ever reaches a pair's own
 LSTM - by DEFAULT (`{}`) every pair's LSTM sees ONLY its own features,
 fully independent; a pair not listed as a `cross_pairs` key stays fully
@@ -79,10 +82,12 @@ import sys
 from argparse import Namespace
 
 from models.portfolio_lstm import (
+    DEFAULT_BANDPASS_ORDER,
     DEFAULT_CONFIG,
     prediction_model_name,
     run_pipeline_multi_seed,
 )
+from models.portfolio_pnl import DEFAULT_TARGET_VOL
 from models.portfolio_postprocess import print_confusion_matrices, print_hit_rates
 
 
@@ -109,6 +114,9 @@ def run(args: Namespace) -> None:
             x_mean=result.x_mean, x_std=result.x_std, pairs=result.pairs, lookback=result.lookback,
             features=getattr(args, "features", None), cma_windows=getattr(args, "cma_windows", None),
             sigma_hat=result.sigma_hat, neutral_band=result.neutral_band,
+            target_vol=getattr(args, "target_vol", None) or DEFAULT_TARGET_VOL,
+            bandpass_windows=getattr(args, "bandpass_windows", None),
+            bandpass_order=getattr(args, "bandpass_order", None) or DEFAULT_BANDPASS_ORDER,
         )
     if args.save_db:
         name = prediction_model_name(args)
@@ -117,6 +125,9 @@ def run(args: Namespace) -> None:
             features=getattr(args, "features", None), cma_windows=getattr(args, "cma_windows", None),
             description=args.model_description,
             sigma_hat=result.sigma_hat, neutral_band=result.neutral_band,
+            target_vol=getattr(args, "target_vol", None) or DEFAULT_TARGET_VOL,
+            bandpass_windows=getattr(args, "bandpass_windows", None),
+            bandpass_order=getattr(args, "bandpass_order", None) or DEFAULT_BANDPASS_ORDER,
         )
         print(f"Persisted model to database as {name!r}")
 

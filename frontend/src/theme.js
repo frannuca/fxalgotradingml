@@ -59,3 +59,11 @@ export const PROBABILITY_COLOR = "#2563eb"; // blue
 // chart type/meaning, so no semantic clash).
 export const ACTUAL_DIST_COLOR = "#7c3aed"; // violet - realized outcomes
 export const FORECAST_DIST_COLOR = "#d97706"; // amber - model-implied outcomes
+
+// The portfolio PnL calculator's two series (see models/portfolio_pnl.py):
+// the probability-modulated, vol-targeted position/PnL vs. the unmodulated
+// risk-parity baseline it's compared against - distinct from PAIR_PALETTE
+// (this pairing means something different: strategy vs. baseline, not
+// asset identity).
+export const MODULATED_COLOR = "#2563eb"; // blue - probability-modulated, vol-targeted
+export const BASELINE_COLOR = "#94a3b8"; // slate - unmodulated risk-parity baseline

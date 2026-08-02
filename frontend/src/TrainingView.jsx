@@ -18,6 +18,7 @@ const FEATURE_OPTIONS = [
   ["kurt", "Rolling excess kurtosis"],
   ["carry", "Carry (interest-rate differential)"],
   ["cma", "Cross moving averages (trend)"],
+  ["bandpass", "Butterworth bandpass (faster-reacting trend)"],
 ];
 
 const DEFAULT_FORM = {
@@ -30,6 +31,8 @@ const DEFAULT_FORM = {
   rolling_stats_window: 20,
   features: ["log_return", "vol", "skew", "kurt"],
   cma_windows: [], // [{short, long}, ...] - UI shape; converted to [[short,long],...] on submit
+  bandpass_windows: [], // same UI shape as cma_windows - short/long PERIODS in days for a causal Butterworth bandpass filter
+  bandpass_order: 3,
   // {pair: [other_pair, ...]} - which OTHER pairs' features also feed a
   // given pair's own LSTM (its own features are always included
   // regardless). DEFAULT is every pair fully independent (see
@@ -45,6 +48,11 @@ const DEFAULT_FORM = {
   weight_decay: 0.0001,
   bce_weight: "1.0", // free text: a single number, or comma-separated to SWEEP (see parseBceWeight)
   neutral_band: 0.05,
+  // Annualized volatility the Evaluation view's portfolio PnL calculator
+  // scales this model's positions to (see models/portfolio_pnl.py) -
+  // persisted with the model, like neutral_band, not a free
+  // evaluation-time parameter.
+  target_vol: 0.1,
   n_seeds: 1,
   device: "auto",
   save_db: true,
@@ -54,8 +62,8 @@ const DEFAULT_FORM = {
 const NUMERIC_FIELDS = new Set([
   "lookback", "years", "train_frac", "test_frac", "direction_horizon", "rolling_stats_window",
   "hidden_size", "num_layers", "dropout", "n_attn_heads",
-  "epochs", "lr", "weight_decay", "neutral_band",
-  "n_seeds",
+  "epochs", "lr", "weight_decay", "neutral_band", "target_vol",
+  "n_seeds", "bandpass_order",
 ]);
 
 // "1.0" -> 1.0 (single value); "1.0, 1.5, 2.0" -> [1.0, 1.5, 2.0] (sweep -
@@ -154,6 +162,21 @@ export default function TrainingView() {
     setForm((f) => ({ ...f, cma_windows: f.cma_windows.filter((_, i) => i !== index) }));
   }
 
+  function addBandpassWindow() {
+    setForm((f) => ({ ...f, bandpass_windows: [...f.bandpass_windows, { short: 10, long: 50 }] }));
+  }
+
+  function updateBandpassWindow(index, field, value) {
+    setForm((f) => ({
+      ...f,
+      bandpass_windows: f.bandpass_windows.map((w, i) => (i === index ? { ...w, [field]: Number(value) } : w)),
+    }));
+  }
+
+  function removeBandpassWindow(index) {
+    setForm((f) => ({ ...f, bandpass_windows: f.bandpass_windows.filter((_, i) => i !== index) }));
+  }
+
   function toggleCrossPair(pair, otherPair) {
     setForm((f) => {
       const current = f.cross_pairs[pair] || [];
@@ -184,6 +207,7 @@ export default function TrainingView() {
         ...form,
         bce_weight: parseBceWeight(form.bce_weight),
         cma_windows: form.cma_windows.map((w) => [w.short, w.long]),
+        bandpass_windows: form.bandpass_windows.map((w) => [w.short, w.long]),
       });
       setJobId(job_id);
       setStatus("pending");
@@ -333,6 +357,40 @@ export default function TrainingView() {
               )}
             </div>
           )}
+          {form.features.includes("bandpass") && (
+            <div style={{ marginTop: 8 }}>
+              <p className="status-line" style={{ marginTop: 0 }}>
+                A causal Butterworth band-pass filter (forward-only - never the zero-phase filtfilt, which would leak
+                future samples) reacting to cycles between the short and long period below, in days - a
+                faster-reacting alternative to a CMA crossover for the same window pair.
+              </p>
+              {form.bandpass_windows.map((w, i) => (
+                <div key={i} style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 6 }}>
+                  <div className="field" style={{ maxWidth: 100 }}>
+                    <label>Short period (days)</label>
+                    <input type="number" value={w.short} onChange={(e) => updateBandpassWindow(i, "short", e.target.value)} />
+                  </div>
+                  <div className="field" style={{ maxWidth: 100 }}>
+                    <label>Long period (days)</label>
+                    <input type="number" value={w.long} onChange={(e) => updateBandpassWindow(i, "long", e.target.value)} />
+                  </div>
+                  <button type="button" className="secondary" onClick={() => removeBandpassWindow(i)} style={{ alignSelf: "end" }}>
+                    Remove
+                  </button>
+                </div>
+              ))}
+              <button type="button" className="secondary" onClick={addBandpassWindow}>Add bandpass window</button>
+              {form.bandpass_windows.length === 0 && (
+                <p className="status-line" style={{ marginTop: 4, color: "#b45309" }}>
+                  "Butterworth bandpass" is selected but no windows are configured - add at least one.
+                </p>
+              )}
+              <div className="field" style={{ maxWidth: 140, marginTop: 6 }}>
+                <label>Filter order</label>
+                <input type="number" value={form.bandpass_order} onChange={(e) => updateField("bandpass_order", e.target.value)} />
+              </div>
+            </div>
+          )}
         </div>
 
         {form.pairs.length > 1 && (
@@ -398,6 +456,7 @@ export default function TrainingView() {
               />
             </div>
             <NumField label="Neutral band (abstention half-width)" name="neutral_band" step="0.01" value={form.neutral_band} onChange={updateField} />
+            <NumField label="Target vol (annualized, for portfolio PnL)" name="target_vol" step="0.01" value={form.target_vol} onChange={updateField} />
           </div>
           <p className="status-line" style={{ marginTop: 4 }}>
             Every asset's LSTM trains FULLY INDEPENDENTLY: its own optimizer, its own loss - never averaged or

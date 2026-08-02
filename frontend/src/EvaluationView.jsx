@@ -4,6 +4,8 @@ import HitRateChart from "./charts/HitRateChart";
 import ColoredReturnChart from "./charts/ColoredReturnChart";
 import ProbabilityChart from "./charts/ProbabilityChart";
 import ReturnDistributionChart from "./charts/ReturnDistributionChart";
+import PortfolioPositionChart from "./charts/PortfolioPositionChart";
+import PortfolioPnlChart from "./charts/PortfolioPnlChart";
 import ConfusionMatrixTable from "./ConfusionMatrixTable";
 import { SPLIT_LABEL } from "./theme";
 import { confusionMatrixForSplit, hitAbstainedSeries, hitRateForSplit } from "./metrics";
@@ -199,6 +201,37 @@ export default function EvaluationView() {
             </table>
           </div>
 
+          <h2>Today&apos;s position (EoD booking sheet)</h2>
+          <div className="panel">
+            <p className="status-line" style={{ marginTop: 0 }}>
+              Risk-parity weight times the probability signal <code>(p - 0.5) * 2</code>, smoothed over this model&apos;s own
+              direction horizon and scaled to its target volatility of {(result.target_vol * 100).toFixed(1)}% annualized
+              (a model property, recovered from its checkpoint) - see the Portfolio PnL section below for the full
+              backtest this is based on.
+            </p>
+            <table className="weights-table">
+              <thead>
+                <tr><th>Pair</th><th>P(positive)</th><th>Modulated position</th><th>Risk-parity baseline</th></tr>
+              </thead>
+              <tbody>
+                {result.pairs.map((pair) => {
+                  const row = result.latest_position[pair];
+                  return (
+                    <tr key={pair}>
+                      <td>{pair}</td>
+                      <td>{(row.probability * 100).toFixed(1)}%</td>
+                      <td style={{ color: row.position_modulated >= 0 ? "#059669" : "#dc2626" }}>
+                        {row.position_modulated >= 0 ? "long " : "short "}
+                        {Math.abs(row.position_modulated).toFixed(3)}
+                      </td>
+                      <td>{row.position_baseline.toFixed(3)}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+
           <div className="panel">
             <h2 style={{ marginTop: 0 }}>Neutral band</h2>
             <div className="form-grid">
@@ -246,6 +279,28 @@ export default function EvaluationView() {
                     />
                   );
                 })}
+              </div>
+            </div>
+          ))}
+
+          <h2>Portfolio PnL (risk parity, probability-modulated)</h2>
+          {["train", "val", "test"].map((split) => (
+            <div key={split}>
+              <h3>{SPLIT_LABEL[split]}</h3>
+              <PortfolioPnlChart
+                dates={result.portfolio[split].dates}
+                cumulativeModulated={result.portfolio[split].cumulative_pnl_modulated}
+                cumulativeBaseline={result.portfolio[split].cumulative_pnl_baseline}
+              />
+              <div className="chart-grid">
+                {result.pairs.map((pair) => (
+                  <PortfolioPositionChart
+                    key={pair}
+                    title={pair}
+                    dates={result.portfolio[split].dates}
+                    series={result.portfolio[split][pair]}
+                  />
+                ))}
               </div>
             </div>
           ))}

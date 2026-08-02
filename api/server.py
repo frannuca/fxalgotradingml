@@ -42,6 +42,7 @@ from pydantic import BaseModel
 from data.db import get_connection
 from data.fx_downloader import MAJOR_FX_PAIRS
 from models.portfolio_lstm import (
+    DEFAULT_BANDPASS_ORDER,
     DEFAULT_CONFIG,
     DEFAULT_FEATURES,
     TrainingStopped,
@@ -55,6 +56,7 @@ from models.portfolio_lstm import (
     probit,
     to_log_returns,
 )
+from models.portfolio_pnl import DEFAULT_TARGET_VOL, compute_portfolio, latest_position
 
 app = FastAPI(title="FX Direction Prediction API")
 app.add_middleware(
@@ -253,6 +255,12 @@ class TrainRequest(BaseModel):
     # FEATURE_CATALOG: "log_return", "vol", "skew", "kurt", "carry", "cma").
     features: list[str] = ["log_return", "vol", "skew", "kurt"]
     cma_windows: list[list[int]] = []  # [[short, long], ...] - only used if "cma" is in `features`
+    # (short, long) period-in-days pairs for a causal Butterworth band-pass
+    # filter (see build_feature_dataframe's own bandpass_windows param) - a
+    # faster-reacting trend-strength alternative to "cma"; only used if
+    # "bandpass" is in `features`.
+    bandpass_windows: list[list[int]] = []
+    bandpass_order: int = DEFAULT_BANDPASS_ORDER
     # Architecture: N independent per-asset LSTMs, each followed by a
     # CAUSAL self-attention layer over the time axis (see AssetLSTM/
     # PredictionModel) - no weights shared between assets. By DEFAULT
@@ -278,6 +286,11 @@ class TrainRequest(BaseModel):
     # validated best, per seed and then overall.
     bce_weight: float | list[float] = 1.0
     neutral_band: float = 0.05  # abstention half-width around p=0.5 (see apply_neutral_band); 0 disables
+    # Annualized volatility the evaluation-mode portfolio PnL calculator
+    # (models/portfolio_pnl.py) scales this model's positions to - a
+    # property of the model, persisted in its checkpoint alongside
+    # neutral_band, not a free evaluation-time parameter.
+    target_vol: float = DEFAULT_TARGET_VOL
     n_seeds: int = 1
     device: str = "auto"  # "auto" (Metal/MPS on Apple Silicon, else CUDA, else CPU), "cpu", "mps", or "cuda" - see get_device
     save_db: bool = True
@@ -380,6 +393,30 @@ def _distribution_payload(pairs: list[str], z_labels: np.ndarray, mu: np.ndarray
     }
 
 
+def _portfolio_payload(dates, pairs: list[str], portfolio: dict) -> dict:
+    """Build a {dates: [...], <pair>: {position_modulated: [...],
+    position_baseline: [...]}, ..., cumulative_pnl_modulated: [...],
+    cumulative_pnl_baseline: [...]} dict - the Evaluation view's portfolio
+    PnL chart (see models/portfolio_pnl.py's compute_portfolio).
+    `position_modulated` is the risk-parity weight times the probability
+    signal `(p - 0.5) * 2`, smoothed over the model's own direction_horizon
+    and scaled to the model's own persisted target_vol; `position_baseline`
+    is the SAME risk-parity weights with no signal applied (unmodulated),
+    scaled to the same target_vol, for a like-for-like comparison. NaN
+    entries (not enough trailing history yet to size a position) are sent
+    as `null` - the frontend chart simply skips them.
+    """
+    payload: dict[str, Any] = {"dates": [str(d.date()) if hasattr(d, "date") else str(d) for d in dates]}
+    for i, pair in enumerate(pairs):
+        payload[pair] = {
+            "position_modulated": [None if np.isnan(v) else float(v) for v in portfolio["positions_modulated"][:, i]],
+            "position_baseline": [None if np.isnan(v) else float(v) for v in portfolio["positions_baseline"][:, i]],
+        }
+    payload["cumulative_pnl_modulated"] = portfolio["cumulative_pnl_modulated"].tolist()
+    payload["cumulative_pnl_baseline"] = portfolio["cumulative_pnl_baseline"].tolist()
+    return payload
+
+
 def _run_training_job(job_id: str, config: dict) -> None:
     """Runs on a background thread - trains a PredictionModel (every
     asset's LSTM together - see models/portfolio_lstm.py's own docstring),
@@ -431,7 +468,8 @@ def _run_training_job(job_id: str, config: dict) -> None:
         result.model.save_model(
             x_mean=result.x_mean, x_std=result.x_std, pairs=result.pairs, lookback=result.lookback,
             features=args.features, cma_windows=args.cma_windows,
-            sigma_hat=result.sigma_hat, neutral_band=result.neutral_band,
+            sigma_hat=result.sigma_hat, neutral_band=result.neutral_band, target_vol=args.target_vol,
+            bandpass_windows=args.bandpass_windows, bandpass_order=args.bandpass_order,
         )
 
         name = prediction_model_name(args)
@@ -439,7 +477,8 @@ def _run_training_job(job_id: str, config: dict) -> None:
             result.model.save_to_db(
                 name, x_mean=result.x_mean, x_std=result.x_std, pairs=result.pairs, lookback=result.lookback,
                 features=args.features, cma_windows=args.cma_windows, description=args.model_description,
-                sigma_hat=result.sigma_hat, neutral_band=result.neutral_band,
+                sigma_hat=result.sigma_hat, neutral_band=result.neutral_band, target_vol=args.target_vol,
+                bandpass_windows=args.bandpass_windows, bandpass_order=args.bandpass_order,
             )
 
         _JOBS[job_id]["result"] = {
@@ -576,8 +615,9 @@ def _predict_latest_probabilities(args: Namespace, model) -> dict[str, float]:
     historical validation/test-period probabilities (which are for
     backtesting): this is "run the model on today's window".
 
-    Uses `model.pairs`/`model.lookback`/`model.features`/`model.cma_windows`
-    - restored from the model's own checkpoint - rather than anything from
+    Uses `model.pairs`/`model.lookback`/`model.features`/`model.cma_windows`/
+    `model.bandpass_windows`/`model.bandpass_order` - restored from the
+    model's own checkpoint - rather than anything from
     the request, so the fetched data, window length, and returned feature
     set always match what the model was actually trained on.
     """
@@ -592,6 +632,8 @@ def _predict_latest_probabilities(args: Namespace, model) -> dict[str, float]:
     device = next(model.parameters()).device
     features = getattr(model, "features", None) or list(DEFAULT_FEATURES)
     cma_windows = getattr(model, "cma_windows", None) or []
+    bandpass_windows = getattr(model, "bandpass_windows", None) or []
+    bandpass_order = getattr(model, "bandpass_order", None) or DEFAULT_BANDPASS_ORDER
     rolling_stats_window = getattr(args, "rolling_stats_window", 20) or 20
     min_days = lookback + rolling_stats_window
 
@@ -603,7 +645,9 @@ def _predict_latest_probabilities(args: Namespace, model) -> dict[str, float]:
             f"the most recent {min_days} days - increase 'years' to fetch more history."
         )
 
-    feature_returns = build_feature_dataframe(returns, pairs, features, rolling_stats_window, cma_windows, args.years)
+    feature_returns = build_feature_dataframe(
+        returns, pairs, features, rolling_stats_window, cma_windows, args.years, bandpass_windows, bandpass_order,
+    )
     last_window_features = feature_returns.to_numpy(dtype=np.float32)[-lookback:]  # (lookback, n_assets * n_channels)
     X = torch.tensor((last_window_features - model.x_mean) / model.x_std, device=device).unsqueeze(0)
 
@@ -643,6 +687,13 @@ def evaluate(req: EvaluateRequest) -> dict:
       - latest_probabilities: the model's predicted probability per asset
         for the next (not-yet-realized) `direction_horizon`-day outcome,
         using the freshest available data.
+      - portfolio: per-asset risk-parity positions for train/val/test, both
+        probability-modulated (scaled to the model's own target_vol) and an
+        unmodulated risk-parity baseline for comparison - see
+        models/portfolio_pnl.py.
+      - latest_position: today's not-yet-booked position per asset (same
+        modulated/baseline split) alongside the probability it was sized
+        from - what a trader would book for today's EoD.
 
     `pairs` and `lookback` are deliberately NOT accepted from `req` - both
     are recovered from the loaded model's own checkpoint (see
@@ -669,10 +720,51 @@ def evaluate(req: EvaluateRequest) -> dict:
         pairs = result.pairs
         latest_probabilities = _predict_latest_probabilities(args, result.model)
 
+        # Portfolio PnL (see models/portfolio_pnl.py): risk-parity weights
+        # modulated by the model's own probabilities, scaled to the
+        # model's own persisted target_vol (a checkpoint property, like
+        # neutral_band - see PredictionModel._checkpoint_dict). Uses each
+        # split's RAW probabilities with the model's persisted neutral_band
+        # applied (an explicit "no view" -> flat position for that pair,
+        # NOT the frontend's live-adjustable display band - sizing a real
+        # position needs one fixed, reported value, not something that
+        # changes as the user drags a slider).
+        direction_horizon = getattr(args, "direction_horizon", 5) or 5
+        target_vol = getattr(result.model, "target_vol", DEFAULT_TARGET_VOL)
+        band = result.neutral_band
+        portfolio_train = compute_portfolio(
+            apply_neutral_band(result.probabilities_train, band), result.next_returns_train, direction_horizon, target_vol,
+        )
+        portfolio_val = compute_portfolio(
+            apply_neutral_band(result.probabilities_val, band), result.next_returns_val, direction_horizon, target_vol,
+        )
+        portfolio_test = compute_portfolio(
+            apply_neutral_band(result.probabilities_test, band), result.next_returns_test, direction_horizon, target_vol,
+        )
+        latest_probabilities_array = np.array([latest_probabilities[p] for p in pairs], dtype=np.float32)
+        today = latest_position(
+            apply_neutral_band(result.probabilities_test, band), result.next_returns_test,
+            latest_probabilities_array, direction_horizon, target_vol,
+        )
+
         return {
             "pairs": pairs,
             "latest_probabilities": latest_probabilities,
             "neutral_band": result.neutral_band,  # initial value for the frontend's neutral-band control - see start_training's result dict
+            "target_vol": target_vol,
+            "latest_position": {
+                pair: {
+                    "position_modulated": float(today["position_modulated"][i]),
+                    "position_baseline": float(today["position_baseline"][i]),
+                    "probability": latest_probabilities[pair],
+                }
+                for i, pair in enumerate(pairs)
+            },
+            "portfolio": {
+                "train": _portfolio_payload(result.dates_train, pairs, portfolio_train),
+                "val": _portfolio_payload(result.dates_val, pairs, portfolio_val),
+                "test": _portfolio_payload(result.dates_test, pairs, portfolio_test),
+            },
             "hit_rate": {
                 "train": _hit_rate_payload(pairs, result.hit_rate_train),
                 "val": _hit_rate_payload(pairs, result.hit_rate_val),
