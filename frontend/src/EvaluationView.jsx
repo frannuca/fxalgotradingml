@@ -7,15 +7,21 @@ import ReturnDistributionChart from "./charts/ReturnDistributionChart";
 import PortfolioPositionChart from "./charts/PortfolioPositionChart";
 import PortfolioPnlChart from "./charts/PortfolioPnlChart";
 import ConfusionMatrixTable from "./ConfusionMatrixTable";
-import { SPLIT_LABEL } from "./theme";
+import AnnualSharpeTable from "./AnnualSharpeTable";
 import { confusionMatrixForSplit, hitAbstainedSeries, hitRateForSplit } from "./metrics";
+
+const DEVICE_OPTIONS = [
+  ["auto", "Auto (Metal/MPS if available, else CUDA, else CPU)"],
+  ["cpu", "CPU"],
+  ["mps", "MPS (Apple Silicon)"],
+];
 
 export default function EvaluationView() {
   const [models, setModels] = useState([]);
   const [pairs, setPairs] = useState([]);
   const [lookback, setLookback] = useState(null);
   const [modelName, setModelName] = useState("");
-  const [params, setParams] = useState({ years: 8, train_frac: 0.8, test_frac: 0.1 });
+  const [params, setParams] = useState({ years: 8, cutoff_date: "", device: "auto" });
   const [refreshYears, setRefreshYears] = useState(1);
   const [refreshStatus, setRefreshStatus] = useState(null);
   const [evalStatus, setEvalStatus] = useState(null);
@@ -72,7 +78,7 @@ export default function EvaluationView() {
     try {
       // No `pairs`/`lookback` sent - the backend recovers both from the
       // selected model's own checkpoint (see api/server.py's evaluate()).
-      const res = await evaluate({ ...params, model_name: modelName });
+      const res = await evaluate({ ...params, cutoff_date: params.cutoff_date || null, model_name: modelName });
       setResult(res);
       setDisplayBand(res.neutral_band);
       setEvalStatus("done");
@@ -86,17 +92,12 @@ export default function EvaluationView() {
 
   // Recomputed from raw probability + realized label (see ./metrics.js)
   // every time displayBand changes - the band never touches evaluation
-  // itself, so this is the ONLY place it's actually applied to this result.
-  const hitRate = result && {
-    train: hitRateForSplit(result.probabilities.train, result.pairs, displayBand),
-    val: hitRateForSplit(result.probabilities.val, result.pairs, displayBand),
-    test: hitRateForSplit(result.probabilities.test, result.pairs, displayBand),
-  };
-  const confusionMatrix = result && {
-    train: confusionMatrixForSplit(result.probabilities.train, result.pairs, displayBand),
-    val: confusionMatrixForSplit(result.probabilities.val, result.pairs, displayBand),
-    test: confusionMatrixForSplit(result.probabilities.test, result.pairs, displayBand),
-  };
+  // itself, so this is the ONLY place it's actually applied to this
+  // result. Evaluation is a single continuous period now (no train/val/
+  // test split - see api/server.py's evaluate()), so these cover the
+  // whole thing directly.
+  const hitRate = result && hitRateForSplit(result.probabilities, result.pairs, displayBand);
+  const confusionMatrix = result && confusionMatrixForSplit(result.probabilities, result.pairs, displayBand);
 
   return (
     <div>
@@ -157,12 +158,26 @@ export default function EvaluationView() {
           <p className="status-line" style={{ marginTop: 0 }}>
             {minYears
               ? `This model needs at least ${lookback} days of history - "years" must fetch more than that (roughly ${minYears}+ years).`
-              : "How much historical data to use, and how the train/val/test split is drawn - the model's own pairs/lookback aren't editable here."}
+              : "How much historical data to use - the model's own pairs/lookback aren't editable here. Evaluation runs over the WHOLE fetched period as one continuous read, not split into train/validation/test (that split only matters during training)."}
           </p>
           <div className="form-grid">
             <NumField label="Years of history" name="years" value={params.years} onChange={updateParam} />
-            <NumField label="Train fraction" name="train_frac" step="0.05" value={params.train_frac} onChange={updateParam} />
-            <NumField label="Test fraction" name="test_frac" step="0.05" value={params.test_frac} onChange={updateParam} />
+            <div className="field">
+              <label>Cutoff date (blank = today, no cutoff)</label>
+              <input
+                type="date"
+                value={params.cutoff_date}
+                onChange={(e) => setParams((p) => ({ ...p, cutoff_date: e.target.value }))}
+              />
+            </div>
+            <div className="field">
+              <label>Execution device</label>
+              <select value={params.device} onChange={(e) => setParams((p) => ({ ...p, device: e.target.value }))}>
+                {DEVICE_OPTIONS.map(([key, label]) => (
+                  <option key={key} value={key}>{label}</option>
+                ))}
+              </select>
+            </div>
           </div>
         </div>
 
@@ -263,77 +278,62 @@ export default function EvaluationView() {
           <ConfusionMatrixTable pairs={result.pairs} confusionMatrix={confusionMatrix} />
 
           <h2>Cumulative returns (colored by prediction hit/miss)</h2>
-          {["train", "val", "test"].map((split) => (
-            <div key={split}>
-              <h3>{SPLIT_LABEL[split]}</h3>
-              <div className="chart-grid">
-                {result.pairs.map((pair) => {
-                  const { probability, label } = result.probabilities[split][pair];
-                  const { hit, abstained } = hitAbstainedSeries(probability, label, displayBand);
-                  return (
-                    <ColoredReturnChart
-                      key={pair}
-                      title={pair}
-                      dates={result.cumulative_returns[split].dates}
-                      series={{ cumulative: result.cumulative_returns[split][pair].cumulative, hit, abstained }}
-                    />
-                  );
-                })}
-              </div>
-            </div>
-          ))}
+          <div className="chart-grid">
+            {result.pairs.map((pair) => {
+              const { probability, label } = result.probabilities[pair];
+              const { hit, abstained } = hitAbstainedSeries(probability, label, displayBand);
+              return (
+                <ColoredReturnChart
+                  key={pair}
+                  title={pair}
+                  dates={result.cumulative_returns.dates}
+                  series={{ cumulative: result.cumulative_returns[pair].cumulative, hit, abstained }}
+                />
+              );
+            })}
+          </div>
 
           <h2>Portfolio PnL (risk parity, probability-modulated)</h2>
-          {["train", "val", "test"].map((split) => (
-            <div key={split}>
-              <h3>{SPLIT_LABEL[split]}</h3>
-              <PortfolioPnlChart
-                dates={result.portfolio[split].dates}
-                cumulativeModulated={result.portfolio[split].cumulative_pnl_modulated}
-                cumulativeBaseline={result.portfolio[split].cumulative_pnl_baseline}
+          <AnnualSharpeTable annualSharpe={result.annual_sharpe} />
+          <PortfolioPnlChart
+            dates={result.portfolio.dates}
+            pairs={result.pairs}
+            cumulativeModulated={result.portfolio.cumulative_pnl_modulated}
+            cumulativeBaseline={result.portfolio.cumulative_pnl_baseline}
+            perAssetCumulativePnl={Object.fromEntries(
+              result.pairs.map((pair) => [pair, result.portfolio[pair].cumulative_pnl])
+            )}
+          />
+          <div className="chart-grid">
+            {result.pairs.map((pair) => (
+              <PortfolioPositionChart
+                key={pair}
+                title={pair}
+                dates={result.portfolio.dates}
+                series={result.portfolio[pair]}
               />
-              <div className="chart-grid">
-                {result.pairs.map((pair) => (
-                  <PortfolioPositionChart
-                    key={pair}
-                    title={pair}
-                    dates={result.portfolio[split].dates}
-                    series={result.portfolio[split][pair]}
-                  />
-                ))}
-              </div>
-            </div>
-          ))}
+            ))}
+          </div>
 
           <h2>Predicted probability</h2>
-          {["train", "val", "test"].map((split) => (
-            <div key={split}>
-              <h3>{SPLIT_LABEL[split]}</h3>
-              <div className="chart-grid">
-                {result.pairs.map((pair) => (
-                  <ProbabilityChart
-                    key={pair}
-                    title={pair}
-                    dates={result.probabilities[split].dates}
-                    series={result.probabilities[split][pair]}
-                    band={displayBand}
-                  />
-                ))}
-              </div>
-            </div>
-          ))}
+          <div className="chart-grid">
+            {result.pairs.map((pair) => (
+              <ProbabilityChart
+                key={pair}
+                title={pair}
+                dates={result.probabilities.dates}
+                series={result.probabilities[pair]}
+                band={displayBand}
+              />
+            ))}
+          </div>
 
           <h2>Forecasted vs actual return distribution</h2>
-          {["train", "val", "test"].map((split) => (
-            <div key={split}>
-              <h3>{SPLIT_LABEL[split]}</h3>
-              <div className="chart-grid">
-                {result.pairs.map((pair) => (
-                  <ReturnDistributionChart key={pair} title={pair} series={result.distribution[split][pair]} />
-                ))}
-              </div>
-            </div>
-          ))}
+          <div className="chart-grid">
+            {result.pairs.map((pair) => (
+              <ReturnDistributionChart key={pair} title={pair} series={result.distribution[pair]} />
+            ))}
+          </div>
         </>
       )}
     </div>

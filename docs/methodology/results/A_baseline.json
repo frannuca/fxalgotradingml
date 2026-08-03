@@ -1,0 +1,260 @@
+{
+  "mode": "A_baseline",
+  "pairs": [
+    "EURUSD",
+    "USDJPY",
+    "AUDUSD"
+  ],
+  "elapsed_sec": 108.8,
+  "train": {
+    "n_days": 1423,
+    "hit_rate": {
+      "EURUSD": 0.5298804640769958,
+      "USDJPY": 0.6119592785835266,
+      "AUDUSD": 0.6079404354095459
+    },
+    "confusion_matrix": {
+      "EURUSD": {
+        "tp": 207,
+        "fp": 188,
+        "tn": 192,
+        "fn": 166,
+        "abstained": 670,
+        "n_decided": 753.0,
+        "accuracy": 0.5298804780806124,
+        "precision": 0.5240506328981253,
+        "recall": 0.5549597855079099,
+        "specificity": 0.5052631578814404,
+        "f1": 0.5390624949900649,
+        "coverage": 0.5291637385767451
+      },
+      "USDJPY": {
+        "tp": 448,
+        "fp": 275,
+        "tn": 33,
+        "fn": 30,
+        "abstained": 637,
+        "n_decided": 786.0,
+        "accuracy": 0.6119592875240208,
+        "precision": 0.6196403872666716,
+        "recall": 0.9372384937042418,
+        "specificity": 0.10714285713937848,
+        "f1": 0.7460449577268735,
+        "coverage": 0.5523541813032161
+      },
+      "AUDUSD": {
+        "tp": 196,
+        "fp": 92,
+        "tn": 294,
+        "fn": 224,
+        "abstained": 617,
+        "n_decided": 806.0,
+        "accuracy": 0.6079404466425814,
+        "precision": 0.6805555555319251,
+        "recall": 0.46666666665555556,
+        "specificity": 0.7616580310683508,
+        "f1": 0.5536723115423411,
+        "coverage": 0.5664089950768348
+      }
+    },
+    "annual_sharpe": {
+      "2018": {
+        "n_days": 56,
+        "sharpe_modulated": -0.1469801874565542,
+        "sharpe_baseline": -3.2060093450167515,
+        "return_modulated": -0.0016497597533069314,
+        "return_baseline": -0.054643943223978746
+      },
+      "2019": {
+        "n_days": 260,
+        "sharpe_modulated": 0.23250141253455842,
+        "sharpe_baseline": -0.6977217624379137,
+        "return_modulated": 0.014460011405507109,
+        "return_baseline": -0.07782942254541196
+      },
+      "2020": {
+        "n_days": 262,
+        "sharpe_modulated": 2.721566418975029,
+        "sharpe_baseline": -0.06529924757783898,
+        "return_modulated": 0.24825614938249005,
+        "return_baseline": -0.00740633503060753
+      },
+      "2021": {
+        "n_days": 261,
+        "sharpe_modulated": 1.617881860643651,
+        "sharpe_baseline": 0.4530714873735848,
+        "return_modulated": 0.11979741311485556,
+        "return_baseline": 0.05174359698815384
+      },
+      "2022": {
+        "n_days": 260,
+        "sharpe_modulated": 2.3406808627289264,
+        "sharpe_baseline": 0.2604681688539985,
+        "return_modulated": 0.27924156699715424,
+        "return_baseline": 0.030502702691499226
+      },
+      "2023": {
+        "n_days": 260,
+        "sharpe_modulated": 1.3110632550936305,
+        "sharpe_baseline": 0.559258313633876,
+        "return_modulated": 0.12947056566038195,
+        "return_baseline": 0.059022126890137
+      },
+      "2024": {
+        "n_days": 64,
+        "sharpe_modulated": 2.1791661428815825,
+        "sharpe_baseline": 0.9702669574592556,
+        "return_modulated": 0.04961917905445909,
+        "return_baseline": 0.02285130400010553
+      }
+    },
+    "overall_sharpe_modulated": 1.7010769866791888,
+    "overall_sharpe_baseline": 0.0400978248563297,
+    "cumulative_return_modulated": 0.8391951258615404,
+    "cumulative_return_baseline": 0.024240029769897482
+  },
+  "val": {
+    "n_days": 330,
+    "hit_rate": {
+      "EURUSD": 0.39156627655029297,
+      "USDJPY": 0.5138339996337891,
+      "AUDUSD": 0.6269429922103882
+    },
+    "confusion_matrix": {
+      "EURUSD": {
+        "tp": 45,
+        "fp": 54,
+        "tn": 20,
+        "fn": 47,
+        "abstained": 164,
+        "n_decided": 166.0,
+        "accuracy": 0.3915662650366526,
+        "precision": 0.45454545449954087,
+        "recall": 0.4891304347294424,
+        "specificity": 0.2702702702337473,
+        "f1": 0.4712041834390505,
+        "coverage": 0.5030303030150597
+      },
+      "USDJPY": {
+        "tp": 129,
+        "fp": 116,
+        "tn": 1,
+        "fn": 7,
+        "abstained": 77,
+        "n_decided": 253.0,
+        "accuracy": 0.513833992074552,
+        "precision": 0.5265306122234069,
+        "recall": 0.948529411694961,
+        "specificity": 0.008547008546278033,
+        "f1": 0.6771653497043972,
+        "coverage": 0.7666666666434343
+      },
+      "AUDUSD": {
+        "tp": 58,
+        "fp": 25,
+        "tn": 63,
+        "fn": 47,
+        "abstained": 137,
+        "n_decided": 193.0,
+        "accuracy": 0.626943005148863,
+        "precision": 0.6987951806386994,
+        "recall": 0.5523809523283447,
+        "specificity": 0.7159090908277377,
+        "f1": 0.6170212715985741,
+        "coverage": 0.5848484848307621
+      }
+    },
+    "annual_sharpe": {
+      "2024": {
+        "n_days": 163,
+        "sharpe_modulated": -0.5744815250666842,
+        "sharpe_baseline": -1.2027006821517987,
+        "return_modulated": -0.03057976272204907,
+        "return_baseline": -0.08754990116727357
+      },
+      "2025": {
+        "n_days": 167,
+        "sharpe_modulated": 0.7477721496762654,
+        "sharpe_baseline": 0.5276061745800172,
+        "return_modulated": 0.04478379325157182,
+        "return_baseline": 0.03646539990263677
+      }
+    },
+    "overall_sharpe_modulated": 0.12531964383337005,
+    "overall_sharpe_baseline": -0.3591711939441859,
+    "cumulative_return_modulated": 0.01420403052952276,
+    "cumulative_return_baseline": -0.05108450126463684
+  },
+  "test": {
+    "n_days": 202,
+    "hit_rate": {
+      "EURUSD": 0.4913793206214905,
+      "USDJPY": 0.5421686768531799,
+      "AUDUSD": 0.5151515007019043
+    },
+    "confusion_matrix": {
+      "EURUSD": {
+        "tp": 47,
+        "fp": 44,
+        "tn": 10,
+        "fn": 15,
+        "abstained": 86,
+        "n_decided": 116.0,
+        "accuracy": 0.49137931030246734,
+        "precision": 0.51648351642676,
+        "recall": 0.7580645160067637,
+        "specificity": 0.18518518515089163,
+        "f1": 0.6143790800666411,
+        "coverage": 0.5742574257141456
+      },
+      "USDJPY": {
+        "tp": 43,
+        "fp": 21,
+        "tn": 2,
+        "fn": 17,
+        "abstained": 119,
+        "n_decided": 83.0,
+        "accuracy": 0.5421686746334737,
+        "precision": 0.6718749998950196,
+        "recall": 0.7166666665472222,
+        "specificity": 0.08695652170132324,
+        "f1": 0.6935483819901146,
+        "coverage": 0.41089108908856975
+      },
+      "AUDUSD": {
+        "tp": 20,
+        "fp": 10,
+        "tn": 48,
+        "fn": 54,
+        "abstained": 70,
+        "n_decided": 132.0,
+        "accuracy": 0.5151515151124885,
+        "precision": 0.6666666664444444,
+        "recall": 0.2702702702337473,
+        "specificity": 0.8275862067538644,
+        "f1": 0.38461538043639054,
+        "coverage": 0.6534653465023037
+      }
+    },
+    "annual_sharpe": {
+      "2025": {
+        "n_days": 55,
+        "sharpe_modulated": 0.023602215722285644,
+        "sharpe_baseline": 4.719387898131365,
+        "return_modulated": 0.0002982489678472035,
+        "return_baseline": 0.07485319012860742
+      },
+      "2026": {
+        "n_days": 147,
+        "sharpe_modulated": -0.2079782938095594,
+        "sharpe_baseline": 1.0574313374693958,
+        "return_modulated": -0.008483035585234801,
+        "return_baseline": 0.06697949428636867
+      }
+    },
+    "overall_sharpe_modulated": -0.15270763014514543,
+    "overall_sharpe_baseline": 1.76417187667829,
+    "cumulative_return_modulated": -0.008184786617387588,
+    "cumulative_return_baseline": 0.141832684414976
+  }
+}

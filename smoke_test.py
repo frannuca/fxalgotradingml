@@ -24,6 +24,11 @@ sys.modules["data.fx_downloader"] = fx_stub
 import torch
 from models import portfolio_lstm as pl
 
+# Captured before test 7 permanently monkeypatches pl.load_close_prices -
+# test 12b needs the REAL function (it's testing load_close_prices itself),
+# reached directly rather than via the (by then patched) module attribute.
+_real_load_close_prices = pl.load_close_prices
+
 torch.manual_seed(0)
 np.random.seed(0)
 
@@ -191,7 +196,7 @@ import pandas as pd
 sweep_pairs = ["A", "B"]
 sweep_dates = pd.bdate_range("2020-01-01", periods=300)
 sweep_returns = pd.DataFrame(np.random.randn(300, 2) * 0.005, index=sweep_dates, columns=sweep_pairs)
-pl.load_close_prices = lambda symbols, years: (1 + sweep_returns[symbols]).cumprod() * 1.1
+pl.load_close_prices = lambda symbols, years, cutoff_date=None: (1 + sweep_returns[symbols]).cumprod() * 1.1
 
 import argparse
 sweep_args = argparse.Namespace(**{
@@ -324,5 +329,185 @@ assert (bullish_today["position_modulated"] > bearish_today["position_modulated"
     "a more bullish today's probability should size a larger (or less negative) position, same history"
 )
 print("9d. latest_position OK: today's probability moves the booked position in the right direction")
+
+# --- 10. train_prediction_model's optional portfolio-Sharpe phase (sharpe_weight) ---
+
+def _make_sharpe_data(n_assets_, seed, t=250):
+    torch.manual_seed(seed)
+    x = torch.randn(t, lookback, n_assets_ * n_channels)
+    z = torch.randn(t, lookback, n_assets_)
+    sig = x[:, -1, 0::n_channels]
+    z[:, -1, :] = sig + 0.3 * torch.randn(t, n_assets_)
+    ret = (0.001 * sig + 0.002 * torch.randn(t, n_assets_)).numpy().astype(np.float32)
+    rp, cov_ = pp.precompute_risk_parity(ret, cov_window=60)
+    return x, z, torch.tensor(ret), torch.tensor(rp, dtype=torch.float32), torch.tensor(cov_, dtype=torch.float32)
+
+# 10a. sharpe_weight=0 (default) is a byte-identical no-op: calling
+# train_prediction_model WITH the new kwargs (all disabled) vs WITHOUT
+# them at all must produce identical trained weights - the regression
+# guarantee every other test in this file already relies on implicitly.
+X10, z10, ret10, rp10, cov10 = _make_sharpe_data(2, seed=7)
+torch.manual_seed(3)
+model_old_call = pl.PredictionModel(n_assets=2, pairs=["A", "B"], n_channels=n_channels, hidden_size=8, dropout=0.0)
+pl.train_prediction_model(model_old_call, X10, z10, epochs=10, lr=1e-2, bce_weight=1.0)
+torch.manual_seed(3)
+model_new_call = pl.PredictionModel(n_assets=2, pairs=["A", "B"], n_channels=n_channels, hidden_size=8, dropout=0.0)
+pl.train_prediction_model(
+    model_new_call, X10, z10, epochs=10, lr=1e-2, bce_weight=1.0,
+    sharpe_weight=0.0, sharpe_window=20, direction_horizon=5, target_vol=0.10,
+    next_returns_train=ret10, rp_weights_train=rp10, cov_train=cov10,
+)
+with torch.no_grad():
+    mu_old, _ = model_old_call(X10)
+    mu_new, _ = model_new_call(X10)
+assert torch.allclose(mu_old, mu_new, atol=1e-7), "sharpe_weight=0 must be a byte-identical no-op"
+print("10a. sharpe_weight=0 OK: byte-identical no-op vs. the pre-existing call signature")
+
+# 10b. sharpe_weight > 0 genuinely couples assets (the whole point of the
+# joint vol-scaling design) - asset A's OWN training now depends on an
+# unrelated asset B being present, the OPPOSITE of test 1c's guarantee
+# (which only holds for the default sharpe_weight=0 path). Same solo-vs-
+# paired harness as 1c, but with sharpe_weight=1.0.
+torch.manual_seed(11)
+Xa, za, reta, rpa, cova = _make_sharpe_data(1, seed=11)
+model_solo = pl.PredictionModel(n_assets=1, pairs=["A"], n_channels=n_channels, hidden_size=8, dropout=0.0)
+pl.train_prediction_model(
+    model_solo, Xa, za, epochs=15, lr=1e-2, bce_weight=1.0,
+    sharpe_weight=1.0, sharpe_window=20, direction_horizon=5, target_vol=0.10,
+    next_returns_train=reta, rp_weights_train=rpa, cov_train=cova,
+)
+with torch.no_grad():
+    mu_solo10, _ = model_solo(Xa)
+hit_solo10 = float(((mu_solo10[:, -1, 0] > 0) == (za[:, -1, 0] > 0)).float().mean())
+
+torch.manual_seed(11)
+Xa2, za2, _, _, _ = _make_sharpe_data(1, seed=11)  # asset A alone, same seed -> identical init/data up to this point
+torch.manual_seed(22)
+x_b_noise = torch.randn(za.shape[0], lookback, n_channels)
+X_pair10 = torch.cat([Xa2, x_b_noise], dim=-1)
+z_pair10 = torch.zeros(za.shape[0], lookback, 2)
+z_pair10[:, -1, 0] = za2[:, -1, 0]
+z_pair10[:, -1, 1] = torch.randn(za.shape[0])
+ret_pair10 = torch.cat([reta, 0.01 * torch.randn(za.shape[0], 1)], dim=-1).numpy().astype(np.float32)
+rp_pair10, cov_pair10 = pp.precompute_risk_parity(ret_pair10, cov_window=60)
+
+torch.manual_seed(11)
+model_pair10 = pl.PredictionModel(n_assets=2, pairs=["A", "B"], n_channels=n_channels, hidden_size=8, dropout=0.0)
+pl.train_prediction_model(
+    model_pair10, X_pair10, z_pair10, epochs=15, lr=1e-2, bce_weight=1.0,
+    sharpe_weight=1.0, sharpe_window=20, direction_horizon=5, target_vol=0.10,
+    next_returns_train=torch.tensor(ret_pair10), rp_weights_train=torch.tensor(rp_pair10, dtype=torch.float32),
+    cov_train=torch.tensor(cov_pair10, dtype=torch.float32),
+)
+with torch.no_grad():
+    mu_pair10, _ = model_pair10(X_pair10)
+hit_pair_a10 = float(((mu_pair10[:, -1, 0] > 0) == (z_pair10[:, -1, 0] > 0)).float().mean())
+
+assert abs(hit_solo10 - hit_pair_a10) > 1e-6, (
+    f"sharpe_weight > 0 should couple assets (solo {hit_solo10:.3f} vs paired {hit_pair_a10:.3f}) - "
+    f"got identical results, the joint vol-scaling phase isn't actually reaching asset A's gradient"
+)
+print(f"10b. sharpe_weight>0 OK: asset A's training genuinely coupled to unrelated asset B ({hit_solo10:.3f} solo vs {hit_pair_a10:.3f} paired)")
+
+# 10c. training with sharpe_weight > 0 actually improves the realized
+# training Sharpe on a planted profitable signal - checks the objective's
+# SIGN is right (maximizing, not accidentally minimizing) and that
+# gradients genuinely flow end-to-end from the Sharpe loss to the model's
+# own weights.
+X10c, z10c, ret10c, rp10c, cov10c = _make_sharpe_data(2, seed=42, t=300)
+model_sharpe = pl.PredictionModel(n_assets=2, pairs=["A", "B"], n_channels=n_channels, hidden_size=8, dropout=0.0)
+with torch.no_grad():
+    sharpe_before = -pl._portfolio_sharpe_loss(model_sharpe, X10c, ret10c, rp10c, cov10c, 5, 20, 0.10).item()
+pl.train_prediction_model(
+    model_sharpe, X10c, z10c, epochs=40, lr=1e-2, bce_weight=1.0,
+    sharpe_weight=2.0, sharpe_window=20, direction_horizon=5, target_vol=0.10,
+    next_returns_train=ret10c, rp_weights_train=rp10c, cov_train=cov10c,
+)
+with torch.no_grad():
+    sharpe_after = -pl._portfolio_sharpe_loss(model_sharpe, X10c, ret10c, rp10c, cov10c, 5, 20, 0.10).item()
+assert sharpe_after > sharpe_before, (
+    f"training sharpe should improve with sharpe_weight > 0 (before {sharpe_before:.3f}, after {sharpe_after:.3f})"
+)
+print(f"10c. sharpe_weight>0 OK: training sharpe improved {sharpe_before:.3f} -> {sharpe_after:.3f}")
+
+# 10d. NaN in the precomputed rp_weights/cov (early warm-up days, see
+# rolling_covariance_matrices) must not poison the loss/gradients with NaN
+# (see _portfolio_sharpe_loss's own docstring on why nan_to_num happens
+# BEFORE arithmetic, not after: 0 * NaN is still NaN in IEEE754).
+X10d, z10d, ret10d, rp10d, cov10d = _make_sharpe_data(2, seed=5, t=80)  # short series -> real NaN warm-up region
+assert torch.isnan(rp10d[:19]).any(), "test setup assumption: short series should have a real NaN warm-up region"
+model_nan = pl.PredictionModel(n_assets=2, pairs=["A", "B"], n_channels=n_channels, hidden_size=8, dropout=0.0)
+loss10d = pl._portfolio_sharpe_loss(model_nan, X10d, ret10d, rp10d, cov10d, 5, 20, 0.10)
+assert torch.isfinite(loss10d), f"NaN warm-up rows leaked into the Sharpe loss: {loss10d}"
+loss10d.backward()
+for p in model_nan.parameters():
+    assert p.grad is None or torch.isfinite(p.grad).all(), "NaN warm-up rows leaked into gradients"
+print("10d. _portfolio_sharpe_loss OK: NaN warm-up rows don't poison the loss or gradients")
+
+# --- 11. _assert_finite_grad: the immediate-failure safety net ---
+# Real-world context: a run with num_layers=2, hidden_size=128,
+# device="mps" produced a FINITE loss but a NaN gradient on its very
+# first backward() - a confirmed PyTorch MPS multi-layer-LSTM
+# backward-kernel bug (the identical forward/backward pass on
+# device="cpu" is fine - see train_prediction_model's own docstring/
+# _assert_finite_grad). That bug is environment-specific and can't be
+# reproduced portably here, so this test instead verifies the SAFETY NET
+# itself: a manufactured NaN gradient must be caught immediately with a
+# clear error, not silently passed to optimizer.step().
+tiny_model = pl.PredictionModel(n_assets=1, pairs=["A"], n_channels=n_channels, hidden_size=4)
+some_param = next(tiny_model.assets[0].parameters())
+some_param.grad = torch.full_like(some_param, float("nan"))
+try:
+    pl._assert_finite_grad(tiny_model.assets[0].parameters(), "test context")
+    raise AssertionError("_assert_finite_grad should have raised on a NaN gradient")
+except RuntimeError as exc:
+    assert "test context" in str(exc), f"error message should include the context: {exc}"
+some_param.grad = torch.zeros_like(some_param)  # finite grad must NOT raise
+pl._assert_finite_grad(tiny_model.assets[0].parameters(), "test context")
+print("11. _assert_finite_grad OK: raises immediately on a NaN gradient, silent on a finite one")
+
+# --- 12. cutoff_date: never fetch/return a day after it ---
+from datetime import date as _date
+
+# 12a. _resolve_cutoff_date: None/far-future both collapse to today; a
+# genuine past date passes through unchanged.
+assert pl._resolve_cutoff_date(None) == _date.today()
+assert pl._resolve_cutoff_date("9999-01-01") == _date.today()
+past_cutoff = _date.today() - pd.Timedelta(days=30)
+assert pl._resolve_cutoff_date(past_cutoff.isoformat()) == past_cutoff
+assert pl._resolve_cutoff_date(past_cutoff) == past_cutoff
+print("12a. _resolve_cutoff_date OK: None/future -> today, past date passes through unchanged")
+
+# 12b. load_close_prices must never ask db.py for (or return) a day past
+# cutoff_date - patch get_time_series to record its own `end` argument and
+# to return data that DELIBERATELY extends past the requested cutoff (as
+# if Postgres already had fresher rows from e.g. /api/quotes/refresh), and
+# confirm both the query bound AND the returned frame respect the cutoff.
+cutoff_dates = pd.bdate_range("2020-01-01", periods=250)
+cutoff_wide = pd.DataFrame(1.1 + np.random.randn(250, 2) * 0.01, index=cutoff_dates, columns=["A", "B"])
+captured_end = {}
+
+def _fake_get_time_series(symbols, start, end, source="yahoo", field="close"):
+    # Mirrors db.py's own real SQL `WHERE as_of_date BETWEEN start AND
+    # end`, deliberately fed a frame that extends PAST the requested
+    # cutoff (as if Postgres already had fresher rows from e.g.
+    # /api/quotes/refresh) - so this only passes if load_close_prices
+    # actually asks for (and therefore only ever receives) rows up to
+    # cutoff_date, not "whatever happens to be in the table".
+    captured_end["end"] = end
+    mask = (cutoff_wide.index >= pd.Timestamp(start)) & (cutoff_wide.index <= pd.Timestamp(end))
+    return cutoff_wide.loc[mask, list(symbols)]
+
+_real_get_time_series = pl.get_time_series
+pl.get_time_series = _fake_get_time_series
+try:
+    cutoff = _date(2020, 6, 1)
+    prices_cut = _real_load_close_prices(["A", "B"], years=3, cutoff_date=cutoff.isoformat())
+    assert captured_end["end"] == cutoff, f"expected query end={cutoff}, got {captured_end['end']}"
+    assert prices_cut.index.max().date() <= cutoff, "load_close_prices returned a row after cutoff_date"
+    assert prices_cut.index.max().date() == cutoff_dates[cutoff_dates <= pd.Timestamp(cutoff)].max().date()
+finally:
+    pl.get_time_series = _real_get_time_series
+print("12b. load_close_prices OK: cutoff_date bounds both the db.py query and the returned frame")
 
 print("\nALL SMOKE TESTS PASSED")

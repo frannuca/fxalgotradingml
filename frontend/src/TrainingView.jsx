@@ -5,6 +5,7 @@ import ColoredReturnChart from "./charts/ColoredReturnChart";
 import ProbabilityChart from "./charts/ProbabilityChart";
 import ReturnDistributionChart from "./charts/ReturnDistributionChart";
 import ConfusionMatrixTable from "./ConfusionMatrixTable";
+import AnnualSharpeTable from "./AnnualSharpeTable";
 import { SPLIT_LABEL } from "./theme";
 import { confusionMatrixForSplit, hitAbstainedSeries, hitRateForSplit } from "./metrics";
 
@@ -21,10 +22,22 @@ const FEATURE_OPTIONS = [
   ["bandpass", "Butterworth bandpass (faster-reacting trend)"],
 ];
 
+const DEVICE_OPTIONS = [
+  ["auto", "Auto (Metal/MPS if available, else CUDA, else CPU)"],
+  ["cpu", "CPU"],
+  ["mps", "MPS (Apple Silicon)"],
+];
+
 const DEFAULT_FORM = {
   pairs: [],
   lookback: 30,
   years: 8,
+  // "" = no cutoff (backend default: use all data up to today, computed
+  // fresh on every run). An ISO "YYYY-MM-DD" date caps every fetched
+  // series (prices + carry) at that date - never later - so a
+  // walk-forward backtest never trains/validates on data past it (see
+  // models/portfolio_lstm.py's _resolve_cutoff_date).
+  cutoff_date: "",
   train_frac: 0.8,
   test_frac: 0.1,
   direction_horizon: 5,
@@ -47,11 +60,20 @@ const DEFAULT_FORM = {
   lr: 0.001,
   weight_decay: 0.0001,
   bce_weight: "1.0", // free text: a single number, or comma-separated to SWEEP (see parseBceWeight)
+  // Optional COMPLEMENTARY training objective - 0 (default) disables it,
+  // training is then unchanged (own optimizer/loss per asset only). > 0
+  // adds a joint portfolio-Sharpe phase: risk-parity weight x this
+  // model's own probability signal, scaled to target_vol below,
+  // maximizing an averaged rolling Sharpe over sharpe_window days - see
+  // models/portfolio_lstm.py's train_prediction_model docstring.
+  sharpe_weight: 0,
+  sharpe_window: 20,
   neutral_band: 0.05,
   // Annualized volatility the Evaluation view's portfolio PnL calculator
   // scales this model's positions to (see models/portfolio_pnl.py) -
   // persisted with the model, like neutral_band, not a free
-  // evaluation-time parameter.
+  // evaluation-time parameter. Also used DURING training if
+  // sharpe_weight above is > 0.
   target_vol: 0.1,
   n_seeds: 1,
   device: "auto",
@@ -63,7 +85,7 @@ const NUMERIC_FIELDS = new Set([
   "lookback", "years", "train_frac", "test_frac", "direction_horizon", "rolling_stats_window",
   "hidden_size", "num_layers", "dropout", "n_attn_heads",
   "epochs", "lr", "weight_decay", "neutral_band", "target_vol",
-  "n_seeds", "bandpass_order",
+  "n_seeds", "bandpass_order", "sharpe_weight", "sharpe_window",
 ]);
 
 // "1.0" -> 1.0 (single value); "1.0, 1.5, 2.0" -> [1.0, 1.5, 2.0] (sweep -
@@ -205,6 +227,7 @@ export default function TrainingView() {
     try {
       const { job_id } = await startTraining({
         ...form,
+        cutoff_date: form.cutoff_date || null,
         bce_weight: parseBceWeight(form.bce_weight),
         cma_windows: form.cma_windows.map((w) => [w.short, w.long]),
         bandpass_windows: form.bandpass_windows.map((w) => [w.short, w.long]),
@@ -292,6 +315,12 @@ export default function TrainingView() {
           <div className="form-grid">
             <NumField label="Lookback (days)" name="lookback" value={form.lookback} onChange={updateField} />
             <NumField label="Years of history" name="years" value={form.years} onChange={updateField} />
+            <DateField
+              label="Cutoff date (blank = today, no cutoff)"
+              name="cutoff_date"
+              value={form.cutoff_date}
+              onChange={updateField}
+            />
             <NumField label="Train fraction (of non-test data)" name="train_frac" step="0.05" value={form.train_frac} onChange={updateField} />
             <NumField label="Test fraction (held out, most recent)" name="test_frac" step="0.05" value={form.test_frac} onChange={updateField} />
             <NumField
@@ -457,6 +486,8 @@ export default function TrainingView() {
             </div>
             <NumField label="Neutral band (abstention half-width)" name="neutral_band" step="0.01" value={form.neutral_band} onChange={updateField} />
             <NumField label="Target vol (annualized, for portfolio PnL)" name="target_vol" step="0.01" value={form.target_vol} onChange={updateField} />
+            <NumField label="Sharpe weight (0 = disabled)" name="sharpe_weight" step="0.1" value={form.sharpe_weight} onChange={updateField} />
+            <NumField label="Sharpe window (days)" name="sharpe_window" value={form.sharpe_window} onChange={updateField} />
           </div>
           <p className="status-line" style={{ marginTop: 4 }}>
             Every asset's LSTM trains FULLY INDEPENDENTLY: its own optimizer, its own loss - never averaged or
@@ -467,6 +498,16 @@ export default function TrainingView() {
             sign, so any discriminating feature gets pulled into spreading μ across zero. Applied densely, over
             every day in every window, not just the last one. Each asset's own checkpoint is restored from ITS OWN
             best validation epoch independently, too - one asset's convergence never drags another's along.
+          </p>
+          <p className="status-line" style={{ marginTop: 4 }}>
+            "Sharpe weight" 0 keeps the above unchanged. {'>'} 0 adds a SECOND, complementary training phase: the
+            model's own probability signal × a precomputed (data-only, never optimized) risk-parity weight, scaled
+            to "Target vol", drives an averaged rolling Sharpe (over "Sharpe window" days) that gets maximized -
+            the same strategy the Evaluation page's portfolio PnL calculator reports. Unlike everything else here,
+            this phase is NOT per-asset independent: the vol-scaling denominator mixes every asset's current
+            signal, so one asset's training genuinely depends on what the others are currently predicting. Keep
+            this modest relative to "BCE direction weight" - directly maximizing Sharpe on noisy daily returns can
+            drift toward low-variance, low-conviction bets rather than genuine predictive signal.
           </p>
           <p className="status-line" style={{ marginTop: 4 }}>
             Enter several comma-separated values to SWEEP the BCE weight alongside the seeds below: every value is
@@ -482,14 +523,24 @@ export default function TrainingView() {
         </div>
 
         <div className="panel">
-          <h2 style={{ marginTop: 0 }}>Multi-seed restarts</h2>
+          <h2 style={{ marginTop: 0 }}>Multi-seed restarts &amp; execution</h2>
           <div className="form-grid">
             <NumField label="Number of seeds" name="n_seeds" value={form.n_seeds} onChange={updateField} />
+            <div className="field">
+              <label>Execution device</label>
+              <select value={form.device} onChange={(e) => updateField("device", e.target.value)}>
+                {DEVICE_OPTIONS.map(([key, label]) => (
+                  <option key={key} value={key}>{label}</option>
+                ))}
+              </select>
+            </div>
           </div>
           <p className="status-line" style={{ marginTop: 4 }}>
             Trains this many independent restarts and keeps whichever had the lowest validation log loss (not hit
             rate - see the model's own docs for why a saturating accuracy metric is the wrong thing to compare
-            restarts on).
+            restarts on). "Auto" picks Apple Silicon's Metal backend (MPS) if available, else CUDA, else CPU - if
+            training fails with a non-finite-gradient error, try "CPU" (a known PyTorch MPS bug affects some
+            multi-layer, large-hidden-size architectures - see models/portfolio_lstm.py's train_prediction_model).
           </p>
         </div>
 
@@ -613,6 +664,14 @@ export default function TrainingView() {
           <h2>Confusion matrix</h2>
           <ConfusionMatrixTable pairs={result.pairs} confusionMatrix={confusionMatrix} />
 
+          <h2>Portfolio Sharpe by year (risk parity, probability-modulated)</h2>
+          {["train", "val", "test"].map((split) => (
+            <div key={split}>
+              <h3>{SPLIT_LABEL[split]}</h3>
+              <AnnualSharpeTable annualSharpe={result.annual_sharpe[split]} />
+            </div>
+          ))}
+
           <h2>Cumulative returns (colored by prediction hit/miss)</h2>
           {["train", "val", "test"].map((split) => (
             <div key={split}>
@@ -674,6 +733,15 @@ function NumField({ label, name, value, onChange, step = "1" }) {
     <div className="field">
       <label>{label}</label>
       <input type="number" step={step} value={value} onChange={(e) => onChange(name, e.target.value)} />
+    </div>
+  );
+}
+
+function DateField({ label, name, value, onChange }) {
+  return (
+    <div className="field">
+      <label>{label}</label>
+      <input type="date" value={value} onChange={(e) => onChange(name, e.target.value)} />
     </div>
   );
 }

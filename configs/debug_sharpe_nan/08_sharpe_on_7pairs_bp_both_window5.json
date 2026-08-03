@@ -1,0 +1,53 @@
+{
+  "lookback": 30,
+  "years": 8,
+  "train_frac": 0.8,
+  "test_frac": 0.1,
+  "direction_horizon": 5,
+  "rolling_stats_window": 20,
+  "features": [
+    "log_return",
+    "vol",
+    "skew",
+    "kurt",
+    "bandpass"
+  ],
+  "cma_windows": [],
+  "bandpass_windows": [
+    [
+      5,
+      25
+    ],
+    [
+      50,
+      100
+    ]
+  ],
+  "bandpass_order": 3,
+  "cross_pairs": {},
+  "hidden_size": 8,
+  "num_layers": 1,
+  "dropout": 0.1,
+  "n_attn_heads": 4,
+  "epochs": 1,
+  "lr": 0.001,
+  "weight_decay": 0.0001,
+  "bce_weight": 1.0,
+  "sharpe_weight": 1.0,
+  "sharpe_window": 5,
+  "neutral_band": 0.05,
+  "target_vol": 0.1,
+  "n_seeds": 1,
+  "device": "cpu",
+  "save_db": false,
+  "pairs": [
+    "EURUSD",
+    "USDJPY",
+    "GBPUSD",
+    "USDCHF",
+    "AUDUSD",
+    "USDCAD",
+    "NZDUSD"
+  ],
+  "model_description": "same as 07 but sharpe_window=5"
+}

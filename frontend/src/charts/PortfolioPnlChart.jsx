@@ -1,14 +1,26 @@
 import { CartesianGrid, Legend, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
-import { AXIS_COLOR, BASELINE_COLOR, GRID_COLOR, MODULATED_COLOR } from "../theme";
+import { AXIS_COLOR, BASELINE_COLOR, GRID_COLOR, MODULATED_COLOR, pairColor } from "../theme";
 
 // Whole-book cumulative PnL (summed across every pair's position * that
 // day's realized return - see models/portfolio_pnl.py's compute_portfolio):
 // the probability-modulated, target-vol-scaled strategy against the
-// unmodulated risk-parity baseline.
-export default function PortfolioPnlChart({ dates, cumulativeModulated, cumulativeBaseline, height = 300 }) {
-  const data = dates.map((date, i) => ({
-    date, modulated: cumulativeModulated[i], baseline: cumulativeBaseline[i],
-  }));
+// unmodulated risk-parity baseline, PLUS each pair's own modulated
+// contribution in the same plot (see api/server.py's _portfolio_payload -
+// `perAssetCumulativePnl[pair]` sums, per day, to `cumulativeModulated`).
+// Per-asset lines use the same fixed categorical palette every other
+// per-pair chart in this app uses (see theme.js's pairColor), thinner than
+// the two book-level lines so the aggregate comparison stays the visual
+// headline.
+export default function PortfolioPnlChart({
+  dates, pairs, cumulativeModulated, cumulativeBaseline, perAssetCumulativePnl, height = 320,
+}) {
+  const data = dates.map((date, i) => {
+    const row = { date, modulated: cumulativeModulated[i], baseline: cumulativeBaseline[i] };
+    for (const pair of pairs) {
+      row[pair] = perAssetCumulativePnl[pair][i];
+    }
+    return row;
+  });
 
   return (
     <div className="chart-card">
@@ -24,25 +36,39 @@ export default function PortfolioPnlChart({ dates, cumulativeModulated, cumulati
           />
           <YAxis tick={{ fontSize: 11, fill: AXIS_COLOR }} axisLine={{ stroke: GRID_COLOR }} tickLine={false} width={64} />
           <Tooltip
-            formatter={(value) => [Number(value).toFixed(4), "cumulative pnl"]}
+            formatter={(value, name) => [Number(value).toFixed(4), name]}
             contentStyle={{ fontSize: 12, borderRadius: 6 }}
           />
           <Legend wrapperStyle={{ fontSize: 12 }} />
+          {pairs.map((pair) => (
+            <Line
+              key={pair}
+              type="monotone"
+              dataKey={pair}
+              name={`${pair} (modulated)`}
+              stroke={pairColor(pairs, pair)}
+              strokeWidth={1}
+              dot={false}
+              isAnimationActive={false}
+            />
+          ))}
           <Line
             type="monotone"
             dataKey="modulated"
-            name="Modulated (vol-targeted)"
+            name="Total (modulated)"
             stroke={MODULATED_COLOR}
-            strokeWidth={1.5}
+            strokeWidth={2.5}
+            strokeDasharray="6 3"
             dot={false}
             isAnimationActive={false}
           />
           <Line
             type="monotone"
             dataKey="baseline"
-            name="Risk parity (unmodulated)"
+            name="Total (risk parity, unmodulated)"
             stroke={BASELINE_COLOR}
-            strokeWidth={1.5}
+            strokeWidth={2.5}
+            strokeDasharray="6 3"
             dot={false}
             isAnimationActive={false}
           />

@@ -9,20 +9,23 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
-import { AXIS_COLOR, GRID_COLOR, SPLIT_COLOR, SPLIT_LABEL } from "../theme";
+import { AXIS_COLOR, GRID_COLOR, PROBABILITY_COLOR, SPLIT_COLOR, SPLIT_LABEL } from "../theme";
 
-// Grouped bar chart: one asset per group, three bars (train/val/test) -
-// `hitRate` is {train: {<pair>: rate}, val: {...}, test: {...}} (see
-// api/server.py's _hit_rate_payload). A dashed reference line at 0.5 marks
-// random-chance (no directional skill) so a bar's position relative to it
-// is immediately readable.
+// Grouped bar chart: one asset per group. `hitRate` is EITHER
+// {train: {<pair>: rate}, val: {...}, test: {...}} (Training view - three
+// bars, one per split) OR a FLAT {<pair>: rate} (Evaluation view - a
+// single continuous period, no split - see api/server.py's evaluate()/
+// _hit_rate_payload) - one bar per asset. Detected by whether a `train`
+// key is present. A dashed reference line at 0.5 marks random-chance (no
+// directional skill) so a bar's position relative to it is immediately
+// readable.
 export default function HitRateChart({ pairs, hitRate, height = 300 }) {
-  const data = pairs.map((pair) => ({
-    pair,
-    [SPLIT_LABEL.train]: hitRate.train[pair],
-    [SPLIT_LABEL.val]: hitRate.val[pair],
-    [SPLIT_LABEL.test]: hitRate.test[pair],
-  }));
+  const isSplit = hitRate && typeof hitRate.train === "object";
+  const data = pairs.map((pair) => (
+    isSplit
+      ? { pair, [SPLIT_LABEL.train]: hitRate.train[pair], [SPLIT_LABEL.val]: hitRate.val[pair], [SPLIT_LABEL.test]: hitRate.test[pair] }
+      : { pair, "Hit rate": hitRate[pair] }
+  ));
 
   return (
     <div className="chart-card">
@@ -50,9 +53,15 @@ export default function HitRateChart({ pairs, hitRate, height = 300 }) {
             strokeDasharray="4 4"
             label={{ value: "random chance (50%)", position: "insideTopRight", fontSize: 10, fill: AXIS_COLOR }}
           />
-          <Bar dataKey={SPLIT_LABEL.train} fill={SPLIT_COLOR.train} radius={[2, 2, 0, 0]} isAnimationActive={false} />
-          <Bar dataKey={SPLIT_LABEL.val} fill={SPLIT_COLOR.val} radius={[2, 2, 0, 0]} isAnimationActive={false} />
-          <Bar dataKey={SPLIT_LABEL.test} fill={SPLIT_COLOR.test} radius={[2, 2, 0, 0]} isAnimationActive={false} />
+          {isSplit ? (
+            <>
+              <Bar dataKey={SPLIT_LABEL.train} fill={SPLIT_COLOR.train} radius={[2, 2, 0, 0]} isAnimationActive={false} />
+              <Bar dataKey={SPLIT_LABEL.val} fill={SPLIT_COLOR.val} radius={[2, 2, 0, 0]} isAnimationActive={false} />
+              <Bar dataKey={SPLIT_LABEL.test} fill={SPLIT_COLOR.test} radius={[2, 2, 0, 0]} isAnimationActive={false} />
+            </>
+          ) : (
+            <Bar dataKey="Hit rate" fill={PROBABILITY_COLOR} radius={[2, 2, 0, 0]} isAnimationActive={false} />
+          )}
         </BarChart>
       </ResponsiveContainer>
     </div>

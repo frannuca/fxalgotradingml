@@ -1,18 +1,22 @@
 import { SPLIT_LABEL } from "./theme";
 
-// `confusionMatrix` is {train: {<pair>: {tp,fp,tn,fn,abstained,coverage,
-// accuracy,precision,recall,specificity,f1}}, val: {...}, test: {...}}
-// (see api/server.py's _confusion_matrix_payload) - one table per split,
-// one row per asset. With a neutral band, every metric except `abstained`
-// itself is computed over DECIDED samples only - accuracy and coverage
-// must be read together (100% accuracy at 2% coverage is a very
-// different claim from 55% at 80%).
+// `confusionMatrix` is EITHER {train: {<pair>: {...}}, val: {...}, test:
+// {...}} (Training view - three splits genuinely mean something there:
+// val drives checkpoint selection, test is held out) OR a FLAT
+// {<pair>: {tp,fp,tn,fn,abstained,coverage,accuracy,precision,recall,
+// specificity,f1}} (Evaluation view - a single continuous period, no
+// split - see api/server.py's evaluate()/_confusion_matrix_payload).
+// Detected by whether a `train` key is present, so this one component
+// serves both without either view needing to know about the other's shape.
 export default function ConfusionMatrixTable({ pairs, confusionMatrix }) {
+  const isSplit = confusionMatrix && typeof confusionMatrix.train === "object";
+  const splits = isSplit ? ["train", "val", "test"] : [null];
+
   return (
     <div className="panel">
-      {["train", "val", "test"].map((split) => (
-        <div key={split} style={{ marginBottom: 20 }}>
-          <h3 style={{ marginBottom: 6 }}>{SPLIT_LABEL[split]}</h3>
+      {splits.map((split) => (
+        <div key={split ?? "flat"} style={{ marginBottom: 20 }}>
+          {split && <h3 style={{ marginBottom: 6 }}>{SPLIT_LABEL[split]}</h3>}
           <div style={{ overflowX: "auto" }}>
             <table className="weights-table">
               <thead>
@@ -33,7 +37,7 @@ export default function ConfusionMatrixTable({ pairs, confusionMatrix }) {
               </thead>
               <tbody>
                 {pairs.map((pair) => {
-                  const m = confusionMatrix[split][pair];
+                  const m = split ? confusionMatrix[split][pair] : confusionMatrix[pair];
                   return (
                     <tr key={pair}>
                       <td>{pair}</td>

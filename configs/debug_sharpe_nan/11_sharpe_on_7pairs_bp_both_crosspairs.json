@@ -3,7 +3,7 @@
   "years": 8,
   "train_frac": 0.8,
   "test_frac": 0.1,
-  "direction_horizon": 2,
+  "direction_horizon": 5,
   "rolling_stats_window": 20,
   "features": [
     "log_return",
@@ -16,63 +16,86 @@
   "bandpass_windows": [
     [
       5,
-      20
-    ],
-    [
-      10,
-      50
-    ],
-    [
-      20,
-      100
+      25
     ],
     [
       50,
-      200
+      100
     ]
   ],
   "bandpass_order": 3,
   "cross_pairs": {
-    "EURUSD": [ ],
+    "EURUSD": [
+      "USDJPY",
+      "GBPUSD",
+      "USDCHF",
+      "AUDUSD",
+      "USDCAD",
+      "NZDUSD"
+    ],
     "USDJPY": [
       "EURUSD",
+      "GBPUSD",
+      "USDCHF",
+      "AUDUSD",
+      "USDCAD",
       "NZDUSD"
     ],
     "GBPUSD": [
-      "EURUSD"
+      "EURUSD",
+      "USDJPY",
+      "USDCHF",
+      "AUDUSD",
+      "USDCAD",
+      "NZDUSD"
     ],
     "USDCHF": [
       "EURUSD",
-      "USDJPY"
+      "USDJPY",
+      "GBPUSD",
+      "AUDUSD",
+      "USDCAD",
+      "NZDUSD"
     ],
     "AUDUSD": [
+      "EURUSD",
       "USDJPY",
+      "GBPUSD",
+      "USDCHF",
+      "USDCAD",
       "NZDUSD"
     ],
     "USDCAD": [
       "EURUSD",
-      "GBPUSD"
-    ],
-    "NZDUSD": [
       "USDJPY",
+      "GBPUSD",
+      "USDCHF",
       "AUDUSD",
       "NZDUSD"
+    ],
+    "NZDUSD": [
+      "EURUSD",
+      "USDJPY",
+      "GBPUSD",
+      "USDCHF",
+      "AUDUSD",
+      "USDCAD"
     ]
   },
-  "hidden_size": 64,
-  "num_layers": 1,
+  "hidden_size": 128,
+  "num_layers": 2,
   "dropout": 0.1,
-  "n_attn_heads": 2,
-  "epochs": 50,
+  "n_attn_heads": 8,
+  "epochs": 300,
   "lr": 0.001,
   "weight_decay": 0.0001,
   "bce_weight": 1.0,
-  "sharpe_weight": 2.0,
+  "sharpe_weight": 1.0,
   "sharpe_window": 20,
-  "neutral_band": 0.0,
+  "neutral_band": 0.05,
   "target_vol": 0.05,
-  "n_seeds": 100,
-  "device": "auto",
+  "n_seeds": 5,
+  "device": "mps",
   "save_db": true,
   "pairs": [
     "EURUSD",
@@ -83,6 +106,5 @@
     "USDCAD",
     "NZDUSD"
   ],
-  "cutoff_date": "2025-12-31",
-  "model_description": "main fx pairs.  bandpass butterworth."
+  "model_description": "same as 07 but every pair cross-linked to every other pair"
 }

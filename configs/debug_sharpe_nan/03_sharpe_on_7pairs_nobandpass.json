@@ -1,0 +1,43 @@
+{
+  "lookback": 30,
+  "years": 8,
+  "train_frac": 0.8,
+  "test_frac": 0.1,
+  "direction_horizon": 5,
+  "rolling_stats_window": 20,
+  "features": [
+    "log_return",
+    "vol",
+    "skew",
+    "kurt"
+  ],
+  "cma_windows": [],
+  "bandpass_windows": [],
+  "bandpass_order": 3,
+  "cross_pairs": {"USDJPY": ["EURUSD"],"GBPUSD": ["EURUSD"]},
+  "hidden_size": 128,
+  "num_layers": 2,
+  "dropout": 0.1,
+  "n_attn_heads": 8,
+  "epochs": 300,
+  "lr": 0.001,
+  "weight_decay": 0.0001,
+  "bce_weight": 1.0,
+  "sharpe_weight": 1.0,
+  "sharpe_window": 20,
+  "neutral_band": 0.05,
+  "target_vol": 0.05,
+  "n_seeds": 1,
+  "device": "cpu",
+  "save_db": false,
+  "pairs": [
+    "EURUSD",
+    "USDJPY",
+    "GBPUSD",
+    "USDCHF",
+    "AUDUSD",
+    "USDCAD",
+    "NZDUSD"
+  ],
+  "model_description": "sharpe on, 7 pairs, no bandpass"
+}

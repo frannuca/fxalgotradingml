@@ -56,7 +56,7 @@ from models.portfolio_lstm import (
     probit,
     to_log_returns,
 )
-from models.portfolio_pnl import DEFAULT_TARGET_VOL, compute_portfolio, latest_position
+from models.portfolio_pnl import DEFAULT_TARGET_VOL, annual_sharpe_table, compute_portfolio, latest_position
 
 app = FastAPI(title="FX Direction Prediction API")
 app.add_middleware(
@@ -247,6 +247,14 @@ class TrainRequest(BaseModel):
     pairs: list[str]
     lookback: int = 30
     years: int = 8
+    # Caps every fetched date range (prices, carry) at this date - never
+    # later, regardless of what's since landed in Postgres (e.g. via
+    # /api/quotes/refresh) - guaranteeing training/validation/test never
+    # see a day after it (see models/portfolio_lstm.py's
+    # _resolve_cutoff_date). None (the default) means "no cutoff": use all
+    # data available up to today. An ISO "YYYY-MM-DD" string walk-forward-
+    # backtests as of that historical date instead.
+    cutoff_date: str | None = None
     train_frac: float = 0.8
     test_frac: float = 0.1
     direction_horizon: int = 5  # forward days the z-score label (see make_sequences) looks
@@ -285,6 +293,16 @@ class TrainRequest(BaseModel):
     # which trains every value under every seed and keeps whichever
     # validated best, per seed and then overall.
     bce_weight: float | list[float] = 1.0
+    # Optional COMPLEMENTARY training objective (see train_prediction_model's
+    # "Optional portfolio-Sharpe phase" docstring) - 0 (default) disables
+    # it, training is then unchanged. > 0 adds a joint portfolio-Sharpe
+    # training phase on top of NLL+BCE: risk-parity weight x this model's
+    # own probability signal, scaled to target_vol below, maximizing an
+    # averaged rolling Sharpe over sharpe_window days. Unlike every other
+    # training parameter, > 0 means one asset's training depends on every
+    # other asset's current output (the target-vol scaling is joint).
+    sharpe_weight: float = 0.0
+    sharpe_window: int = 20
     neutral_band: float = 0.05  # abstention half-width around p=0.5 (see apply_neutral_band); 0 disables
     # Annualized volatility the evaluation-mode portfolio PnL calculator
     # (models/portfolio_pnl.py) scales this model's positions to - a
@@ -395,22 +413,29 @@ def _distribution_payload(pairs: list[str], z_labels: np.ndarray, mu: np.ndarray
 
 def _portfolio_payload(dates, pairs: list[str], portfolio: dict) -> dict:
     """Build a {dates: [...], <pair>: {position_modulated: [...],
-    position_baseline: [...]}, ..., cumulative_pnl_modulated: [...],
-    cumulative_pnl_baseline: [...]} dict - the Evaluation view's portfolio
-    PnL chart (see models/portfolio_pnl.py's compute_portfolio).
+    position_baseline: [...], cumulative_pnl: [...]}, ...,
+    cumulative_pnl_modulated: [...], cumulative_pnl_baseline: [...]} dict -
+    the Evaluation view's portfolio PnL chart (see
+    models/portfolio_pnl.py's compute_portfolio).
     `position_modulated` is the risk-parity weight times the probability
     signal `(p - 0.5) * 2`, smoothed over the model's own direction_horizon
     and scaled to the model's own persisted target_vol; `position_baseline`
     is the SAME risk-parity weights with no signal applied (unmodulated),
     scaled to the same target_vol, for a like-for-like comparison. NaN
     entries (not enough trailing history yet to size a position) are sent
-    as `null` - the frontend chart simply skips them.
+    as `null` - the frontend chart simply skips them. Each pair's own
+    `cumulative_pnl` (MODULATED strategy only) is that asset's own
+    `position_modulated * next_return`, cumulatively summed - these sum
+    ACROSS pairs, per day, to top-level `cumulative_pnl_modulated` (the
+    whole book), so the Evaluation page can plot per-asset contributions
+    alongside the book total in the same chart.
     """
     payload: dict[str, Any] = {"dates": [str(d.date()) if hasattr(d, "date") else str(d) for d in dates]}
     for i, pair in enumerate(pairs):
         payload[pair] = {
             "position_modulated": [None if np.isnan(v) else float(v) for v in portfolio["positions_modulated"][:, i]],
             "position_baseline": [None if np.isnan(v) else float(v) for v in portfolio["positions_baseline"][:, i]],
+            "cumulative_pnl": portfolio["cumulative_pnl_per_asset_modulated"][:, i].tolist(),
         }
     payload["cumulative_pnl_modulated"] = portfolio["cumulative_pnl_modulated"].tolist()
     payload["cumulative_pnl_baseline"] = portfolio["cumulative_pnl_baseline"].tolist()
@@ -481,6 +506,24 @@ def _run_training_job(job_id: str, config: dict) -> None:
                 bandpass_windows=args.bandpass_windows, bandpass_order=args.bandpass_order,
             )
 
+        # Portfolio PnL + per-year Sharpe (see models/portfolio_pnl.py) for
+        # all three splits - same risk-parity-weight x probability-signal
+        # strategy the Evaluation page reports, computed here too so a
+        # freshly-trained model's Sharpe-by-year can be read off right
+        # after training, without a separate evaluation round-trip.
+        direction_horizon = getattr(args, "direction_horizon", 5) or 5
+        target_vol = args.target_vol
+        band = result.neutral_band
+        portfolio_train = compute_portfolio(
+            apply_neutral_band(result.probabilities_train, band), result.next_returns_train, direction_horizon, target_vol,
+        )
+        portfolio_val = compute_portfolio(
+            apply_neutral_band(result.probabilities_val, band), result.next_returns_val, direction_horizon, target_vol,
+        )
+        portfolio_test = compute_portfolio(
+            apply_neutral_band(result.probabilities_test, band), result.next_returns_test, direction_horizon, target_vol,
+        )
+
         _JOBS[job_id]["result"] = {
             "model_name": name,
             "pairs": pairs,
@@ -515,6 +558,11 @@ def _run_training_job(job_id: str, config: dict) -> None:
                 "train": _distribution_payload(pairs, result.z_labels_train, result.mu_train, result.sigma_train),
                 "val": _distribution_payload(pairs, result.z_labels_val, result.mu_val, result.sigma_val),
                 "test": _distribution_payload(pairs, result.z_labels_test, result.mu_test, result.sigma_test),
+            },
+            "annual_sharpe": {
+                "train": annual_sharpe_table(result.dates_train, portfolio_train["pnl_modulated"], portfolio_train["pnl_baseline"]),
+                "val": annual_sharpe_table(result.dates_val, portfolio_val["pnl_modulated"], portfolio_val["pnl_baseline"]),
+                "test": annual_sharpe_table(result.dates_test, portfolio_test["pnl_modulated"], portfolio_test["pnl_baseline"]),
             },
         }
 
@@ -598,14 +646,25 @@ class EvaluateRequest(BaseModel):
     """Note: no `pairs` or `lookback` fields - both are properties of the
     trained model itself (restored from its checkpoint, see
     models/portfolio_lstm.py's load_pipeline), not free evaluation
-    parameters. Only what's genuinely evaluation-time - how much history to
-    fetch and how the train/val/test split is drawn - is exposed here.
+    parameters. No `train_frac`/`test_frac` either - evaluation is no
+    longer split into train/validation/test at all (that distinction only
+    means something DURING training, for checkpoint/seed selection and a
+    genuinely held-out test read); here the model is just run over the
+    WHOLE fetched period as one continuous evaluation. Only `years` (how
+    much history to fetch), `cutoff_date`, and `device` are genuinely
+    evaluation-time.
     """
 
     model_name: str  # a quant.model_registry name, or a local .pt path
     years: int = 8
-    train_frac: float = 0.8
-    test_frac: float = 0.1
+    # Caps the fetched date range (and "latest_probabilities") at this
+    # date - never later, regardless of what's since landed in Postgres -
+    # so evaluation never sees a day after it (see models/portfolio_lstm.py's
+    # _resolve_cutoff_date). None (the default) means "no cutoff": use all
+    # data up to today. An ISO "YYYY-MM-DD" string walk-forward-backtests
+    # this model as of that historical date instead.
+    cutoff_date: str | None = None
+    device: str = "auto"  # "auto" (Metal/MPS on Apple Silicon, else CUDA, else CPU), "cpu", "mps", or "cuda" - see get_device
 
 
 def _predict_latest_probabilities(args: Namespace, model) -> dict[str, float]:
@@ -636,8 +695,9 @@ def _predict_latest_probabilities(args: Namespace, model) -> dict[str, float]:
     bandpass_order = getattr(model, "bandpass_order", None) or DEFAULT_BANDPASS_ORDER
     rolling_stats_window = getattr(args, "rolling_stats_window", 20) or 20
     min_days = lookback + rolling_stats_window
+    cutoff_date = getattr(args, "cutoff_date", None)
 
-    prices = load_close_prices(pairs, years=args.years)
+    prices = load_close_prices(pairs, years=args.years, cutoff_date=cutoff_date)
     returns = to_log_returns(prices)
     if len(returns) < min_days:
         raise ValueError(
@@ -647,6 +707,7 @@ def _predict_latest_probabilities(args: Namespace, model) -> dict[str, float]:
 
     feature_returns = build_feature_dataframe(
         returns, pairs, features, rolling_stats_window, cma_windows, args.years, bandpass_windows, bandpass_order,
+        cutoff_date,
     )
     last_window_features = feature_returns.to_numpy(dtype=np.float32)[-lookback:]  # (lookback, n_assets * n_channels)
     X = torch.tensor((last_window_features - model.x_mean) / model.x_std, device=device).unsqueeze(0)
@@ -677,18 +738,23 @@ def _predict_latest_probabilities(args: Namespace, model) -> dict[str, float]:
 def evaluate(req: EvaluateRequest) -> dict:
     """Load a previously-trained model (by quant.model_registry name or
     local path) and run it purely for inference - no training happens.
-    Returns everything the Evaluation view plots:
-      - hit_rate: per-asset directional hit rate for train/val/test.
+    Unlike training, evaluation is NOT split into train/validation/test -
+    that distinction only matters DURING training (val drives checkpoint
+    selection, test is held out for an unbiased read); here the model is
+    simply run over the WHOLE fetched period as one continuous evaluation
+    (`train_frac=1.0`/`test_frac=0.0` internally - see _prepare_data's own
+    purge-boundary handling for why this doesn't needlessly discard the
+    freshest days). Returns everything the Evaluation view plots:
+      - hit_rate: per-asset directional hit rate.
       - confusion_matrix: per-asset TP/FP/TN/FN + accuracy/precision/
-        recall/specificity/F1 for train/val/test.
+        recall/specificity/F1.
       - cumulative_returns: per-asset cumulative (single-day-ahead) return
-        path for train/val/test, with a parallel per-day hit/miss boolean
-        array for coloring.
+        path, with a parallel per-day hit/miss boolean array for coloring.
       - latest_probabilities: the model's predicted probability per asset
         for the next (not-yet-realized) `direction_horizon`-day outcome,
         using the freshest available data.
-      - portfolio: per-asset risk-parity positions for train/val/test, both
-        probability-modulated (scaled to the model's own target_vol) and an
+      - portfolio: per-asset risk-parity positions, both probability-
+        modulated (scaled to the model's own target_vol) and an
         unmodulated risk-parity baseline for comparison - see
         models/portfolio_pnl.py.
       - latest_position: today's not-yet-booked position per asset (same
@@ -708,8 +774,10 @@ def evaluate(req: EvaluateRequest) -> dict:
         "pairs": None,
         "lookback": None,
         "years": req.years,
-        "train_frac": req.train_frac,
-        "test_frac": req.test_frac,
+        "cutoff_date": req.cutoff_date,
+        "train_frac": 1.0,
+        "test_frac": 0.0,
+        "device": req.device,
         "load_model": req.model_name,
     })
 
@@ -723,8 +791,8 @@ def evaluate(req: EvaluateRequest) -> dict:
         # Portfolio PnL (see models/portfolio_pnl.py): risk-parity weights
         # modulated by the model's own probabilities, scaled to the
         # model's own persisted target_vol (a checkpoint property, like
-        # neutral_band - see PredictionModel._checkpoint_dict). Uses each
-        # split's RAW probabilities with the model's persisted neutral_band
+        # neutral_band - see PredictionModel._checkpoint_dict). Uses the
+        # RAW probabilities with the model's persisted neutral_band
         # applied (an explicit "no view" -> flat position for that pair,
         # NOT the frontend's live-adjustable display band - sizing a real
         # position needs one fixed, reported value, not something that
@@ -732,19 +800,11 @@ def evaluate(req: EvaluateRequest) -> dict:
         direction_horizon = getattr(args, "direction_horizon", 5) or 5
         target_vol = getattr(result.model, "target_vol", DEFAULT_TARGET_VOL)
         band = result.neutral_band
-        portfolio_train = compute_portfolio(
-            apply_neutral_band(result.probabilities_train, band), result.next_returns_train, direction_horizon, target_vol,
-        )
-        portfolio_val = compute_portfolio(
-            apply_neutral_band(result.probabilities_val, band), result.next_returns_val, direction_horizon, target_vol,
-        )
-        portfolio_test = compute_portfolio(
-            apply_neutral_band(result.probabilities_test, band), result.next_returns_test, direction_horizon, target_vol,
-        )
+        banded_probabilities = apply_neutral_band(result.probabilities_train, band)
+        portfolio = compute_portfolio(banded_probabilities, result.next_returns_train, direction_horizon, target_vol)
         latest_probabilities_array = np.array([latest_probabilities[p] for p in pairs], dtype=np.float32)
         today = latest_position(
-            apply_neutral_band(result.probabilities_test, band), result.next_returns_test,
-            latest_probabilities_array, direction_horizon, target_vol,
+            banded_probabilities, result.next_returns_train, latest_probabilities_array, direction_horizon, target_vol,
         )
 
         return {
@@ -760,36 +820,13 @@ def evaluate(req: EvaluateRequest) -> dict:
                 }
                 for i, pair in enumerate(pairs)
             },
-            "portfolio": {
-                "train": _portfolio_payload(result.dates_train, pairs, portfolio_train),
-                "val": _portfolio_payload(result.dates_val, pairs, portfolio_val),
-                "test": _portfolio_payload(result.dates_test, pairs, portfolio_test),
-            },
-            "hit_rate": {
-                "train": _hit_rate_payload(pairs, result.hit_rate_train),
-                "val": _hit_rate_payload(pairs, result.hit_rate_val),
-                "test": _hit_rate_payload(pairs, result.hit_rate_test),
-            },
-            "confusion_matrix": {
-                "train": _confusion_matrix_payload(pairs, result.probabilities_train, result.direction_labels_train, result.neutral_band),
-                "val": _confusion_matrix_payload(pairs, result.probabilities_val, result.direction_labels_val, result.neutral_band),
-                "test": _confusion_matrix_payload(pairs, result.probabilities_test, result.direction_labels_test, result.neutral_band),
-            },
-            "cumulative_returns": {
-                "train": _cumulative_return_payload(result.dates_train, pairs, result.next_returns_train),
-                "val": _cumulative_return_payload(result.dates_val, pairs, result.next_returns_val),
-                "test": _cumulative_return_payload(result.dates_test, pairs, result.next_returns_test),
-            },
-            "probabilities": {
-                "train": _probability_payload(result.dates_train, pairs, result.probabilities_train, result.direction_labels_train),
-                "val": _probability_payload(result.dates_val, pairs, result.probabilities_val, result.direction_labels_val),
-                "test": _probability_payload(result.dates_test, pairs, result.probabilities_test, result.direction_labels_test),
-            },
-            "distribution": {
-                "train": _distribution_payload(pairs, result.z_labels_train, result.mu_train, result.sigma_train),
-                "val": _distribution_payload(pairs, result.z_labels_val, result.mu_val, result.sigma_val),
-                "test": _distribution_payload(pairs, result.z_labels_test, result.mu_test, result.sigma_test),
-            },
+            "portfolio": _portfolio_payload(result.dates_train, pairs, portfolio),
+            "annual_sharpe": annual_sharpe_table(result.dates_train, portfolio["pnl_modulated"], portfolio["pnl_baseline"]),
+            "hit_rate": _hit_rate_payload(pairs, result.hit_rate_train),
+            "confusion_matrix": _confusion_matrix_payload(pairs, result.probabilities_train, result.direction_labels_train, result.neutral_band),
+            "cumulative_returns": _cumulative_return_payload(result.dates_train, pairs, result.next_returns_train),
+            "probabilities": _probability_payload(result.dates_train, pairs, result.probabilities_train, result.direction_labels_train),
+            "distribution": _distribution_payload(pairs, result.z_labels_train, result.mu_train, result.sigma_train),
         }
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=f"Model not found: {exc}") from exc

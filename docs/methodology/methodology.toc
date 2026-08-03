@@ -2,41 +2,50 @@
 \contentsline {section}{\numberline {2}System Overview}{3}{section.2}%
 \contentsline {section}{\numberline {3}Data Pipeline and Feature Engineering}{4}{section.3}%
 \contentsline {subsection}{\numberline {3.1}Price loading and log returns}{4}{subsection.3.1}%
-\contentsline {subsection}{\numberline {3.2}Feature engineering: carry and vol-normalized momentum}{4}{subsection.3.2}%
-\contentsline {paragraph}{Carry.}{5}{paragraph*.2}%
-\contentsline {paragraph}{Vol-normalized momentum.}{5}{paragraph*.3}%
-\contentsline {paragraph}{Asset-major channel layout.}{5}{paragraph*.4}%
-\contentsline {subsection}{\numberline {3.3}Rolling window construction}{6}{subsection.3.3}%
-\contentsline {subsection}{\numberline {3.4}Standardization}{6}{subsection.3.4}%
-\contentsline {section}{\numberline {4}Chronological Train / Validation / Test Split}{7}{section.4}%
-\contentsline {section}{\numberline {5}PortfolioLSTM}{7}{section.5}%
-\contentsline {subsection}{\numberline {5.1}Encoder A: concatenated input}{8}{subsection.5.1}%
-\contentsline {subsection}{\numberline {5.2}Encoder B: shared per-asset encoder with cross-asset attention}{8}{subsection.5.2}%
-\contentsline {subsection}{\numberline {5.3}Temporal pooling: last hidden state vs.\ attention pooling}{9}{subsection.5.3}%
-\contentsline {subsection}{\numberline {5.4}Weight schemes}{10}{subsection.5.4}%
-\contentsline {subsection}{\numberline {5.5}Recurrent-policy feedback: feeding the previous weight into the head}{10}{subsection.5.5}%
-\contentsline {subsection}{\numberline {5.6}NoisyNet: parameter-space exploration noise}{11}{subsection.5.6}%
-\contentsline {subsection}{\numberline {5.7}The \texttt {CASH} pseudo-asset}{12}{subsection.5.7}%
-\contentsline {section}{\numberline {6}Volatility Targeting}{12}{section.6}%
-\contentsline {subsection}{\numberline {6.1}Three covariance estimators}{13}{subsection.6.1}%
-\contentsline {paragraph}{(a) Sample covariance (default).}{13}{paragraph*.6}%
-\contentsline {paragraph}{(b) EWMA (RiskMetrics-style).}{13}{paragraph*.7}%
-\contentsline {paragraph}{(c) Ledoit-Wolf shrinkage (Ledoit \& Wolf, 2004).}{13}{paragraph*.8}%
-\contentsline {subsection}{\numberline {6.2}The leverage cap}{14}{subsection.6.2}%
-\contentsline {section}{\numberline {7}Training Objectives}{14}{section.7}%
-\contentsline {subsection}{\numberline {7.1}Rolling-window Sortino-style ratio (\texttt {"sharpe"}, default)}{14}{subsection.7.1}%
-\contentsline {subsection}{\numberline {7.2}Kelly criterion (\texttt {"kelly"})}{15}{subsection.7.2}%
-\contentsline {subsection}{\numberline {7.3}Mean-CVaR (\texttt {"cvar"})}{15}{subsection.7.3}%
-\contentsline {section}{\numberline {8}Transaction Costs}{15}{section.8}%
-\contentsline {section}{\numberline {9}Portfolio Training Loop}{15}{section.9}%
-\contentsline {section}{\numberline {10}RiskLSTM: Risk-Attenuation Overlay}{16}{section.10}%
-\contentsline {subsection}{\numberline {10.1}Marginal risk features: rolling moments of the weighted PnL path}{17}{subsection.10.1}%
-\contentsline {subsection}{\numberline {10.2}Cross-sectional risk features (optional)}{17}{subsection.10.2}%
-\contentsline {subsection}{\numberline {10.3}Building RiskLSTM's input sequences}{18}{subsection.10.3}%
-\contentsline {subsection}{\numberline {10.4}RiskLSTM architecture and forward pass}{19}{subsection.10.4}%
-\contentsline {subsection}{\numberline {10.5}Risk training loop}{20}{subsection.10.5}%
-\contentsline {section}{\numberline {11}Inverse-Volatility Benchmark}{20}{section.11}%
-\contentsline {section}{\numberline {12}Ensembling: Multi-Seed Restarts}{20}{section.12}%
-\contentsline {section}{\numberline {13}Configuration Reference}{21}{section.13}%
-\contentsline {section}{\numberline {14}Summary of Architectural Decisions}{22}{section.14}%
-\contentsline {section}{\numberline {15}Repository Map}{23}{section.15}%
+\contentsline {subsection}{\numberline {3.2}The feature catalog}{5}{subsection.3.2}%
+\contentsline {paragraph}{(a) Raw log return.}{5}{paragraph*.2}%
+\contentsline {paragraph}{(b/c/d) Rolling moments: volatility, skewness, excess kurtosis.}{5}{paragraph*.3}%
+\contentsline {paragraph}{(e) Carry (interest-rate differential).}{6}{paragraph*.4}%
+\contentsline {paragraph}{(f) Cross moving averages (trend).}{6}{paragraph*.5}%
+\contentsline {paragraph}{(g) Causal Butterworth band-pass (faster-reacting trend).}{6}{paragraph*.6}%
+\contentsline {paragraph}{Assembly and NaN handling.}{7}{paragraph*.7}%
+\contentsline {subsection}{\numberline {3.3}Standardization}{7}{subsection.3.3}%
+\contentsline {section}{\numberline {4}Sequence Construction and Labels}{7}{section.4}%
+\contentsline {subsection}{\numberline {4.1}The forward z-score label}{7}{subsection.4.1}%
+\contentsline {subsection}{\numberline {4.2}Dense, per-day supervision within each window}{8}{subsection.4.2}%
+\contentsline {subsection}{\numberline {4.3}Chronological split, and purge/embargo at each boundary}{8}{subsection.4.3}%
+\contentsline {section}{\numberline {5}\texttt {AssetLSTM}: One Asset's Independent Predictor}{9}{section.5}%
+\contentsline {subsection}{\numberline {5.1}Causal self-attention}{10}{subsection.5.1}%
+\contentsline {subsection}{\numberline {5.2}The heteroscedastic head}{10}{subsection.5.2}%
+\contentsline {section}{\numberline {6}\texttt {PredictionModel}: $N$ Assets as One Persistable Unit}{10}{section.6}%
+\contentsline {subsection}{\numberline {6.1}\texttt {cross\_pairs}: opt-in, per-pair input widening}{10}{subsection.6.1}%
+\contentsline {section}{\numberline {7}Loss Functions}{11}{section.7}%
+\contentsline {subsection}{\numberline {7.1}Gaussian negative log-likelihood}{11}{subsection.7.1}%
+\contentsline {subsection}{\numberline {7.2}The direction anti-collapse term}{11}{subsection.7.2}%
+\contentsline {subsection}{\numberline {7.3}The probit link}{12}{subsection.7.3}%
+\contentsline {section}{\numberline {8}Training: Fully Independent per Asset}{12}{section.8}%
+\contentsline {subsection}{\numberline {8.1}Per-asset checkpoint selection}{13}{subsection.8.1}%
+\contentsline {subsection}{\numberline {8.2}Multi-seed restarts, and sweeping \texttt {bce\_weight}}{13}{subsection.8.2}%
+\contentsline {subsection}{\numberline {8.3}Numerical safety: immediate failure on a non-finite gradient}{13}{subsection.8.3}%
+\contentsline {section}{\numberline {9}Calibration}{14}{section.9}%
+\contentsline {section}{\numberline {10}The Neutral Band and Confusion-Matrix Metrics}{14}{section.10}%
+\contentsline {section}{\numberline {11}Portfolio Construction: A Risk-Parity Overlay}{14}{section.11}%
+\contentsline {subsection}{\numberline {11.1}Equal-risk-contribution (risk parity) weights}{14}{subsection.11.1}%
+\contentsline {subsection}{\numberline {11.2}Probability modulation}{15}{subsection.11.2}%
+\contentsline {subsection}{\numberline {11.3}Horizon smoothing: why the product, not the signal, gets averaged}{15}{subsection.11.3}%
+\contentsline {subsection}{\numberline {11.4}Target-volatility scaling}{16}{subsection.11.4}%
+\contentsline {section}{\numberline {12}Optional Complementary Objective: Training on Portfolio Sharpe}{16}{section.12}%
+\contentsline {subsection}{\numberline {12.1}Why this cannot be per-asset}{16}{subsection.12.1}%
+\contentsline {subsection}{\numberline {12.2}The joint training phase}{17}{subsection.12.2}%
+\contentsline {subsection}{\numberline {12.3}Validation selection uses the same composite objective}{18}{subsection.12.3}%
+\contentsline {subsection}{\numberline {12.4}Empirical verification of the cross-asset coupling}{18}{subsection.12.4}%
+\contentsline {section}{\numberline {13}Results}{18}{section.13}%
+\contentsline {subsection}{\numberline {13.1}Asset selection}{18}{subsection.13.1}%
+\contentsline {subsection}{\numberline {13.2}Model modes}{19}{subsection.13.2}%
+\contentsline {subsection}{\numberline {13.3}Directional hit rate}{19}{subsection.13.3}%
+\contentsline {subsection}{\numberline {13.4}Confusion matrix (mode C, test split)}{20}{subsection.13.4}%
+\contentsline {subsection}{\numberline {13.5}Portfolio Sharpe: modulated vs.\ risk-parity baseline}{20}{subsection.13.5}%
+\contentsline {subsection}{\numberline {13.6}Colored cumulative return and predicted probability (mode C, test, EURUSD)}{21}{subsection.13.6}%
+\contentsline {subsection}{\numberline {13.7}Honest limitations of this results section}{22}{subsection.13.7}%
+\contentsline {section}{\numberline {14}Configuration Reference}{23}{section.14}%
+\contentsline {section}{\numberline {15}Summary of Architectural Decisions}{23}{section.15}%

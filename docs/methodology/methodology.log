@@ -1,4 +1,4 @@
-This is pdfTeX, Version 3.141592653-2.6-1.40.29 (TeX Live 2026) (preloaded format=pdflatex 2026.6.5)  31 JUL 2026 12:01
+This is pdfTeX, Version 3.141592653-2.6-1.40.29 (TeX Live 2026) (preloaded format=pdflatex 2026.6.5)  3 AUG 2026 16:39
 entering extended mode
  restricted \write18 enabled.
  %&-line parsing enabled.
@@ -996,7 +996,16 @@ LaTeX Font Info:    Trying to load font information for U+msb on input line 112
 (/usr/local/texlive/2026/texmf-dist/tex/latex/amsfonts/umsb.fd
 File: umsb.fd 2013/01/14 v3.01 AMS symbols B
 )
-(./methodology.toc [1
+Overfull \hbox (21.19676pt too wide) in paragraph at lines 115--141
+\T1/cmr/m/n/10 prediction and portfolio-construction sys-tem. $\OML/cmm/m/it/10
+ N$ \T1/cmr/bx/n/10 fully in-de-pen-dent \T1/cmr/m/n/10 per-asset LSTMs (\T1/cm
+tt/m/n/10 AssetLSTM\T1/cmr/m/n/10 ,
+ []
+
+(./methodology.toc
+LaTeX Font Info:    Font shape `T1/cmtt/bx/n' in size <10.95> not available
+(Font)              Font shape `T1/cmtt/m/n' tried instead on input line 17.
+ [1
 
 {/usr/local/texlive/2026/texmf-var/fonts/map/pdftex/updmap/pdftex.map}{/usr/loc
 al/texlive/2026/texmf-dist/fonts/enc/dvips/cm-super/cm-super-t1.enc}])
@@ -1004,247 +1013,228 @@ al/texlive/2026/texmf-dist/fonts/enc/dvips/cm-super/cm-super-t1.enc}])
 \openout5 = `methodology.toc'.
 
  [2]
-Overfull \hbox (123.75575pt too wide) in paragraph at lines 145--158
+Overfull \hbox (140.28743pt too wide) in paragraph at lines 154--169
  [] 
  []
 
 
-Overfull \hbox (20.8813pt too wide) in paragraph at lines 183--186
-\T1/cmr/m/n/10.95 normalized-momentum chan-nels $\OMS/cmsy/m/n/10.95 !$ \T1/cmr
-/m/n/10.95 rolling win-dows $\OMS/cmsy/m/n/10.95 !$ \T1/cmr/m/n/10.95 chrono-lo
-g-i-cal train/validation/test
+Overfull \hbox (61.7565pt too wide) in paragraph at lines 198--203
+\T1/cmr/m/n/10.95 crossover, causal But-ter-worth band-pass) $\OMS/cmsy/m/n/10.
+95 !$ \T1/cmr/m/n/10.95 rolling win-dows $\OMS/cmsy/m/n/10.95 !$ \T1/cmr/m/n/10
+.95 chrono-log-i-cal train/validation/test
+ []
+
+
+Overfull \hbox (4.63794pt too wide) in paragraph at lines 216--220
+[]\T1/cmr/bx/n/10.95 Portfolio over-lay \T1/cmr/m/n/10.95 (Ÿ[][]11[][]): each a
+s-set's prob-a-bil-ity be-comes a sig-nal in $\OT1/cmr/m/n/10.95 [\OMS/cmsy/m/n
+/10.95 ^^@\OT1/cmr/m/n/10.95 1\OML/cmm/m/it/10.95 ; \OT1/cmr/m/n/10.95 1]$\T1/c
+mr/m/n/10.95 , weighted
  []
 
 [3]
 Package hyperref Info: bookmark level for unknown lstlisting defaults to 0 on i
-nput line 269.
+nput line 293.
 LaTeX Font Info:    Font shape `T1/cmtt/bx/n' in size <9> not available
-(Font)              Font shape `T1/cmtt/m/n' tried instead on input line 270.
-Package mdframed Info: Not enough space on this page on input line 300.
+(Font)              Font shape `T1/cmtt/m/n' tried instead on input line 294.
  [4]
-Package mdframed Info: Not enough space on this page on input line 300.
- [5]
-Overfull \hbox (4.93732pt too wide) in paragraph at lines 398--401
-[]\T1/cmr/bx/n/10 Tensor shapes. $\OML/cmm/m/it/10 X \OMS/cmsy/m/n/10 2 \U/msb/
-m/n/10 R[]$ \T1/cmr/m/n/10 where $\OML/cmm/m/it/10 B \OT1/cmr/m/n/10 = \OML/cmm
-/m/it/10 T \OMS/cmsy/m/n/10 ^^@ \OML/cmm/m/it/10 L$ \T1/cmr/m/n/10 ($\OML/cmm/m
-/it/10 T$ \T1/cmr/m/n/10 = num-ber of us-able days of his-tory); \T1/cmtt/m/n/1
-0 next_returns
- []
-
-[6] [7]
-Overfull \hbox (38.05956pt too wide) in paragraph at lines 547--550
-\T1/cmr/m/n/10.95 followed by pool-ing over time (Ÿ[][]5.3[][]) to a sin-gle $\
-U/msb/m/n/10.95 R[]$ \T1/cmr/m/n/10.95 sum-mary, then the head (a sin-gle \T1/c
-mtt/m/n/10 Linear\T1/cmr/m/n/10.95 /\T1/cmtt/m/n/10 NoisyLinear
+Overfull \hbox (74.49214pt too wide) in paragraph at lines 347--350
+\T1/cmtt/m/n/10 "cma" \T1/cmr/m/n/10.95 and \T1/cmtt/m/n/10 "bandpass" \T1/cmr/
+m/n/10.95 are spe-cial: each con-tributes \T1/cmr/m/it/10.95 one chan-nel per w
+in-dow pair \T1/cmr/m/n/10.95 in \T1/cmtt/m/n/10 cma_windows\T1/cmr/m/n/10.95 /
+\T1/cmtt/m/n/10 bandpass_windows\T1/cmr/m/n/10.95 ,
  []
 
 
-Overfull \hbox (13.7378pt too wide) detected at line 553
-[][][][][] \OT1/cmr/m/n/10.95 = [][][ [][] ;  \OML/cmm/m/it/10.95 w[] \OT1/cmr/
-m/n/10.95 ][] \OMS/cmsy/m/n/10.95 2 \U/msb/m/n/10.95 R[] \OT1/cmr/m/n/10.95 ([]
-[] = [])
+Overfull \hbox (150.75218pt too wide) detected at line 355
+[][][]\OML/cmm/m/it/10.95 C \OT1/cmr/m/n/10.95 = [] + [] + []
  []
 
-[8]
+[5]
+Overfull \hbox (19.55858pt too wide) in paragraph at lines 395--400
+\T1/cmr/m/n/10.95 return-space ana-logue of a clas-sic price moving-average cro
+ssover. Purely trail-ing (\T1/cmtt/m/n/10 min_periods=window\T1/cmr/m/n/10.95 ,
 
-LaTeX Warning: Reference `sec:verification' on page 9 undefined on input line 6
-27.
+ []
 
-[9] [10] [11]
+Package mdframed Info: Not enough space on this page on input line 449.
+[6]
+Package mdframed Info: Not enough space on this page on input line 449.
+ [7] [8]
+LaTeX Font Info:    Font shape `T1/cmtt/bx/n' in size <14.4> not available
+(Font)              Font shape `T1/cmtt/m/n' tried instead on input line 584.
+ [9]
+
+Package hyperref Warning: Token not allowed in a PDF string (Unicode):
+(hyperref)                removing `math shift' on input line 704.
+
+
+Package hyperref Warning: Token not allowed in a PDF string (Unicode):
+(hyperref)                removing `math shift' on input line 704.
+
 LaTeX Font Info:    Font shape `T1/cmtt/bx/n' in size <12> not available
-(Font)              Font shape `T1/cmtt/m/n' tried instead on input line 843.
- [12]
-Package mdframed Info: Not enough space on this page on input line 890.
- [13]
-Overfull \hbox (70.83922pt too wide) in paragraph at lines 1004--1010
-\T1/cmr/m/n/10.95 turns pe-nal-ized -- the Sortino vari-ant) rather than the pl
-ain stan-dard de-vi-a-tion.  []\T1/cmtt/m/n/9 models/portfolio_lstm.py:1131--11
-77
+(Font)              Font shape `T1/cmtt/m/n' tried instead on input line 713.
+[10] [11]
+LaTeX Font Info:    Font shape `T1/cmtt/bx/n' in size <10> not available
+(Font)              Font shape `T1/cmtt/m/n' tried instead on input line 807.
+ [12] [13]
+Overfull \hbox (10.15648pt too wide) in paragraph at lines 963--972
+\T1/cmr/m/n/10 never re-ceives \T1/cmtt/m/n/10 neutral_band\T1/cmr/m/n/10 ; \T1
+/cmtt/m/n/10 evaluate_prediction_model \T1/cmr/m/n/10 stores \T1/cmtt/m/n/10 pr
+obabilities_* \T1/cmr/m/n/10 RAW (un-snapped).
  []
 
-[14]
-Overfull \hbox (99.92223pt too wide) in paragraph at lines 1081--1090
-[]\T1/cmr/bx/n/10 Rationale. \T1/cmr/m/n/10 Costs are ap-plied \T1/cmr/bx/n/10 
-net, in-side the train-ing loss it-self \T1/cmr/m/n/10 (via the dif-fer-en-tiab
-le \T1/cmtt/m/n/10 apply_transaction_costs_torch\T1/cmr/m/n/10 ),
- []
+[14] [15]
+Package mdframed Info: Not enough space on this page on input line 1064.
 
-[15] [16]
-
-Package mdframed Warning: You got a bad break
-(mdframed)                because the last box will be empty
-(mdframed)                you have to change it manually
-(mdframed)                by changing the text, the space
-(mdframed)                or something else on input line 1245.
-
-[17] [18] [19]
-Overfull \hbox (3.0552pt too wide) in paragraph at lines 1423--1427
-[]\T1/cmr/bx/n/10 Optional com-po-nent (opt-in, de-fault off). \T1/cmtt/m/n/10 
-n_seeds $\OML/cmm/m/it/10 > \OT1/cmr/m/n/10 1$ \T1/cmr/m/n/10 (de-fault 1) trai
-ns that many independently-
+Overfull \hbox (14.77156pt too wide) detected at line 1077
+[][][]\OML/cmm/m/it/10.95 ^^[[]\OT1/cmr/m/n/10.95 (\OML/cmm/m/it/10.95 t\OT1/cm
+r/m/n/10.95 ) = []\OML/cmm/m/it/10.95 ;  []\OT1/cmr/m/n/10.95 (\OML/cmm/m/it/10
+.95 t\OT1/cmr/m/n/10.95 ) = []  [] \OML/cmm/m/it/10.95 ;  []\OT1/cmr/m/n/10.95 
+(\OML/cmm/m/it/10.95 t\OT1/cmr/m/n/10.95 ) = \OML/cmm/m/it/10.95 w\OT1/cmr/m/n/
+10.95 (\OML/cmm/m/it/10.95 t\OT1/cmr/m/n/10.95 ) \OMS/cmsy/m/n/10.95 ^^A []\OT1
+/cmr/m/n/10.95 (\OML/cmm/m/it/10.95 t\OT1/cmr/m/n/10.95 )
  []
 
 
-Overfull \hbox (47.13708pt too wide) in paragraph at lines 1423--1427
-\T1/cmr/m/n/10 seeded restarts of Port-fo-li-oL-STM (and, if en-abled, RiskL-ST
-M) on iden-ti-cal data, com-bined via \T1/cmtt/m/n/10 restart_strategy\T1/cmr/m
-/n/10 . 
- []
-
-[20]
-Overfull \hbox (8.53065pt too wide) in paragraph at lines 1450--1463
-[]\T1/cmr/bx/n/10 Rationale. \T1/cmr/m/n/10 The Sharpe-ratio train-ing ob-jec-t
-ive is non-convex in the LSTM's pa-ram-e-ters (LSTM/softmax
+Overfull \hbox (13.52478pt too wide) in paragraph at lines 1093--1093
+|[]\T1/cmr/bx/n/14.4 Optional Com-ple-men-tary Ob-jec-tive: Train-ing on Port-f
+o-lio Sharpe| 
  []
 
 
-Underfull \hbox (badness 3312) in paragraph at lines 1497--1498
-[]|\T1/cmr/m/n/10.95 NoisyNet pa-ram-e-ter noise on the out-put
+Underfull \hbox (badness 3291) in paragraph at lines 1116--1116
+[]|\T1/cmr/bx/n/10.95 Reading A: scale base-line
  []
 
 
-Overfull \hbox (5.40076pt too wide) in paragraph at lines 1504--1504
-[]|\T1/cmtt/m/n/10.95 attention| 
+Underfull \hbox (badness 4013) in paragraph at lines 1118--1118
+\T1/cmr/m/n/10.95 const pre-com-puted from data
  []
 
 
-Overfull \hbox (10.73734pt too wide) in paragraph at lines 1506--1506
-[]|\T1/cmtt/m/n/10.95 covariance_estimator| 
+Underfull \hbox (badness 10000) in paragraph at lines 1120--1120
+[]|\T1/cmr/m/n/10.95 Fidelity to eval.
+ []
+
+[16] [17] [18]
+Underfull \hbox (badness 10000) in paragraph at lines 1255--1255
+[]|\T1/cmtt/m/n/10 features=[log_return,vol,skew,kurt]\T1/cmr/m/n/10 ,
  []
 
 
-Overfull \hbox (5.07896pt too wide) in paragraph at lines 1520--1520
-[]|\T1/cmtt/m/n/10.95 risk_rolling_window| 
+Underfull \hbox (badness 10000) in paragraph at lines 1257--1257
+[]|\T1/cmr/m/n/10 C: PnL-
  []
 
 
-Overfull \hbox (5.07896pt too wide) in paragraph at lines 1521--1521
-[]|\T1/cmtt/m/n/10.95 use_cross_sectional| 
+Overfull \hbox (32.99312pt too wide) in paragraph at lines 1262--1269
+[]\T1/cmr/m/n/10.95 Common hy-per-pa-ram-e-ters: \T1/cmtt/m/n/10 lookback=30\T1
+/cmr/m/n/10.95 , \T1/cmtt/m/n/10 years=8\T1/cmr/m/n/10.95 , \T1/cmtt/m/n/10 tra
+in_frac=0.8\T1/cmr/m/n/10.95 , \T1/cmtt/m/n/10 test_frac=0.1\T1/cmr/m/n/10.95 ,
+ \T1/cmtt/m/n/10 direction_horizon=5\T1/cmr/m/n/10.95 ,
  []
 
 
-Underfull \hbox (badness 10000) in paragraph at lines 1523--1523
-[]|\T1/cmtt/m/n/10.95 load_portfolio \T1/cmr/m/n/10.95 /
+Overfull \hbox (15.41074pt too wide) in paragraph at lines 1262--1269
+\T1/cmtt/m/n/10 hidden_size=16\T1/cmr/m/n/10.95 , \T1/cmtt/m/n/10 num_layers=1\
+T1/cmr/m/n/10.95 , \T1/cmtt/m/n/10 n_attn_heads=4\T1/cmr/m/n/10.95 , \T1/cmtt/m
+/n/10 epochs=300\T1/cmr/m/n/10.95 , \T1/cmtt/m/n/10 lr=$\OT1/cmr/m/n/10.95 10[]
+$\T1/cmr/m/n/10.95 , \T1/cmtt/m/n/10 target_vol=0.10\T1/cmr/m/n/10.95 , \T1/cmt
+t/m/n/10 device="cpu"
+ []
+
+<figures/hit_rate_by_mode.pdf, id=595, 525.79579pt x 232.97185pt>
+File: figures/hit_rate_by_mode.pdf Graphic file (type pdf)
+<use figures/hit_rate_by_mode.pdf>
+Package pdftex.def Info: figures/hit_rate_by_mode.pdf  used on input line 1299.
+
+(pdftex.def)             Requested size: 391.79755pt x 173.60155pt.
+[19]
+<figures/portfolio_pnl_C_pnl_mode_test.pdf, id=604, 422.73016pt x 226.5707pt>
+File: figures/portfolio_pnl_C_pnl_mode_test.pdf Graphic file (type pdf)
+<use figures/portfolio_pnl_C_pnl_mode_test.pdf>
+Package pdftex.def Info: figures/portfolio_pnl_C_pnl_mode_test.pdf  used on inp
+ut line 1363.
+(pdftex.def)             Requested size: 391.79755pt x 209.99637pt.
+ [20 <./figures/hit_rate_by_mode.pdf>]
+<figures/colored_return_EURUSD_C_pnl_mode.pdf, id=657, 490.63927pt x 206.91325p
+t>
+File: figures/colored_return_EURUSD_C_pnl_mode.pdf Graphic file (type pdf)
+<use figures/colored_return_EURUSD_C_pnl_mode.pdf>
+Package pdftex.def Info: figures/colored_return_EURUSD_C_pnl_mode.pdf  used on 
+input line 1390.
+(pdftex.def)             Requested size: 368.74939pt x 155.5129pt.
+<figures/probability_EURUSD_C_pnl_mode.pdf, id=658, 405.72226pt x 187.25581pt>
+File: figures/probability_EURUSD_C_pnl_mode.pdf Graphic file (type pdf)
+<use figures/probability_EURUSD_C_pnl_mode.pdf>
+Package pdftex.def Info: figures/probability_EURUSD_C_pnl_mode.pdf  used on inp
+ut line 1399.
+(pdftex.def)             Requested size: 368.74939pt x 170.1916pt.
+ [21 <./figures/portfolio_pnl_C_pnl_mode_test.pdf> <./figures/colored_return_EU
+RUSD_C_pnl_mode.pdf>]
+<figures/distribution_EURUSD_C_pnl_mode.pdf, id=784, 443.30618pt x 210.71269pt>
+
+File: figures/distribution_EURUSD_C_pnl_mode.pdf Graphic file (type pdf)
+<use figures/distribution_EURUSD_C_pnl_mode.pdf>
+Package pdftex.def Info: figures/distribution_EURUSD_C_pnl_mode.pdf  used on in
+put line 1408.
+(pdftex.def)             Requested size: 331.87375pt x 157.7544pt.
+ [22 <./figures/probability_EURUSD_C_pnl_mode.pdf> <./figures/distribution_EURU
+SD_C_pnl_mode.pdf>]
+Underfull \hbox (badness 10000) in paragraph at lines 1455--1455
+[]|\T1/cmtt/m/n/10 train_frac \T1/cmr/m/n/10 /
  []
 
 
-ignored: Infinite glue shrinkage found in box being split [21]
-Underfull \hbox (badness 3240) in paragraph at lines 1541--1541
-[]|\T1/cmr/m/n/10.95 Sequential (not joint)
+Overfull \hbox (8.23518pt too wide) in paragraph at lines 1457--1457
+[]|\T1/cmtt/m/n/10 rolling_stats_window| 
  []
 
 
-Underfull \hbox (badness 1048) in paragraph at lines 1546--1546
-\T1/cmr/m/n/10.95 back-fill) for carry/vol
+Overfull \hbox (79.56117pt too wide) in paragraph at lines 1458--1458
+[]|\T1/cmtt/m/n/10 [log_return,vol,skew,kurt]| 
  []
 
 
-Underfull \hbox (badness 10000) in paragraph at lines 1548--1548
-[]|\T1/cmr/m/n/10.95 Per-asset shared en-
+Underfull \hbox (badness 10000) in paragraph at lines 1459--1459
+[]|\T1/cmtt/m/n/10 cma_windows \T1/cmr/m/n/10 /
  []
 
 
-Underfull \hbox (badness 10000) in paragraph at lines 1548--1548
-\T1/cmr/m/n/10.95 coder + cross-asset
+Underfull \hbox (badness 7759) in paragraph at lines 1493--1493
+[]|\T1/cmr/m/n/10 Fully in-de-pen-dent per-
  []
 
 
-Underfull \hbox (badness 10000) in paragraph at lines 1553--1553
-[]|\T1/cmtt/m/n/10.95 use_prev_weight
+Underfull \hbox (badness 2564) in paragraph at lines 1496--1497
+[]|\T1/cmr/m/n/10 Anti-collapse: BCE forces $\OML/cmm/m/it/10 ^^V$ \T1/cmr/m/n/
+10 to
  []
 
 
-Underfull \hbox (badness 10000) in paragraph at lines 1556--1556
-[]|\T1/cmr/m/n/10.95 NoisyNet pa-ram-e-ter
+Underfull \hbox (badness 7047) in paragraph at lines 1497--1497
+[]|\T1/cmr/m/n/10 Neutral band as pure
  []
 
 
-Underfull \hbox (badness 10000) in paragraph at lines 1558--1558
-[]|\T1/cmr/m/n/10.95 NoisyLinear
+Underfull \hbox (badness 4229) in paragraph at lines 1498--1498
+[]|\T1/cmr/m/n/10 Risk par-ity, not equal
  []
 
 
-Underfull \hbox (badness 3386) in paragraph at lines 1561--1561
-[]|\T1/cmtt/m/n/10.95 CASH \T1/cmr/m/n/10.95 as a data-layer
+Underfull \hbox (badness 10000) in paragraph at lines 1500--1500
+[]|\T1/cmr/m/n/10 Butterworth band-pass
  []
 
 
-Underfull \hbox (badness 1910) in paragraph at lines 1563--1563
-[]|\T1/cmr/m/n/10.95 Three co-vari-ance es-ti-
+Underfull \hbox (badness 2922) in paragraph at lines 1501--1502
+\T1/cmr/m/n/10 (ex-ter-nal SLSQP call); it's also
  []
 
 
-Underfull \hbox (badness 10000) in paragraph at lines 1573--1573
-[]|\T1/cmr/m/n/10.95 Chronological, test-
- []
-
-
-Underfull \hbox (badness 3482) in paragraph at lines 1575--1575
-[]|\T1/cmr/m/n/10.95 Best-val-Sharpe check-
- []
-
-
-Underfull \hbox (badness 10000) in paragraph at lines 1577--1577
-[]|\T1/cmr/m/n/10.95 Marginal + cross-
- []
-
-
-Underfull \hbox (badness 2626) in paragraph at lines 1577--1577
-\T1/cmr/m/n/10.95 sectional risk fea-tures
- []
-
-
-Underfull \hbox (badness 3895) in paragraph at lines 1582--1582
-[]|\T1/cmr/m/n/10.95 Multi-seed restarts &
- []
-
-
-Underfull \hbox (badness 1038) in paragraph at lines 1584--1584
-[]|\T1/cmr/m/n/10.95 Inverse-vol bench-mark,
- []
-
-
-ignored: Infinite glue shrinkage found in box being split [22]
-Overfull \hbox (36.29445pt too wide) in paragraph at lines 1602--1605
-[]|\T1/cmr/m/n/10.95 Data pipeline, \T1/cmtt/m/n/10.95 PortfolioLSTM\T1/cmr/m/n
-/10.95 /\T1/cmtt/m/n/10.95 EnsemblePortfolioLSTM\T1/cmr/m/n/10.95 ,
- []
-
-
-Underfull \hbox (badness 6364) in paragraph at lines 1602--1605
-\T1/cmr/m/n/10.95 trans-ac-tion costs, the full port-fo-lio train-
- []
-
-
-Overfull \hbox (4.85387pt too wide) in paragraph at lines 1607--1607
-[]|\T1/cmtt/m/n/10.95 models/risk_postprocess.py| 
- []
-
-
-Underfull \hbox (badness 10000) in paragraph at lines 1610--1611
-[]|\T1/cmr/m/n/10.95 FRED interest-rate down-loader (feeds
- []
-
-
-Underfull \hbox (badness 1184) in paragraph at lines 1611--1612
-[]|\T1/cmr/m/n/10.95 Postgres-backed \T1/cmtt/m/n/10.95 quant.model_registry \T
-1/cmr/m/n/10.95 model
- []
-
-
-Overfull \hbox (21.82898pt too wide) in paragraph at lines 1613--1613
-[]|\T1/cmtt/m/n/10.95 frontend/src/TrainingView.jsx| 
- []
-
-
-Underfull \hbox (badness 10000) in paragraph at lines 1613--1614
-[]|\T1/cmr/m/n/10.95 Training con-fig-u-ra-tion form, live in-
- []
-
-
-Overfull \hbox (33.14572pt too wide) in paragraph at lines 1614--1614
-[]|\T1/cmtt/m/n/10.95 frontend/src/EvaluationView.jsx| 
+Underfull \hbox (badness 10000) in paragraph at lines 1502--1502
+[]|\T1/cmtt/m/n/10 _assert_finite_grad
  []
 
 
@@ -1253,58 +1243,56 @@ ignored: Infinite glue shrinkage found in box being split [23] [24] (./methodolo
 LaTeX2e <2025-11-01>
 L3 programming layer <2026-01-19>
  ***********
-
-
-LaTeX Warning: There were undefined references.
-
 Package rerunfilecheck Info: File `methodology.out' has not changed.
-(rerunfilecheck)             Checksum: B93082A5498966021BA5D98E9277C438;7834.
+(rerunfilecheck)             Checksum: 61E74C535592CC46BD75DCE6AE6B6609;10524.
  ) 
 Here is how much of TeX's memory you used:
- 28323 strings out of 467525
- 516060 string characters out of 5418983
- 1433421 words of memory out of 5000000
- 56421 multiletter control sequences out of 15000+600000
- 653212 words of font info for 104 fonts, out of 8000000 for 9000
+ 28135 strings out of 467525
+ 514367 string characters out of 5418983
+ 1334421 words of memory out of 5000000
+ 56324 multiletter control sequences out of 15000+600000
+ 654444 words of font info for 109 fonts, out of 8000000 for 9000
  1141 hyphenation exceptions out of 8191
- 84i,13n,94p,1200b,2032s stack positions out of 10000i,1000n,20000p,200000b,200000s
-</usr/local/texlive/2026/texmf-dist/fonts/type1/public/amsfonts/cm/cmbx10.pfb
-></usr/local/texlive/2026/texmf-dist/fonts/type1/public/amsfonts/cm/cmex10.pfb>
-</usr/local/texlive/2026/texmf-dist/fonts/type1/public/amsfonts/cm/cmmi10.pfb><
-/usr/local/texlive/2026/texmf-dist/fonts/type1/public/amsfonts/cm/cmmi6.pfb></u
-sr/local/texlive/2026/texmf-dist/fonts/type1/public/amsfonts/cm/cmmi7.pfb></usr
-/local/texlive/2026/texmf-dist/fonts/type1/public/amsfonts/cm/cmmi8.pfb></usr/l
-ocal/texlive/2026/texmf-dist/fonts/type1/public/amsfonts/cm/cmr10.pfb></usr/loc
-al/texlive/2026/texmf-dist/fonts/type1/public/amsfonts/cm/cmr6.pfb></usr/local/
-texlive/2026/texmf-dist/fonts/type1/public/amsfonts/cm/cmr7.pfb></usr/local/tex
-live/2026/texmf-dist/fonts/type1/public/amsfonts/cm/cmr8.pfb></usr/local/texliv
-e/2026/texmf-dist/fonts/type1/public/amsfonts/cm/cmsy10.pfb></usr/local/texlive
-/2026/texmf-dist/fonts/type1/public/amsfonts/cm/cmsy7.pfb></usr/local/texlive/2
-026/texmf-dist/fonts/type1/public/amsfonts/cm/cmsy8.pfb></usr/local/texlive/202
-6/texmf-dist/fonts/type1/public/amsfonts/symbols/msbm10.pfb></usr/local/texlive
-/2026/texmf-dist/fonts/type1/public/cm-super/sfbx1000.pfb></usr/local/texlive/2
-026/texmf-dist/fonts/type1/public/cm-super/sfbx1095.pfb></usr/local/texlive/202
-6/texmf-dist/fonts/type1/public/cm-super/sfbx1200.pfb></usr/local/texlive/2026/
-texmf-dist/fonts/type1/public/cm-super/sfbx1440.pfb></usr/local/texlive/2026/te
-xmf-dist/fonts/type1/public/cm-super/sfbx1728.pfb></usr/local/texlive/2026/texm
-f-dist/fonts/type1/public/cm-super/sfit0900.pfb></usr/local/texlive/2026/texmf-
-dist/fonts/type1/public/cm-super/sfrm0600.pfb></usr/local/texlive/2026/texmf-di
-st/fonts/type1/public/cm-super/sfrm0700.pfb></usr/local/texlive/2026/texmf-dist
-/fonts/type1/public/cm-super/sfrm0800.pfb></usr/local/texlive/2026/texmf-dist/f
-onts/type1/public/cm-super/sfrm1000.pfb></usr/local/texlive/2026/texmf-dist/fon
-ts/type1/public/cm-super/sfrm1095.pfb></usr/local/texlive/2026/texmf-dist/fonts
-/type1/public/cm-super/sfrm1200.pfb></usr/local/texlive/2026/texmf-dist/fonts/t
-ype1/public/cm-super/sfti1000.pfb></usr/local/texlive/2026/texmf-dist/fonts/typ
-e1/public/cm-super/sfti1095.pfb></usr/local/texlive/2026/texmf-dist/fonts/type1
-/public/cm-super/sftt0800.pfb></usr/local/texlive/2026/texmf-dist/fonts/type1/p
-ublic/cm-super/sftt0900.pfb></usr/local/texlive/2026/texmf-dist/fonts/type1/pub
-lic/cm-super/sftt1000.pfb></usr/local/texlive/2026/texmf-dist/fonts/type1/publi
-c/cm-super/sftt1095.pfb></usr/local/texlive/2026/texmf-dist/fonts/type1/public/
-cm-super/sftt1200.pfb>
-Output written on methodology.pdf (24 pages, 775413 bytes).
+ 84i,14n,94p,1200b,2149s stack positions out of 10000i,1000n,20000p,200000b,200000s
+</usr/local/texlive/2026/texmf-dist/fonts/type1/public/amsfonts/cm/cmbx8.pfb>
+</usr/local/texlive/2026/texmf-dist/fonts/type1/public/amsfonts/cm/cmex10.pfb><
+/usr/local/texlive/2026/texmf-dist/fonts/type1/public/amsfonts/cm/cmmi10.pfb></
+usr/local/texlive/2026/texmf-dist/fonts/type1/public/amsfonts/cm/cmmi12.pfb></u
+sr/local/texlive/2026/texmf-dist/fonts/type1/public/amsfonts/cm/cmmi5.pfb></usr
+/local/texlive/2026/texmf-dist/fonts/type1/public/amsfonts/cm/cmmi6.pfb></usr/l
+ocal/texlive/2026/texmf-dist/fonts/type1/public/amsfonts/cm/cmmi7.pfb></usr/loc
+al/texlive/2026/texmf-dist/fonts/type1/public/amsfonts/cm/cmmi8.pfb></usr/local
+/texlive/2026/texmf-dist/fonts/type1/public/amsfonts/cm/cmr10.pfb></usr/local/t
+exlive/2026/texmf-dist/fonts/type1/public/amsfonts/cm/cmr7.pfb></usr/local/texl
+ive/2026/texmf-dist/fonts/type1/public/amsfonts/cm/cmr8.pfb></usr/local/texlive
+/2026/texmf-dist/fonts/type1/public/amsfonts/cm/cmsy10.pfb></usr/local/texlive/
+2026/texmf-dist/fonts/type1/public/amsfonts/cm/cmsy6.pfb></usr/local/texlive/20
+26/texmf-dist/fonts/type1/public/amsfonts/cm/cmsy7.pfb></usr/local/texlive/2026
+/texmf-dist/fonts/type1/public/amsfonts/cm/cmsy8.pfb></usr/local/texlive/2026/t
+exmf-dist/fonts/type1/public/amsfonts/symbols/msbm10.pfb></usr/local/texlive/20
+26/texmf-dist/fonts/type1/public/cm-super/sfbx1000.pfb></usr/local/texlive/2026
+/texmf-dist/fonts/type1/public/cm-super/sfbx1095.pfb></usr/local/texlive/2026/t
+exmf-dist/fonts/type1/public/cm-super/sfbx1200.pfb></usr/local/texlive/2026/tex
+mf-dist/fonts/type1/public/cm-super/sfbx1440.pfb></usr/local/texlive/2026/texmf
+-dist/fonts/type1/public/cm-super/sfbx1728.pfb></usr/local/texlive/2026/texmf-d
+ist/fonts/type1/public/cm-super/sfit0900.pfb></usr/local/texlive/2026/texmf-dis
+t/fonts/type1/public/cm-super/sfrm0600.pfb></usr/local/texlive/2026/texmf-dist/
+fonts/type1/public/cm-super/sfrm0700.pfb></usr/local/texlive/2026/texmf-dist/fo
+nts/type1/public/cm-super/sfrm0800.pfb></usr/local/texlive/2026/texmf-dist/font
+s/type1/public/cm-super/sfrm1000.pfb></usr/local/texlive/2026/texmf-dist/fonts/
+type1/public/cm-super/sfrm1095.pfb></usr/local/texlive/2026/texmf-dist/fonts/ty
+pe1/public/cm-super/sfrm1200.pfb></usr/local/texlive/2026/texmf-dist/fonts/type
+1/public/cm-super/sfti1000.pfb></usr/local/texlive/2026/texmf-dist/fonts/type1/
+public/cm-super/sfti1095.pfb></usr/local/texlive/2026/texmf-dist/fonts/type1/pu
+blic/cm-super/sftt0900.pfb></usr/local/texlive/2026/texmf-dist/fonts/type1/publ
+ic/cm-super/sftt1000.pfb></usr/local/texlive/2026/texmf-dist/fonts/type1/public
+/cm-super/sftt1095.pfb></usr/local/texlive/2026/texmf-dist/fonts/type1/public/c
+m-super/sftt1200.pfb></usr/local/texlive/2026/texmf-dist/fonts/type1/public/cm-
+super/sftt1440.pfb>
+Output written on methodology.pdf (24 pages, 856928 bytes).
 PDF statistics:
- 851 PDF objects out of 1000 (max. 8388607)
- 750 compressed objects within 8 object streams
- 351 named destinations out of 1000 (max. 500000)
- 301 words of extra memory for PDF output out of 10000 (max. 10000000)
+ 1117 PDF objects out of 1200 (max. 8388607)
+ 777 compressed objects within 8 object streams
+ 259 named destinations out of 1000 (max. 500000)
+ 398 words of extra memory for PDF output out of 10000 (max. 10000000)
 

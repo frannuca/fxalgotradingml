@@ -300,6 +300,47 @@ barely-trained checkpoint while discarding every later epoch that kept
 getting more confident/better-calibrated without being able to push
 accuracy any higher.
 
+**Optional complementary objective - portfolio Sharpe (`sharpe_weight`)**:
+`sharpe_weight` (default `0`, fully backward-compatible - training is then
+identical to the description above) adds a SECOND, joint training phase
+each epoch, after the per-asset phase: the model's own probability signal
+`(p - 0.5) * 2`, multiplied by a **precomputed** (data-only, never
+optimized - see `models/portfolio_pnl.py`'s `precompute_risk_parity`)
+risk-parity weight and scaled to `target_vol` (the same value the
+Evaluation page's portfolio PnL calculator uses - see step 7), drives an
+**averaged rolling Sharpe ratio** (mean/std of daily book PnL over a
+trailing `sharpe_window`-day window, computed at every position and
+averaged into one loss) that gets maximized.
+
+This phase is deliberately **not** per-asset independent like everything
+else above: the strategy scales the WHOLE modulated book to a target
+volatility, so any one asset's position depends on every other asset's
+CURRENT signal through that shared scaling factor - it can't be
+decomposed into N separate per-asset losses. `_portfolio_sharpe_loss`
+therefore runs one forward pass across every asset (`model(X)`), produces
+ONE joint loss, and a single `backward()` populates gradients across every
+asset's parameters at once - each asset's OWN optimizer then steps using
+whatever gradient landed in its own parameters (optimizer state, e.g.
+Adam's per-parameter moments, is still never shared - only the gradient
+computation is joint, not the optimizer). When `sharpe_weight > 0` and a
+validation split is tracked, the SAME joint Sharpe is computed on
+validation (no backward, pure diagnostic) and folded into each asset's own
+checkpoint-selection score as `val_loss_i - sharpe_weight * val_sharpe` -
+selection uses the exact objective training optimizes, rather than
+switching to an isolated Sharpe-only metric (which, over a validation
+window of a few hundred days, would be a much higher-variance selection
+signal).
+
+Two things worth knowing before turning this on: it needs `next_returns`/
+precomputed risk-parity weights and covariance threaded through (handled
+automatically via `_PreparedData`/`run_pipeline_multi_seed` - nothing to
+configure beyond `sharpe_weight`/`sharpe_window`/`target_vol`), and
+directly optimizing Sharpe on noisy daily FX returns carries real
+degenerate-solution risk (drifting toward low-variance, low-conviction
+bets that inflate mean/std rather than genuine predictive signal) - keep
+`sharpe_weight` modest relative to `bce_weight` so it's a genuine
+complement to the calibrated NLL/BCE objective, not a replacement for it.
+
 **Purge/embargo at split boundaries**: sequences are stride-1, so
 consecutive samples share most of their forward label window and lookback
 input window with their neighbors. Right at the train/validation or
