@@ -510,4 +510,183 @@ finally:
     pl.get_time_series = _real_get_time_series
 print("12b. load_close_prices OK: cutoff_date bounds both the db.py query and the returned frame")
 
+# --- 13. checkpoint_metric ("val_loss"/"hit_rate"/"sharpe") + continue_training ---
+
+# 13a. invalid checkpoint_metric is rejected loudly, not silently ignored.
+try:
+    pl.train_prediction_model(
+        pl.PredictionModel(n_assets=2, pairs=["A", "B"], n_channels=n_channels, hidden_size=4, dropout=0.0),
+        X10, z10, epochs=1, lr=1e-2, checkpoint_metric="bogus",
+    )
+    raise AssertionError("checkpoint_metric='bogus' should have raised")
+except ValueError as exc:
+    assert "checkpoint_metric" in str(exc)
+print("13a. checkpoint_metric OK: invalid value rejected with a clear error")
+
+# 13b. "hit_rate"/"sharpe" run cleanly end-to-end, INCLUDING validation-time
+# Sharpe being computed even though sharpe_weight=0 (checkpoint_metric
+# alone should be enough to trigger it - see track_sharpe_val), and
+# actually change which epoch's weights get restored (not a no-op).
+X13, z13, _, _, _ = _make_sharpe_data(2, seed=99, t=200)
+Xv13, zv13, retv13, rpv13, covv13 = _make_sharpe_data(2, seed=100, t=60)
+for metric in ("hit_rate", "sharpe"):
+    torch.manual_seed(1)
+    model13 = pl.PredictionModel(n_assets=2, pairs=["A", "B"], n_channels=n_channels, hidden_size=4, dropout=0.0)
+    with torch.no_grad():
+        mu_before, _ = model13(X13)
+    pl.train_prediction_model(
+        model13, X13, z13, epochs=8, lr=1e-2, bce_weight=1.0,
+        X_val=Xv13, z_labels_val=zv13,
+        next_returns_val=retv13, rp_weights_val=rpv13, cov_val=covv13,
+        checkpoint_metric=metric,
+    )
+    with torch.no_grad():
+        mu_after, _ = model13(X13)
+    assert not torch.allclose(mu_before, mu_after), f"checkpoint_metric={metric!r} should have actually trained/restored something"
+print("13b. checkpoint_metric OK: 'hit_rate'/'sharpe' run end-to-end (val Sharpe computed even with sharpe_weight=0)")
+
+# 13c. continue_training: a genuine warm start, not a fresh random init -
+# epochs=0 must reproduce the base model's own probabilities EXACTLY
+# (nothing in the loop runs, so best_state stays empty and the warm-
+# started weights are returned untouched).
+continue_pairs = ["A", "B"]
+continue_dates = pd.bdate_range("2020-01-01", periods=300)
+continue_returns = pd.DataFrame(np.random.randn(300, 2) * 0.005, index=continue_dates, columns=continue_pairs)
+pl.load_close_prices = lambda symbols, years, cutoff_date=None: (1 + continue_returns[symbols]).cumprod() * 1.1
+
+base_args = argparse.Namespace(**{
+    **pl.DEFAULT_CONFIG,
+    "pairs": continue_pairs, "lookback": 15, "years": 3, "train_frac": 0.8, "test_frac": 0.1,
+    "direction_horizon": 5, "rolling_stats_window": 20,
+    "epochs": 5, "n_seeds": 1, "device": "cpu", "hidden_size": 4, "num_layers": 1,
+})
+base_result = pl.run_pipeline_multi_seed(base_args)
+
+# continue_training is only ever called (in production - see
+# api/server.py) with a model reloaded via load_prediction_model_auto,
+# which reconstructs it through PredictionModel._from_checkpoint - THAT is
+# what actually populates .x_mean/.x_std/.features/.cma_windows/etc as
+# real attributes (a freshly in-memory-trained PredictionModel, straight
+# out of run_pipeline_multi_seed, has none of them - they're checkpoint-
+# only metadata). Save-then-reload here so this test exercises the exact
+# same object shape continue_training will actually receive.
+with tempfile.TemporaryDirectory() as ct_dir:
+    base_path = os.path.join(ct_dir, "base.pt")
+    base_result.model.save_model(
+        base_path, x_mean=base_result.x_mean, x_std=base_result.x_std, pairs=base_result.pairs,
+        lookback=base_result.lookback, features=base_args.features, cma_windows=base_args.cma_windows,
+        sigma_hat=base_result.sigma_hat, neutral_band=base_result.neutral_band, target_vol=base_args.target_vol,
+    )
+    loaded_base_model = pl.PredictionModel.load_model(base_path)
+
+    continue_args_noop = argparse.Namespace(**{**vars(base_args), "epochs": 0})
+    result_noop = pl.continue_training(continue_args_noop, loaded_base_model)
+    assert np.allclose(result_noop.probabilities_train, base_result.probabilities_train, atol=1e-6), (
+        "continue_training with epochs=0 should reproduce the base model's own probabilities exactly - "
+        "got different values, so it isn't actually warm-starting from the base model's weights"
+    )
+    print("13c. continue_training OK: epochs=0 exactly reproduces the base model (genuine warm start, not a fresh init)")
+
+    # 13d. architecture is recovered from base_model, NEVER from args - even
+    # a deliberately WRONG hidden_size/pairs in args must be ignored.
+    continue_args_wrong_arch = argparse.Namespace(**{
+        **vars(base_args), "epochs": 1, "hidden_size": 999, "pairs": ["Z"],
+    })
+    result_arch = pl.continue_training(continue_args_wrong_arch, loaded_base_model)
+    assert result_arch.model.hidden_size == base_result.model.hidden_size == 4
+    assert result_arch.pairs == base_result.pairs == continue_pairs
+    print("13d. continue_training OK: architecture recovered from the base model, ignoring mismatched args")
+
+# --- 14. on_best_checkpoint callback + summarize_checkpoint: "save best model so far" ---
+
+# 14a. on_best_checkpoint fires with the RIGHT references (model/data/args
+# match what actually trained; epoch increases; best_state is populated
+# for every asset after at least one validated epoch).
+captured_calls = []
+def _on_best14(model, data, args, epoch, best_state):
+    captured_calls.append({"model": model, "data": data, "args": args, "epoch": epoch, "best_state": best_state})
+
+best_args14 = argparse.Namespace(**{
+    **pl.DEFAULT_CONFIG,
+    "pairs": continue_pairs, "lookback": 15, "years": 3, "train_frac": 0.8, "test_frac": 0.1,
+    "direction_horizon": 5, "rolling_stats_window": 20,
+    "epochs": 6, "n_seeds": 1, "device": "cpu", "hidden_size": 4, "num_layers": 1,
+})
+pl.run_pipeline_multi_seed(best_args14, on_best_checkpoint=_on_best14)
+assert len(captured_calls) >= 1, "on_best_checkpoint should have fired at least once (every validated epoch)"
+last = captured_calls[-1]
+assert all(s is not None for s in last["best_state"]), "every asset should have a validated checkpoint by the end"
+assert last["epoch"] == best_args14.epochs, f"last call should be from the final epoch ({best_args14.epochs}), got {last['epoch']}"
+print(f"14a. on_best_checkpoint OK: fired {len(captured_calls)} times, last at epoch {last['epoch']}, every asset validated")
+
+# 14b. summarize_checkpoint returns None if any asset lacks a validated checkpoint.
+assert pl.summarize_checkpoint(last["model"], last["data"], last["args"], [None, {"dummy": 1}]) is None
+print("14b. summarize_checkpoint OK: returns None when any asset has no validated checkpoint yet")
+
+# 14c. Full snapshot from a REAL best_state: correct shape, finite loss,
+# hit_rate in [0, 1], and a Sharpe (float or None, never NaN) for each split.
+snapshot = pl.summarize_checkpoint(last["model"], last["data"], last["args"], last["best_state"])
+assert snapshot is not None
+snapshot_model, snapshot_result, summary = snapshot
+assert isinstance(snapshot_model, pl.PredictionModel)
+for split in ("train", "val", "test"):
+    assert split in summary
+    assert np.isfinite(summary[split]["loss"]), f"{split} loss should be finite, got {summary[split]['loss']}"
+    assert 0.0 <= summary[split]["hit_rate"] <= 1.0
+    assert summary[split]["sharpe"] is None or np.isfinite(summary[split]["sharpe"])
+print("14c. summarize_checkpoint OK: valid snapshot + train/val/test summary (finite loss, hit_rate in [0,1], Sharpe finite-or-None)")
+
+# --- 15. _non_overlapping_sharpe_torch: non-overlapping, backward-walking chunks, remainder DROPPED ---
+
+# 15a. exact chunk boundaries: T=50, window=20 -> chunk 0 = pnl[30:50]
+# (the LAST 20 days), chunk 1 = pnl[10:30] (the 20 days before that); the
+# oldest 10 days (pnl[0:10]) are never included in ANY chunk.
+torch.manual_seed(0)
+pnl15 = torch.randn(50) * 0.01 + 0.001
+sharpes15 = pl._non_overlapping_sharpe_torch(pnl15, window=20)
+assert sharpes15.shape == (2,), f"expected 2 full 20-day chunks from 50 days, got {tuple(sharpes15.shape)}"
+for i, (lo, hi) in enumerate([(30, 50), (10, 30)]):
+    chunk = pnl15[lo:hi]
+    expected = chunk.mean() / (chunk.std(unbiased=True) + 1e-8)
+    assert torch.allclose(sharpes15[i], expected, atol=1e-6), (
+        f"chunk {i} should be pnl[{lo}:{hi}] (walking backward from the last day) - got {sharpes15[i]:.6f}, "
+        f"expected {expected:.6f}"
+    )
+print("15a. _non_overlapping_sharpe_torch OK: chunks walk backward from the last day, exact boundaries match a manual reference")
+
+# 15b. a leftover remainder shorter than `window` is DROPPED entirely -
+# not computed as its own (shorter) chunk, and not merged into a neighbor.
+pnl15b = torch.randn(45) * 0.01  # 45 = 2*20 + 5 leftover
+sharpes15b = pl._non_overlapping_sharpe_torch(pnl15b, window=20)
+assert sharpes15b.shape == (2,), f"the 5-day remainder should be dropped, not counted as a 3rd chunk - got {tuple(sharpes15b.shape)}"
+print("15b. _non_overlapping_sharpe_torch OK: a shorter leftover chunk is dropped entirely, never computed")
+
+# 15c. fewer than one full window -> EMPTY result (not a shrunk window).
+pnl15c = torch.randn(10) * 0.01  # < window=20
+sharpes15c = pl._non_overlapping_sharpe_torch(pnl15c, window=20)
+assert sharpes15c.numel() == 0, f"expected an empty result for T < window, got shape {tuple(sharpes15c.shape)}"
+print("15c. _non_overlapping_sharpe_torch OK: T < window returns an empty result rather than shrinking the window")
+
+# 15d. wired end-to-end: a split shorter than sharpe_window yields a
+# NEUTRAL zero Sharpe loss (not NaN) from _portfolio_sharpe_loss, and
+# training with sharpe_weight > 0 on such a short split still runs
+# cleanly (the zero contributes nothing to the combined loss, rather than
+# poisoning it - see _portfolio_sharpe_loss_from_predictions's own
+# docstring on why this must never be NaN).
+X15d, z15d, ret15d, rp15d, cov15d = _make_sharpe_data(2, seed=3, t=15)  # 15 < default sharpe_window=20
+model15d = pl.PredictionModel(n_assets=2, pairs=["A", "B"], n_channels=n_channels, hidden_size=4, dropout=0.0)
+loss15d = pl._portfolio_sharpe_loss(model15d, X15d, ret15d, rp15d, cov15d, direction_horizon=5, sharpe_window=20, target_vol=0.10)
+assert torch.isfinite(loss15d) and float(loss15d) == 0.0, f"expected a neutral zero loss for T < sharpe_window, got {loss15d}"
+
+model15d2 = pl.PredictionModel(n_assets=2, pairs=["A", "B"], n_channels=n_channels, hidden_size=4, dropout=0.0)
+pl.train_prediction_model(
+    model15d2, X15d, z15d, epochs=3, lr=1e-2, bce_weight=1.0,
+    sharpe_weight=1.0, sharpe_window=20, direction_horizon=5, target_vol=0.10,
+    next_returns_train=ret15d, rp_weights_train=rp15d, cov_train=cov15d,
+)
+with torch.no_grad():
+    mu15d2, _ = model15d2(X15d)
+assert torch.isfinite(mu15d2).all(), "training with a too-short split for sharpe_window should stay finite (neutral, not crashing)"
+print("15d. _portfolio_sharpe_loss OK: a split shorter than sharpe_window yields a neutral zero loss and trains without crashing")
+
 print("\nALL SMOKE TESTS PASSED")

@@ -1,5 +1,6 @@
 import { NavLink, Route, Routes, Navigate } from "react-router-dom";
 import TrainingView from "./TrainingView";
+import ContinueTrainingView from "./ContinueTrainingView";
 import EvaluationView from "./EvaluationView";
 
 export default function App() {
@@ -12,6 +13,9 @@ export default function App() {
         <NavLink to="/training" className={({ isActive }) => (isActive ? "active" : "")}>
           Training
         </NavLink>
+        <NavLink to="/continue-training" className={({ isActive }) => (isActive ? "active" : "")}>
+          Continue Training
+        </NavLink>
         <NavLink to="/evaluation" className={({ isActive }) => (isActive ? "active" : "")}>
           Evaluation
         </NavLink>
@@ -20,6 +24,7 @@ export default function App() {
       <Routes>
         <Route path="/" element={<Navigate to="/training" replace />} />
         <Route path="/training" element={<TrainingView />} />
+        <Route path="/continue-training" element={<ContinueTrainingView />} />
         <Route path="/evaluation" element={<EvaluationView />} />
       </Routes>
     </div>

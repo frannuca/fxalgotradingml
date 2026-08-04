@@ -89,10 +89,12 @@ from torch import nn
 from data.db import get_time_series, upsert_pairs
 from data.fx_downloader import FXDownloader, MAJOR_FX_PAIRS
 from models.portfolio_pnl import (
+    DEFAULT_COST_BPS,
     DEFAULT_COV_WINDOW,
     DEFAULT_TARGET_VOL,
     MAX_VOL_SCALE,
     TRADING_DAYS_PER_YEAR,
+    compute_portfolio,
     precompute_risk_parity,
 )
 
@@ -134,7 +136,7 @@ def get_device(device: str = "auto") -> torch.device:
 # other's callback. Library code (this module) only ever READS this;
 # nothing here ever sets it.
 _epoch_report_callback: contextvars.ContextVar[
-    Callable[[str, int, int, float, float, float | None, float | None], None] | None
+    Callable[..., None] | None
 ] = contextvars.ContextVar("_epoch_report_callback", default=None)
 
 
@@ -146,17 +148,34 @@ def _report_epoch(
     train_hit_rate: float,
     val_loss: float | None = None,
     val_hit_rate: float | None = None,
+    train_sharpe: float | None = None,
+    val_sharpe: float | None = None,
+    best_score: float | None = None,
 ) -> None:
     """Call the registered interim-results callback, if any, with this
-    epoch's training BCE loss and mean (decision-day) hit rate, plus
+    epoch's training loss and mean (decision-day) hit rate, plus
     validation versions of both when available - a no-op when nothing has
-    registered one (e.g. the CLI / main.py path). `stage` is "marginal" or
-    "copula", so a caller tracking both training phases can tell which one
-    an update belongs to.
+    registered one (e.g. the CLI / main.py path). `stage` is always
+    "train" now that training is a single joint phase - kept as a field
+    purely for payload-shape stability with older consumers.
+
+    `train_sharpe`/`val_sharpe` (only when the optional Sharpe phase or
+    checkpoint_metric="sharpe" is actually computing them that epoch - see
+    train_prediction_model) are the SAME train/val rolling-Sharpe numbers
+    already in the console log line, surfaced here too so a live UI can
+    plot them. `best_score` is the RUNNING best checkpoint-selection score
+    found so far this run, in human-legible units matching
+    `checkpoint_metric` (best hit rate/Sharpe SO FAR if that metric is
+    selected - higher is better; best val loss so far if "val_loss" -
+    lower is better) - None until at least one epoch has updated a
+    checkpoint (i.e. no validation split, or the very first logged epoch).
     """
     callback = _epoch_report_callback.get()
     if callback is not None:
-        callback(stage, epoch, epochs, train_loss, train_hit_rate, val_loss, val_hit_rate)
+        callback(
+            stage, epoch, epochs, train_loss, train_hit_rate, val_loss, val_hit_rate,
+            train_sharpe=train_sharpe, val_sharpe=val_sharpe, best_score=best_score,
+        )
 
 
 class TrainingStopped(Exception):
@@ -1246,41 +1265,91 @@ def _trailing_moving_average_torch(x: torch.Tensor, window: int) -> torch.Tensor
     return windowed_sum / counts.unsqueeze(-1)
 
 
-def _rolling_sharpe_torch(pnl: torch.Tensor, window: int, eps: float = 1e-8) -> torch.Tensor:
+def _non_overlapping_sharpe_torch(pnl: torch.Tensor, window: int, eps: float = 1e-8) -> torch.Tensor:
     """Sharpe ratio (mean/std of `pnl`, NOT annualized - a plain per-day
-    ratio) computed at EVERY position using the trailing `window` days,
-    returned as a (T - window + 1,) series. train_prediction_model's
-    sharpe_weight phase averages this into one scalar loss - an AVERAGED
-    ROLLING Sharpe over the whole period, not a single end-of-period value,
-    so the objective reflects consistency across the training window
-    rather than just wherever training happened to end.
+    ratio) computed over NON-OVERLAPPING `window`-day chunks, walking
+    BACKWARD from the LAST day: chunk 0 is the final `window` days, chunk
+    1 is the `window` days immediately before that, and so on - each day
+    contributes to AT MOST one chunk, unlike a trailing/rolling window
+    (see this function's own git history), where the same day is reused
+    across up to `window` overlapping positions. Returned as a
+    (n_chunks,) series, most recent chunk first.
+    train_prediction_model's sharpe_weight phase averages this into one
+    scalar loss - an AVERAGED Sharpe across several INDEPENDENT
+    sub-periods of the window, not a single end-of-period value and not a
+    smoothed/autocorrelated rolling statistic, so the objective reflects
+    consistency across genuinely distinct stretches of the training
+    window.
+
+    If `T` (the series length) doesn't divide evenly by `window`, the
+    leftover OLDEST `T mod window` days are DROPPED entirely, never
+    contributing a chunk of their own - every chunk that DOES get a
+    Sharpe has the SAME full `window` length (no averaging together
+    Sharpes computed over different sample sizes/variances). If `T` is
+    SHORTER than `window` itself, there isn't even one full chunk -
+    returns an EMPTY tensor rather than shrinking the window to fit (that
+    would silently compute a Sharpe over fewer than `window` points,
+    exactly what dropping the leftover above is meant to avoid) - see
+    _portfolio_sharpe_loss_from_predictions for how an empty result is
+    handled (a neutral, zero-gradient contribution, not a NaN).
     """
     t = pnl.shape[0]
-    window = max(min(window, t), 2)
-    windows = pnl.unfold(0, window, 1)  # (T - window + 1, window)
-    return windows.mean(dim=-1) / (windows.std(dim=-1, unbiased=True) + eps)
+    window = max(window, 2)
+    n_full_chunks = t // window  # 0 if t < window - see this function's own docstring
+    if n_full_chunks == 0:
+        # Short-circuit rather than falling through to a (0, window)
+        # reshape + std() - PyTorch warns ("degrees of freedom is <= 0")
+        # on a std() reduction over a zero-sized tensor even though the
+        # result (correctly) still comes out empty; skip the warning
+        # entirely since this is an expected, handled case, not a bug.
+        return pnl.new_zeros((0,))
+
+    # Walk backward from the end: reverse once, so a plain reshape into
+    # (n_full_chunks, window) rows gives row 0 = the LAST `window` days,
+    # row 1 = the `window` days before that, etc. (any leftover oldest
+    # days, past n_full_chunks * window, are simply never included in the
+    # reshape - dropped). mean()/std() are order-invariant WITHIN a row,
+    # so the reversal never needs undoing.
+    reversed_pnl = pnl.flip(0)
+    full_chunks = reversed_pnl[: n_full_chunks * window].reshape(n_full_chunks, window)
+    return full_chunks.mean(dim=-1) / (full_chunks.std(dim=-1, unbiased=True) + eps)
 
 
-def _portfolio_sharpe_loss(
-    model: "PredictionModel",
-    X: torch.Tensor,
+def _portfolio_sharpe_loss_from_predictions(
+    mu_dec: torch.Tensor,
+    sigma_dec: torch.Tensor,
     next_returns: torch.Tensor,
     rp_weights: torch.Tensor,
     cov: torch.Tensor,
     direction_horizon: int,
     sharpe_window: int,
     target_vol: float,
+    cost_bps: float = DEFAULT_COST_BPS,
 ) -> torch.Tensor:
-    """Differentiable, JOINT (whole-book) negative averaged rolling Sharpe
-    - the torch-side counterpart of models/portfolio_pnl.py's
+    """Differentiable, JOINT (whole-book) negative averaged Sharpe (over
+    non-overlapping `sharpe_window`-day chunks - see
+    _non_overlapping_sharpe_torch) - the torch-side counterpart of models/portfolio_pnl.py's
     compute_portfolio (same strategy: risk-parity weight x probability
     signal, smoothed over direction_horizon, scaled to target_vol),
-    computed for ONE split (train or val). Used ONLY as an optional
-    training objective (see train_prediction_model's sharpe_weight) - NOT
-    decomposable per-asset like gaussian_nll/direction_bce, since the
+    computed for ONE split (train or val), from ALREADY-COMPUTED
+    decision-day predictions (`mu_dec`/`sigma_dec`, each (T, n_assets) -
+    the window's LAST timestep, see PredictionModel.forward's docstring).
+
+    Takes predictions rather than `model`+`X` so a caller that ALSO needs
+    (mu, sigma) for something else that epoch (see train_prediction_model,
+    which needs the SAME forward pass's dense output for its own per-asset
+    NLL/BCE terms) can compute the shared forward pass exactly ONCE and
+    reuse it here - both for a single combined `backward()` across every
+    loss term (see train_prediction_model's own docstring on why this
+    matters), and simply to avoid a redundant forward pass. `_portfolio_sharpe_loss`
+    below is the convenience wrapper for a caller that only needs this
+    term on its own (e.g. a standalone before/after comparison).
+
+    NOT decomposable per-asset like gaussian_nll/direction_bce, since the
     vol-scaling denominator `w' cov w` mixes EVERY asset's current signal
-    together, so this needs a forward pass from every asset's own LSTM
-    (via model(X), not model.assets[i](...) for a single i).
+    together - this is the ONE place in this module's training loop where
+    one asset's loss genuinely depends on every other asset's CURRENT
+    output.
 
     `rp_weights`/`cov` are the PRECOMPUTED, data-only constants from
     models/portfolio_pnl.py's precompute_risk_parity (see _PreparedData) -
@@ -1299,8 +1368,6 @@ def _portfolio_sharpe_loss(
     it doesn't exist yet mid-training. The sign/relative ordering a trading
     signal actually needs doesn't depend on that calibration scale.
     """
-    mu, sigma = model(X)  # each (T, lookback, n_assets)
-    mu_dec, sigma_dec = mu[:, -1, :], sigma[:, -1, :]
     signal = (probit(mu_dec / sigma_dec.clamp_min(1e-8)) - 0.5) * 2.0  # (T, n_assets), in [-1, 1]
 
     rp_weights_safe = torch.nan_to_num(rp_weights, nan=0.0)
@@ -1319,9 +1386,56 @@ def _portfolio_sharpe_loss(
     scale = torch.clamp(target_vol_daily / torch.sqrt(port_var.clamp_min(1e-16)), max=MAX_VOL_SCALE)
     positions = w_mod * scale.unsqueeze(-1)
 
-    daily_pnl = (positions * next_returns).sum(dim=-1)  # (T,) - whole-book daily pnl
-    rolling_sharpe = _rolling_sharpe_torch(daily_pnl, sharpe_window)
-    return -rolling_sharpe.mean()
+    # NET daily pnl: gross minus linear transaction costs on daily position
+    # CHANGE (day 0 pays for establishing from flat) - the differentiable
+    # counterpart of compute_portfolio's own cost deduction
+    # (models/portfolio_pnl.py), so the Sharpe being maximized here is the
+    # SAME net-of-costs Sharpe evaluation reports; without this the
+    # objective would happily crank turnover a real book pays for. |x| is
+    # differentiable a.e. - the same subgradient story as any L1 penalty.
+    gross_pnl = (positions * next_returns).sum(dim=-1)  # (T,) - whole-book daily pnl
+    position_deltas = torch.diff(positions, dim=0, prepend=torch.zeros_like(positions[:1]))
+    daily_costs = cost_bps * 1e-4 * position_deltas.abs().sum(dim=-1)
+    daily_pnl = gross_pnl - daily_costs
+    period_sharpes = _non_overlapping_sharpe_torch(daily_pnl, sharpe_window)
+    if period_sharpes.numel() == 0:
+        # Fewer than `sharpe_window` days available (e.g. a short split) -
+        # _non_overlapping_sharpe_torch deliberately returns empty rather
+        # than shrinking the window (see its own docstring), so there's no
+        # well-defined Sharpe to compute yet. A NEUTRAL zero loss (no
+        # gradient contribution from this term at all) is the honest
+        # result - not NaN (mean() of an empty tensor), which would
+        # corrupt every other loss term summed with this one that epoch
+        # (see train_prediction_model's own combined-loss docstring).
+        return torch.zeros((), device=daily_pnl.device, dtype=daily_pnl.dtype)
+    return -period_sharpes.mean()
+
+
+def _portfolio_sharpe_loss(
+    model: "PredictionModel",
+    X: torch.Tensor,
+    next_returns: torch.Tensor,
+    rp_weights: torch.Tensor,
+    cov: torch.Tensor,
+    direction_horizon: int,
+    sharpe_window: int,
+    target_vol: float,
+    cost_bps: float = DEFAULT_COST_BPS,
+) -> torch.Tensor:
+    """Convenience wrapper around _portfolio_sharpe_loss_from_predictions
+    for a caller that only needs the Sharpe term on its own (a standalone
+    before/after comparison, a smoke test, etc.) and doesn't already have
+    `model`'s own forward pass computed - runs one itself. Everywhere this
+    loss is needed ALONGSIDE the dense NLL/BCE forward pass (see
+    train_prediction_model) calls _portfolio_sharpe_loss_from_predictions
+    directly instead, reusing that SAME pass rather than paying for a
+    second one.
+    """
+    mu, sigma = model(X)  # each (T, lookback, n_assets)
+    return _portfolio_sharpe_loss_from_predictions(
+        mu[:, -1, :], sigma[:, -1, :], next_returns, rp_weights, cov, direction_horizon, sharpe_window, target_vol,
+        cost_bps,
+    )
 
 
 def _assert_finite_grad(params, context: str) -> None:
@@ -1363,42 +1477,58 @@ def train_prediction_model(
     sharpe_window: int = 20,
     direction_horizon: int = 5,
     target_vol: float = DEFAULT_TARGET_VOL,
+    cost_bps: float = DEFAULT_COST_BPS,
     next_returns_train: torch.Tensor | None = None,
     next_returns_val: torch.Tensor | None = None,
     rp_weights_train: torch.Tensor | None = None,
     rp_weights_val: torch.Tensor | None = None,
     cov_train: torch.Tensor | None = None,
     cov_val: torch.Tensor | None = None,
+    checkpoint_metric: str = "val_loss",
+    on_checkpoint_update: Callable[[int, list], None] | None = None,
 ) -> None:
-    """Train every asset's LSTM FULLY INDEPENDENTLY - each asset gets its
-    OWN `torch.optim.Adam` instance (own momentum/variance state, entirely
-    separate from every other asset's optimizer), its OWN loss (computed
-    from just that asset's own (mu, sigma) and label - never averaged or
-    summed together with any other asset's loss before backward()), and
-    its OWN best-validation-loss checkpoint restored independently at the
-    end (asset A's own best epoch can differ from asset B's). The assets
-    never shared WEIGHTS (see AssetLSTM/PredictionModel) - this decouples
-    the OPTIMIZATION too, so nothing about how one asset is trained
-    (gradient magnitude, Adam's adaptive per-parameter state, which epoch
-    its own checkpoint gets restored from) depends on how many OTHER
-    assets there are or how they happen to be doing. An asset linked to
-    another pair's features via `cross_pairs` still trains this way - only
-    what its LSTM READS is widened, never what optimizes it.
+    """Train every asset's LSTM with its OWN `torch.optim.Adam` instance
+    (own momentum/variance state, entirely separate from every other
+    asset's optimizer) and its OWN best-validation-loss checkpoint
+    restored independently at the end (asset A's own best epoch can differ
+    from asset B's). The assets never shared WEIGHTS (see AssetLSTM/
+    PredictionModel) - so even though (see below) every loss term is
+    summed into ONE scalar before a SINGLE `backward()` call each epoch,
+    each asset's OWN accumulated gradient still only ever contains terms
+    that actually depend on THAT asset's own parameters. An asset linked
+    to another pair's features via `cross_pairs` still trains this way -
+    only what its LSTM READS is widened, never what optimizes it.
 
-    Per asset i, each epoch:
-        mu_i, sigma_i = model.assets[i](model.asset_input(X_train, i))  # dense, (n_train, lookback)
-        loss_i = GaussianNLL(mu_i, sigma_i, z_label_i)                   [see gaussian_nll]
-               + bce_weight * BCE(probit(mu_i/sigma_i), sign(z_label_i)) [see direction_bce]
-        loss_i.backward(); optimizer_i.step()
+    ONE combined step per epoch
+    ----------------------------
+    Every loss term this epoch - each asset's own NLL+BCE, and (if
+    `sharpe_weight > 0`) the portfolio-Sharpe term - is summed into ONE
+    scalar and passed to a SINGLE `backward()` call, evaluated at the SAME
+    pre-step weights, before any optimizer steps at all:
 
-    Applied to the FULL dense (batch, lookback) output, not just the
-    window's last ("decision") day - every day in every window is its own
-    supervised sample (see AssetLSTM's docstring), giving each epoch far
-    more gradient signal than decision-day-only supervision would, and
-    since consecutive windows slide by one day, a given calendar day is
-    trained on repeatedly (once per window it falls inside) rather than
-    just once as a decision day - so there's no need to separately
-    up-weight it.
+        mu, sigma = model(X_train)          # ONE dense forward pass, every asset at once, (n_train, lookback, n_assets)
+        total_loss = sum(
+            gaussian_nll(mu[:, :, i], sigma[:, :, i], z_label_i)
+            + bce_weight * direction_bce(mu[:, :, i], sigma[:, :, i], z_label_i)
+            for i in range(n_assets)
+        )
+        if sharpe_weight > 0:
+            total_loss = total_loss + sharpe_weight * _portfolio_sharpe_loss_from_predictions(
+                mu[:, -1, :], sigma[:, -1, :], next_returns_train, rp_weights_train, cov_train, ...
+            )
+        total_loss.backward()
+        for each asset's own optimizer: optimizer.step()
+
+    Applied to the FULL dense (batch, lookback) output for the NLL/BCE
+    terms, not just the window's last ("decision") day - every day in
+    every window is its own supervised sample (see AssetLSTM's docstring),
+    giving each epoch far more gradient signal than decision-day-only
+    supervision would, and since consecutive windows slide by one day, a
+    given calendar day is trained on repeatedly (once per window it falls
+    inside) rather than just once as a decision day - so there's no need
+    to separately up-weight it. The Sharpe term (when enabled) uses only
+    the decision day, matching how it's actually traded/evaluated (see
+    models/portfolio_pnl.py's compute_portfolio).
 
     NLL fits the full predictive DISTRIBUTION: mu is pulled toward each
     sample's conditional mean, and sigma toward the actual residual spread
@@ -1418,14 +1548,48 @@ def train_prediction_model(
     used exactly as standardized. `weight_decay` is passed straight to
     each asset's own Adam as an L2 penalty.
 
+    Why ONE step, not two sequential ones
+    ----------------------------------------
+    An earlier version of this function ran two SEPARATE phases each
+    epoch: a full per-asset NLL+BCE backward/step, immediately followed by
+    a SEPARATE Sharpe backward/step computed at the ALREADY-UPDATED
+    weights. That was a first-order OPERATOR SPLIT of the combined update
+    (the Lie-Trotter formula: `exp(lr*A) . exp(lr*B) = exp(lr*(A+B)) +
+    O(lr^2)`) - a legitimate technique (the same idea behind GAN G/D
+    alternation, ADMM, etc.), but not free: whenever the two gradients
+    pointed in different directions, the SECOND phase could genuinely claw
+    back some of the FIRST phase's own improvement that same epoch (and
+    vice versa the next epoch, in the other order) - an avoidable
+    per-epoch approximation error whose size scales with the two
+    gradients' disagreement and with `lr`. Summing both terms into ONE
+    scalar before ONE `backward()` removes that error entirely: both
+    gradients are now computed at the IDENTICAL starting point and added
+    together BEFORE stepping - exactly what jointly minimizing
+    `sum_i loss_i + sharpe_weight * sharpe_loss` means, with no splitting
+    artifact left over.
+
+    This changes WHEN the Sharpe gradient is computed relative to the
+    NLL+BCE gradient, not whose parameters end up receiving it - it does
+    NOT reintroduce weight-sharing. `sharpe_weight=0` remains BYTE-
+    IDENTICAL to training every asset in complete isolation, one at a
+    time (see smoke_test.py's own regression test for this): the NLL/BCE
+    terms are architecturally independent per asset (no shared weights),
+    so summing N independent scalars into one before backward() cannot
+    introduce a dependency between them that wasn't already there.
+    `sharpe_weight > 0` remains the ONE case with a genuine cross-asset
+    gradient term (see _portfolio_sharpe_loss_from_predictions's own
+    docstring on why Sharpe can't decompose per-asset) - it's just now
+    included in the SAME step instead of a follow-up one.
+
     If `X_val`/`z_labels_val` are given, the same per-asset loss - but
     computed on the DECISION DAY ONLY, matching what's actually
     evaluated/reported (unlike the dense training loss above) - is tracked
     per asset after every epoch, and each asset's OWN state_dict from
     whichever epoch had ITS OWN lowest validation loss is restored
     independently at the end - not just whichever epoch `epochs` happened
-    to end on, and deliberately NOT the epoch with the best validation HIT
-    RATE (computed here from sign(mu), purely for logging): hit rate is a
+    to end on, and (by default - see `checkpoint_metric` below)
+    deliberately NOT the epoch with the best validation HIT RATE
+    (computed here from sign(mu), purely for logging): hit rate is a
     coarse, saturating metric (once every sample's sign is already
     correct, it cannot improve further no matter how much more
     confident/well-calibrated the predictions get), so selecting on it
@@ -1435,36 +1599,7 @@ def train_prediction_model(
 
     The epoch counter and log line are shared across all assets (one line
     per epoch, an average across assets) purely for readable progress
-    reporting - it does not mean the assets are optimized together;
-    reread the per-asset loop above for what actually happens.
-
-    Optional portfolio-Sharpe phase (`sharpe_weight > 0`)
-    ------------------------------------------------------
-    `sharpe_weight` defaults to 0, which skips every line of code below
-    that mentions it - behavior is then BYTE-IDENTICAL to the
-    per-asset-only description above (see smoke_test.py's regression test
-    for this). When `sharpe_weight > 0`, a SECOND, complementary phase
-    runs after the per-asset phase each epoch:
-
-        sharpe_loss = _portfolio_sharpe_loss(model, X_train, next_returns_train,
-                                              rp_weights_train, cov_train, ...)
-        (sharpe_weight * sharpe_loss).backward()
-        for each asset's own optimizer: optimizer.step()
-
-    This is DELIBERATELY not per-asset like the phase above: the strategy
-    it's evaluating (models/portfolio_pnl.py) scales the WHOLE modulated
-    book to a target volatility, so a single asset's position depends on
-    every other asset's CURRENT probability output through that shared
-    scaling factor - it genuinely cannot be decomposed into N independent
-    per-asset losses the way Gaussian NLL/BCE can. `_portfolio_sharpe_loss`
-    therefore calls `model(X)` (every asset's forward pass at once) and
-    produces ONE joint loss; ONE `backward()` call correctly populates
-    gradients in every asset's own parameters via the shared computational
-    graph. Each asset's optimizer then steps using only ITS OWN
-    accumulated gradient and ITS OWN Adam state (still never shared with
-    any other asset) - what's joint is how the gradient was COMPUTED, not
-    the optimizer state that consumes it, so this doesn't reintroduce
-    weight-sharing, only a shared loss term.
+    reporting.
 
     `rp_weights`/`cov` are precomputed ONCE from realized data before
     training even starts (models/portfolio_pnl.py's precompute_risk_parity,
@@ -1474,26 +1609,70 @@ def train_prediction_model(
 
     When `X_val`/`z_labels_val` are also given, the SAME joint Sharpe is
     computed on the validation split (no backward - pure diagnostic +
-    selection signal) and SUBTRACTED (weighted by `sharpe_weight`) from
-    each asset's own `val_loss_i` before the best-checkpoint comparison -
-    i.e. checkpoint selection uses the exact same composite objective
-    training optimizes, instead of switching to a different, noisier
-    metric (validation-period Sharpe alone, over a few hundred days, is a
+    selection signal) and, if `checkpoint_metric="val_loss"` (the
+    default), SUBTRACTED (weighted by `sharpe_weight`) from each asset's
+    own `val_loss_i` before the best-checkpoint comparison - i.e.
+    checkpoint selection uses the exact same composite objective training
+    optimizes, instead of switching to a different, noisier metric
+    (validation-period Sharpe alone, over a few hundred days, is a
     high-variance statistic - selecting on it in isolation risks picking
     whichever epoch's realized path happened to align with the validation
     window rather than a genuinely better model).
+
+    `checkpoint_metric` (independent of `sharpe_weight` - which controls
+    what TRAINS the weights above): which per-epoch VALIDATION metric
+    selects each asset's own restored checkpoint at the end.
+      - "val_loss" (default): as described above - own NLL+BCE val loss,
+        minus sharpe_weight * val_sharpe if sharpe_weight > 0. Unchanged
+        from this function's original behavior.
+      - "hit_rate": the epoch with the best validation directional hit
+        rate wins instead. This function's own docstring above explains
+        why this is NOT the default (hit rate saturates once every sign is
+        already correct, so it tends to freeze onto whichever epoch first
+        reached its ceiling and ignore further loss improvement) - it's
+        offered as an explicit, informed choice for a caller who wants
+        checkpoints selected on the same coarse metric the Training/
+        Evaluation views report front and center, not a recommendation.
+      - "sharpe": the epoch with the best validation portfolio Sharpe
+        (see _portfolio_sharpe_loss) wins - the SAME joint (whole-book,
+        not per-asset) value applies to every asset's own comparison, same
+        as the "val_loss" branch's sharpe_weight-adjustment above. Works
+        even when `sharpe_weight=0` (training stays pure NLL+BCE; only
+        which CHECKPOINT gets kept changes) - the caller must still supply
+        next_returns_val/rp_weights_val/cov_val for this to be computable.
+
+    `on_checkpoint_update`, if given, is called after every VALIDATED
+    epoch with `best_state` itself (the SAME list object, whose per-asset
+    ENTRIES get reassigned - never mutated in place - to a fresh
+    `copy.deepcopy` whenever a new best is found) - cheap (no evaluation,
+    just handing over a reference), letting a caller elsewhere (e.g.
+    api/server.py's "save best model so far" endpoint) always read the
+    CURRENT best checkpoint on demand, without this function needing to
+    know anything about full evaluation, checkpoint metadata, or the DB -
+    see models/portfolio_lstm.py's summarize_checkpoint for that part.
     """
     n_assets = model.n_assets
     optimizers = [
         torch.optim.Adam(model.assets[i].parameters(), lr=lr, weight_decay=weight_decay)
         for i in range(n_assets)
     ]
+    if checkpoint_metric not in ("val_loss", "hit_rate", "sharpe"):
+        raise ValueError(f"checkpoint_metric must be 'val_loss', 'hit_rate', or 'sharpe' - got {checkpoint_metric!r}")
     track_val = X_val is not None and z_labels_val is not None
-    track_sharpe = sharpe_weight > 0
+    track_sharpe = sharpe_weight > 0  # does SHARPE actually contribute to the combined training loss?
+    # Does validation-time Sharpe need computing at all this run? Either
+    # because track_sharpe needs it for the "val_loss" branch's own
+    # composite score (unchanged original behavior), or because
+    # checkpoint_metric itself selects on it directly - independent of
+    # whether sharpe_weight trains anything.
+    track_sharpe_val = track_val and (track_sharpe or checkpoint_metric == "sharpe")
     if track_sharpe and (next_returns_train is None or rp_weights_train is None or cov_train is None):
         raise ValueError("sharpe_weight > 0 requires next_returns_train/rp_weights_train/cov_train")
-    if track_sharpe and track_val and (next_returns_val is None or rp_weights_val is None or cov_val is None):
-        raise ValueError("sharpe_weight > 0 with validation tracking requires next_returns_val/rp_weights_val/cov_val")
+    if track_sharpe_val and (next_returns_val is None or rp_weights_val is None or cov_val is None):
+        raise ValueError(
+            "sharpe_weight > 0 (with validation tracking) or checkpoint_metric='sharpe' requires "
+            "next_returns_val/rp_weights_val/cov_val"
+        )
     best_val_loss = [float("inf")] * n_assets
     best_state: list[dict | None] = [None] * n_assets
     val_losses: list[float | None] = [None] * n_assets
@@ -1504,94 +1683,138 @@ def train_prediction_model(
             if best_state[i] is not None:
                 model.assets[i].load_state_dict(best_state[i])
         mean_best = sum(v for v in best_val_loss if v != float("inf")) / n_assets
-        logger.info("Restored each asset's own best-validation-loss checkpoint (mean val loss %.4f)", mean_best)
+        logger.info(
+            "Restored each asset's own best-validation-%s checkpoint (mean score %.4f)",
+            checkpoint_metric, mean_best,
+        )
 
     model.train()
     try:
         for epoch in range(1, epochs + 1):
             _check_stop()
-            train_losses = []
+            for opt in optimizers:
+                opt.zero_grad()
+
+            # ONE dense forward pass, every asset at once - see this
+            # function's own docstring on why every loss term below is
+            # summed into ONE scalar and backward()'d together, rather
+            # than as two sequential phases.
+            mu, sigma = model(X_train)  # each (n_train, lookback, n_assets)
+            per_asset_losses = []
             train_hits = []
             for i in range(n_assets):
-                optimizers[i].zero_grad()
-                x_i = model.asset_input(X_train, i)
-                mu_i, sigma_i = model.assets[i](x_i)  # each (n_train, lookback)
+                mu_i, sigma_i = mu[:, :, i], sigma[:, :, i]
                 target_i = z_labels_train[:, :, i]
                 loss_i = gaussian_nll(mu_i, sigma_i, target_i) + bce_weight * direction_bce(mu_i, sigma_i, target_i)
-                loss_i.backward()
-                _assert_finite_grad(model.assets[i].parameters(), f"epoch {epoch}, asset {i} ({model.pairs[i]}), NLL+BCE phase")
-                optimizers[i].step()
-                train_losses.append(loss_i.item())
+                per_asset_losses.append(loss_i)
                 with torch.no_grad():
                     train_hits.append(float(((mu_i[:, -1] > 0) == (target_i[:, -1] > 0)).float().mean()))
-            train_loss = sum(train_losses) / n_assets
+            total_loss = torch.stack(per_asset_losses).sum()
+            train_loss = total_loss.item() / n_assets
             train_hit_rate = sum(train_hits) / n_assets
 
-            # Phase B (opt-in, see this function's own docstring): a
-            # SECOND, JOINT update - one shared backward() across every
-            # asset's parameters, then each asset's own optimizer steps
-            # using whatever gradient landed in ITS OWN parameters.
             train_sharpe = None
             if track_sharpe:
-                for opt in optimizers:
-                    opt.zero_grad()
-                sharpe_loss = _portfolio_sharpe_loss(
-                    model, X_train, next_returns_train, rp_weights_train, cov_train,
-                    direction_horizon, sharpe_window, target_vol,
+                sharpe_loss = _portfolio_sharpe_loss_from_predictions(
+                    mu[:, -1, :], sigma[:, -1, :], next_returns_train, rp_weights_train, cov_train,
+                    direction_horizon, sharpe_window, target_vol, cost_bps,
                 )
-                (sharpe_weight * sharpe_loss).backward()
-                for i in range(n_assets):
-                    _assert_finite_grad(model.assets[i].parameters(), f"epoch {epoch}, asset {i} ({model.pairs[i]}), Sharpe phase")
-                for opt in optimizers:
-                    opt.step()
+                total_loss = total_loss + sharpe_weight * sharpe_loss
                 train_sharpe = -sharpe_loss.detach().item()
+
+            total_loss.backward()
+            for i in range(n_assets):
+                _assert_finite_grad(model.assets[i].parameters(), f"epoch {epoch}, asset {i} ({model.pairs[i]})")
+            for opt in optimizers:
+                opt.step()
 
             if track_val:
                 model.eval()
                 with torch.no_grad():
+                    # Same idea as the training pass above: ONE dense
+                    # forward pass over X_val, reused for every asset's own
+                    # NLL+BCE val loss AND (if needed) the joint val Sharpe -
+                    # values only, no backward, but no reason to pay for N+1
+                    # separate forward passes when one covers everything.
+                    val_mu, val_sigma = model(X_val)
+                    val_mu_dec, val_sigma_dec = val_mu[:, -1, :], val_sigma[:, -1, :]
                     for i in range(n_assets):
-                        x_i_val = model.asset_input(X_val, i)
-                        val_mu_i, val_sigma_i = model.assets[i](x_i_val)
-                        val_mu_dec, val_sigma_dec = val_mu_i[:, -1], val_sigma_i[:, -1]
                         val_target_i = z_labels_val[:, -1, i]
                         val_loss_i = float(
-                            gaussian_nll(val_mu_dec, val_sigma_dec, val_target_i)
-                            + bce_weight * direction_bce(val_mu_dec, val_sigma_dec, val_target_i)
+                            gaussian_nll(val_mu_dec[:, i], val_sigma_dec[:, i], val_target_i)
+                            + bce_weight * direction_bce(val_mu_dec[:, i], val_sigma_dec[:, i], val_target_i)
                         )
                         val_losses[i] = val_loss_i
-                        val_hit_rates[i] = float(((val_mu_dec > 0) == (val_target_i > 0)).float().mean())
+                        val_hit_rates[i] = float(((val_mu_dec[:, i] > 0) == (val_target_i > 0)).float().mean())
 
-                    # Composite selection score: the SAME objective training
-                    # optimizes (own NLL+BCE minus the shared Sharpe term,
-                    # see this function's own docstring), not a separate
-                    # Sharpe-only metric - a single joint val_sharpe here
-                    # applies equally to every asset's own comparison below.
+                    # val_sharpe is a single JOINT (whole-book) value - see
+                    # _portfolio_sharpe_loss's own docstring on why Sharpe
+                    # can't decompose per-asset - so it applies equally to
+                    # every asset's own comparison below, both in the
+                    # "val_loss" branch's composite score (unchanged
+                    # original behavior: the SAME objective training
+                    # optimizes, not a separate Sharpe-only metric) and in
+                    # the "sharpe" branch, where it's the WHOLE score.
                     val_sharpe = None
-                    if track_sharpe:
-                        val_sharpe_loss = _portfolio_sharpe_loss(
-                            model, X_val, next_returns_val, rp_weights_val, cov_val,
-                            direction_horizon, sharpe_window, target_vol,
+                    if track_sharpe_val:
+                        val_sharpe_loss = _portfolio_sharpe_loss_from_predictions(
+                            val_mu_dec, val_sigma_dec, next_returns_val, rp_weights_val, cov_val,
+                            direction_horizon, sharpe_window, target_vol, cost_bps,
                         )
                         val_sharpe = -val_sharpe_loss.item()
                     for i in range(n_assets):
-                        combined_val_loss_i = val_losses[i] - (sharpe_weight * val_sharpe if track_sharpe else 0.0)
-                        if combined_val_loss_i < best_val_loss[i]:
-                            best_val_loss[i] = combined_val_loss_i
+                        # LOWER score is always better (matches best_val_loss's
+                        # own "<" comparison below) - "hit_rate"/"sharpe" are
+                        # maximized quantities, so negate them to fit that
+                        # convention; "val_loss" (default) is unchanged from
+                        # this function's original behavior.
+                        if checkpoint_metric == "hit_rate":
+                            score_i = -val_hit_rates[i]
+                        elif checkpoint_metric == "sharpe":
+                            score_i = -val_sharpe
+                        else:
+                            score_i = val_losses[i] - (sharpe_weight * val_sharpe if track_sharpe else 0.0)
+                        if score_i < best_val_loss[i]:
+                            best_val_loss[i] = score_i
                             best_state[i] = copy.deepcopy(model.assets[i].state_dict())
                 model.train()
+                if on_checkpoint_update is not None:
+                    on_checkpoint_update(epoch, best_state)
 
             if epoch == 1 or epoch % max(epochs // 10, 1) == 0:
                 val_loss_mean = sum(val_losses) / n_assets if track_val else None
                 val_hit_mean = sum(val_hit_rates) / n_assets if track_val else None
                 val_msg = f" | val loss {val_loss_mean:.4f} | val hit rate {val_hit_mean:.4f}" if track_val else ""
                 sharpe_msg = f" | train sharpe {train_sharpe:.4f}" if track_sharpe else ""
-                if track_sharpe and track_val:
+                if track_sharpe_val:
                     sharpe_msg += f" | val sharpe {val_sharpe:.4f}"
+
+                # Running best CHECKPOINT-SELECTION score so far this run,
+                # in human-legible units matching checkpoint_metric (see
+                # this function's own docstring) - "val_loss" is stored/
+                # displayed as-is (lower better); "hit_rate"/"sharpe" are
+                # stored NEGATED (see the score_i computation above, to fit
+                # best_val_loss's shared "<" convention), so un-negate them
+                # here for display (higher better). None until at least one
+                # epoch has actually updated a checkpoint.
+                best_score = None
+                if track_val:
+                    finite_bests = [v for v in best_val_loss if v != float("inf")]
+                    if finite_bests:
+                        mean_best_score = sum(finite_bests) / len(finite_bests)
+                        best_score = mean_best_score if checkpoint_metric == "val_loss" else -mean_best_score
+                if best_score is not None:
+                    sharpe_msg += f" | best {checkpoint_metric} {best_score:.4f}"
+
                 logger.info(
                     "epoch %d/%d - train loss %.4f | train hit rate %.4f%s%s",
                     epoch, epochs, train_loss, train_hit_rate, val_msg, sharpe_msg,
                 )
-                _report_epoch("train", epoch, epochs, train_loss, train_hit_rate, val_loss_mean, val_hit_mean)
+                _report_epoch(
+                    "train", epoch, epochs, train_loss, train_hit_rate, val_loss_mean, val_hit_mean,
+                    train_sharpe=train_sharpe, val_sharpe=val_sharpe if track_sharpe_val else None,
+                    best_score=best_score,
+                )
     except TrainingStopped:
         logger.info("Training stopped early at epoch %d/%d", epoch, epochs)
         if track_val:
@@ -1711,7 +1934,7 @@ DEFAULT_CONFIG: dict = {
     # How many days AHEAD the z-score label (see make_sequences) looks:
     # an asset's CUMULATIVE log return over the next `direction_horizon`
     # days, expressed in trailing-volatility standard deviations - what
-    # training's Huber loss regresses against (see train_prediction_model),
+    # training's Gaussian NLL + BCE loss fits (see train_prediction_model),
     # and what hit rate/confusion matrices are computed from (via the
     # label's sign).
     "direction_horizon": 5,
@@ -1776,20 +1999,43 @@ DEFAULT_CONFIG: dict = {
     # and keeps whichever validated best, per seed and then overall.
     "bce_weight": 1.0,
     # Optional COMPLEMENTARY training objective (see train_prediction_model's
-    # own docstring on its "Optional portfolio-Sharpe phase"): 0 (default)
+    # own docstring on its "ONE combined step per epoch"): 0 (default)
     # disables it entirely - training is then IDENTICAL to the description
-    # above. > 0 adds a SECOND, JOINT phase each epoch (own optimizer step,
-    # after the per-asset NLL+BCE phase): the model's own probability
-    # signal, multiplied by a PRECOMPUTED (data-only, never optimized)
-    # risk-parity weight and scaled to `target_vol`, drives an averaged
-    # rolling Sharpe ratio (over `sharpe_window` days) that gets maximized.
+    # above. > 0 adds a JOINT Sharpe term to the SAME combined loss every
+    # epoch (one shared backward(), not a separate phase): the model's own
+    # probability signal, multiplied by a PRECOMPUTED (data-only, never
+    # optimized) risk-parity weight and scaled to `target_vol`, drives an
+    # averaged Sharpe ratio - over NON-OVERLAPPING `sharpe_window`-day
+    # chunks walking backward from the last day, see
+    # _non_overlapping_sharpe_torch - that gets maximized.
     # This is NOT decomposable per-asset like NLL/BCE - the target-vol
     # scaling denominator mixes every asset's current signal - so unlike
     # everything else in this config, sharpe_weight > 0 means one asset's
     # training genuinely depends on every other asset's current output
     # (see models/portfolio_pnl.py/train_prediction_model docstrings).
     "sharpe_weight": 0.0,
-    "sharpe_window": 20,  # trailing days the rolling Sharpe (see _rolling_sharpe_torch) is computed over
+    # Chunk size (days) each non-overlapping period Sharpe (see
+    # _non_overlapping_sharpe_torch) is computed over.
+    "sharpe_window": 20,
+    # Linear transaction cost, in BASIS POINTS per unit of daily position
+    # change - applied both to every reported portfolio PnL/Sharpe
+    # (models/portfolio_pnl.py's compute_portfolio) and inside the
+    # sharpe_weight training objective itself, so what's optimized and
+    # what's reported are the same NET-of-costs quantity. ~1bp is a
+    # realistic all-in spread for FX majors at modest size; 0 recovers the
+    # frictionless book.
+    "cost_bps": DEFAULT_COST_BPS,
+    # Which per-epoch VALIDATION metric selects each asset's own restored
+    # checkpoint (see train_prediction_model's own docstring) - independent
+    # of "sharpe_weight" above, which controls what TRAINS the weights, not
+    # which epoch's weights get kept. "val_loss" (default, unchanged
+    # original behavior): own NLL+BCE val loss, minus sharpe_weight *
+    # val_sharpe if sharpe_weight > 0. "hit_rate": best validation
+    # directional hit rate wins (NOT the default - see the docstring on why
+    # this is a coarser, saturating metric). "sharpe": best validation
+    # portfolio Sharpe wins - works even with sharpe_weight=0 (training
+    # stays pure NLL+BCE; only checkpoint selection changes).
+    "checkpoint_metric": "val_loss",
     # Neutral band (see apply_neutral_band): probabilities within
     # 0.5 +/- this half-width are snapped to exactly 0.5 - the model
     # ABSTAINS instead of making a near-coin-flip call. Hit rate/
@@ -1985,9 +2231,15 @@ def _prepare_data(
     # whole fetched period is one block, see api/server.py's evaluate()),
     # there's no val/test after train to protect from leakage, so trimming
     # here would just needlessly throw away the freshest, most valuable
-    # days for no reason.
+    # days for no reason. Train IS followed by another split whenever a
+    # validation split exists (n_train < n_remaining) OR - the
+    # `train_frac=1.0` + `test_frac>0` corner - the test split begins
+    # IMMEDIATELY at n_train == n_remaining, which needs the exact same
+    # gap (the last training labels would otherwise overlap the first
+    # test samples' lookback windows).
     purge_gap = lookback + direction_horizon
-    train_end = max(n_train - purge_gap, 0) if n_train < n_remaining else n_train
+    train_followed_by_split = n_train < n_remaining or n_test > 0
+    train_end = max(n_train - purge_gap, 0) if train_followed_by_split else n_train
     val_end = max(n_remaining - purge_gap, n_train) if n_test > 0 else n_remaining
     if train_end == 0:
         raise ValueError(
@@ -2210,11 +2462,71 @@ def evaluate_prediction_model(
     )
 
 
-def _train_and_evaluate(data: _PreparedData, args: argparse.Namespace) -> PredictionResult:
+def _run_train_prediction_model(
+    model: PredictionModel, data: "_PreparedData", args: argparse.Namespace,
+    on_checkpoint_update: Callable[[int, list], None] | None = None,
+) -> None:
+    """Shared by _train_and_evaluate (fresh random-init model) and
+    continue_training (warm-started from an existing checkpoint's
+    state_dict) - builds the sharpe_weight/checkpoint_metric-dependent
+    tensors and calls train_prediction_model identically either way. The
+    only difference between the two callers is how `model`'s WEIGHTS got
+    to this point before this function ever runs.
+
+    `on_checkpoint_update` is passed straight through to
+    train_prediction_model - see its own docstring.
+    """
+    sharpe_weight = getattr(args, "sharpe_weight", 0.0) or 0.0
+    checkpoint_metric = getattr(args, "checkpoint_metric", "val_loss") or "val_loss"
+    # next_returns_val_t is needed whenever validation-time Sharpe is
+    # needed AT ALL - either because sharpe_weight>0 (the combined loss's
+    # own composite val score) or because checkpoint_metric="sharpe"
+    # selects on it directly, even with sharpe_weight=0 (pure NLL+BCE
+    # training, Sharpe only decides which checkpoint gets kept - see
+    # train_prediction_model's own docstring on checkpoint_metric).
+    # next_returns_train_t is only ever needed when sharpe_weight>0 itself.
+    next_returns_train_t, next_returns_val_t = None, None
+    if sharpe_weight > 0:
+        next_returns_train_t = torch.as_tensor(data.next_returns_train, dtype=torch.float32, device=data.device)
+    if sharpe_weight > 0 or checkpoint_metric == "sharpe":
+        next_returns_val_t = torch.as_tensor(data.next_returns_val, dtype=torch.float32, device=data.device)
+
+    train_prediction_model(
+        model, data.X_train, data.z_labels_train,
+        epochs=args.epochs, lr=args.lr, weight_decay=args.weight_decay,
+        bce_weight=getattr(args, "bce_weight", 1.0),
+        X_val=data.X_val, z_labels_val=data.z_labels_val,
+        sharpe_weight=sharpe_weight,
+        sharpe_window=getattr(args, "sharpe_window", 20) or 20,
+        direction_horizon=getattr(args, "direction_horizon", 5) or 5,
+        target_vol=getattr(args, "target_vol", None) or DEFAULT_TARGET_VOL,
+        cost_bps=getattr(args, "cost_bps", DEFAULT_COST_BPS),
+        next_returns_train=next_returns_train_t, next_returns_val=next_returns_val_t,
+        rp_weights_train=data.rp_weights_train, rp_weights_val=data.rp_weights_val,
+        cov_train=data.cov_train, cov_val=data.cov_val,
+        checkpoint_metric=checkpoint_metric,
+        on_checkpoint_update=on_checkpoint_update,
+    )
+
+
+def _train_and_evaluate(
+    data: _PreparedData, args: argparse.Namespace,
+    on_best_checkpoint: Callable[[PredictionModel, _PreparedData, argparse.Namespace, int, list], None] | None = None,
+) -> PredictionResult:
     """Train one PredictionModel (whatever random seed is currently set) on
     already-prepared data - every asset's LSTM trained FULLY
     INDEPENDENTLY, its own optimizer and loss (see train_prediction_model)
     - and evaluate it on all three splits.
+
+    `on_best_checkpoint`, if given, is called after every VALIDATED epoch
+    with `(model, data, args, epoch, best_state)` - `model`/`data`/`args` are
+    this call's OWN (architecture, prepared data, config), closed over
+    here so a caller several layers up (see api/server.py's "save best
+    model so far" endpoint) can build a full evaluated snapshot from
+    `best_state` at any later time - e.g. models/portfolio_lstm.py's
+    summarize_checkpoint - without needing to plumb `model`/`data`/`args`
+    through itself. See train_prediction_model's own docstring on why
+    handing over `best_state` here is cheap (no evaluation happens now).
     """
     num_layers = getattr(args, "num_layers", 1)
     if str(data.device) == "mps" and num_layers > 1:
@@ -2237,27 +2549,168 @@ def _train_and_evaluate(data: _PreparedData, args: argparse.Namespace) -> Predic
         cross_pairs=getattr(args, "cross_pairs", None),
     ).to(data.device)
 
-    sharpe_weight = getattr(args, "sharpe_weight", 0.0) or 0.0
-    next_returns_train_t, next_returns_val_t = None, None
-    if sharpe_weight > 0:
-        next_returns_train_t = torch.as_tensor(data.next_returns_train, dtype=torch.float32, device=data.device)
-        next_returns_val_t = torch.as_tensor(data.next_returns_val, dtype=torch.float32, device=data.device)
+    on_checkpoint_update = None
+    if on_best_checkpoint is not None:
+        on_checkpoint_update = lambda epoch, best_state: on_best_checkpoint(model, data, args, epoch, best_state)  # noqa: E731
 
-    train_prediction_model(
-        model, data.X_train, data.z_labels_train,
-        epochs=args.epochs, lr=args.lr, weight_decay=args.weight_decay,
-        bce_weight=getattr(args, "bce_weight", 1.0),
-        X_val=data.X_val, z_labels_val=data.z_labels_val,
-        sharpe_weight=sharpe_weight,
-        sharpe_window=getattr(args, "sharpe_window", 20) or 20,
-        direction_horizon=getattr(args, "direction_horizon", 5) or 5,
-        target_vol=getattr(args, "target_vol", None) or DEFAULT_TARGET_VOL,
-        next_returns_train=next_returns_train_t, next_returns_val=next_returns_val_t,
-        rp_weights_train=data.rp_weights_train, rp_weights_val=data.rp_weights_val,
-        cov_train=data.cov_train, cov_val=data.cov_val,
-    )
-
+    _run_train_prediction_model(model, data, args, on_checkpoint_update=on_checkpoint_update)
     return evaluate_prediction_model(model, data, neutral_band=getattr(args, "neutral_band", 0.0))
+
+
+def continue_training(
+    args: argparse.Namespace, base_model: PredictionModel,
+    on_best_checkpoint: Callable[[PredictionModel, "_PreparedData", argparse.Namespace, int, list], None] | None = None,
+) -> PredictionResult:
+    """Warm-start training from an ALREADY-TRAINED model's weights
+    (`base_model` - loaded by the caller, e.g. via load_prediction_model_auto)
+    instead of a freshly random-initialized PredictionModel - i.e. keep
+    optimizing an existing model rather than starting over.
+
+    Every ARCHITECTURE-defining property - n_assets/pairs, n_channels,
+    hidden_size, num_layers, dropout, n_attn_heads, cross_pairs, lookback,
+    features, cma_windows, bandpass_windows, bandpass_order - and the
+    model's own input standardization stats (x_mean/x_std: the weights
+    were fit expecting inputs scaled EXACTLY this way) are recovered from
+    `base_model` and used AS-IS - never from `args` - since changing any
+    of them would produce a shape-incompatible or silently-miscalibrated
+    model, not a genuine continuation of training. (api/server.py's
+    _run_training_job additionally overwrites `args`'s own copies of these
+    fields to match `base_model` before calling this, purely so the
+    caller's OWN post-training bookkeeping - e.g. what it saves the result
+    checkpoint with - stays consistent too; this function does not depend
+    on that having happened.)
+
+    Everything else - epochs, lr, weight_decay, bce_weight, sharpe_weight,
+    sharpe_window, direction_horizon, checkpoint_metric, target_vol,
+    neutral_band, and the data window (years, cutoff_date, train_frac,
+    test_frac, device) - comes from `args`, exactly like a fresh training
+    run (see _train_and_evaluate) - e.g. to continue training over freshly
+    extended history, or with a different optimization objective, without
+    touching what the network architecturally is. Optimizer momentum
+    (Adam's own per-parameter state) is NOT persisted in a checkpoint and
+    so is NOT resumed - this is a warm-started fresh optimizer run over
+    pretrained weights, not a bit-exact resume of a previous run.
+
+    `on_best_checkpoint`, if given, is called after every VALIDATED epoch
+    with `(model, data, args, epoch, best_state)` - see _train_and_evaluate's own
+    docstring, identical contract here.
+    """
+    data = _prepare_data(
+        args, x_mean=base_model.x_mean, x_std=base_model.x_std, pairs=base_model.pairs,
+        lookback=base_model.lookback, features=base_model.features, cma_windows=base_model.cma_windows,
+        bandpass_windows=base_model.bandpass_windows, bandpass_order=base_model.bandpass_order,
+    )
+    model = PredictionModel(
+        n_assets=len(base_model.pairs),
+        pairs=base_model.pairs,
+        n_channels=base_model.n_channels,
+        hidden_size=base_model.hidden_size,
+        num_layers=base_model.num_layers,
+        dropout=base_model.dropout_p,
+        n_attn_heads=base_model.n_attn_heads,
+        cross_pairs=base_model.cross_pairs,
+    ).to(data.device)
+    model.load_state_dict(base_model.state_dict())
+
+    on_checkpoint_update = None
+    if on_best_checkpoint is not None:
+        on_checkpoint_update = lambda epoch, best_state: on_best_checkpoint(model, data, args, epoch, best_state)  # noqa: E731
+
+    _run_train_prediction_model(model, data, args, on_checkpoint_update=on_checkpoint_update)
+    return evaluate_prediction_model(model, data, neutral_band=getattr(args, "neutral_band", 0.0))
+
+
+def summarize_checkpoint(
+    model_template: PredictionModel, data: "_PreparedData", args: argparse.Namespace, best_state: list,
+) -> tuple[PredictionModel, PredictionResult, dict] | None:
+    """Build a fresh, fully-evaluated snapshot from `best_state` (the SAME
+    list _train_and_evaluate/continue_training's `on_best_checkpoint`
+    callback hands over - see their own docstrings) - the "save best model
+    so far" endpoint's whole job. Returns None if any asset doesn't have a
+    validated checkpoint yet (best_state[i] is still None - e.g. before
+    the first validated epoch, or that asset's every score so far was
+    NaN) - there is no well-defined "best" for that asset yet.
+
+    `model_template` supplies the ARCHITECTURE only (hidden_size,
+    num_layers, dropout, n_attn_heads, cross_pairs, n_channels) - never
+    its CURRENT weights, which keep changing throughout training and are
+    irrelevant here; a brand new PredictionModel is constructed and only
+    `best_state`'s own (already-deep-copied) per-asset weights are loaded
+    into it, so this never touches - or races with - the live training
+    model's own parameters.
+
+    Returns `(snapshot_model, result, summary)`:
+      - `snapshot_model`: the newly built, weight-loaded PredictionModel -
+        ready to hand to save_model/save_to_db exactly like any other
+        trained model.
+      - `result`: its full PredictionResult (see evaluate_prediction_model) -
+        everything the Training view's own result panel needs (hit rate,
+        confusion matrix, cumulative returns, probabilities, ...).
+      - `summary`: `{"train"/"val"/"test": {"loss", "hit_rate", "sharpe"}}` -
+        `loss` is NLL + bce_weight*BCE (using the FIRST value if
+        `bce_weight` is a sweep list) over that split's decision-day
+        predictions (see PredictionResult's own mu_*/sigma_*/z_labels_*),
+        `hit_rate` the same mean already in `result.hit_rate_*`, and
+        `sharpe` the ANNUALIZED Sharpe of that split's realized daily
+        whole-book PnL (risk-parity weight x probability signal, scaled
+        to `target_vol` - see models/portfolio_pnl.py's compute_portfolio,
+        the same strategy the Evaluation/Training views' own portfolio
+        charts use) - None if that split is too short to define a Sharpe
+        (fewer than 2 days, or zero variance).
+    """
+    if any(s is None for s in best_state):
+        return None
+    n_assets = len(data.pairs)
+    snapshot = PredictionModel(
+        n_assets=n_assets,
+        pairs=data.pairs,
+        n_channels=data.n_channels,
+        hidden_size=model_template.hidden_size,
+        num_layers=model_template.num_layers,
+        dropout=model_template.dropout_p,
+        n_attn_heads=model_template.n_attn_heads,
+        cross_pairs=model_template.cross_pairs,
+    ).to(data.device)
+    for i in range(n_assets):
+        snapshot.assets[i].load_state_dict(best_state[i])
+
+    result = evaluate_prediction_model(snapshot, data, neutral_band=getattr(args, "neutral_band", 0.0))
+
+    direction_horizon = getattr(args, "direction_horizon", 5) or 5
+    target_vol = getattr(args, "target_vol", None) or DEFAULT_TARGET_VOL
+    cost_bps = getattr(args, "cost_bps", DEFAULT_COST_BPS)
+    bce_weight = getattr(args, "bce_weight", 1.0)
+    if isinstance(bce_weight, (list, tuple)):
+        bce_weight = bce_weight[0] if bce_weight else 1.0
+    band = result.neutral_band
+
+    summary = {}
+    for split in ("train", "val", "test"):
+        mu = torch.as_tensor(getattr(result, f"mu_{split}"))
+        # result.sigma_* is CALIBRATED (sigma * sigma_hat - see
+        # PredictionResult's docstring); divide sigma_hat back out so this
+        # loss is the SAME raw-sigma NLL+BCE quantity training and
+        # checkpoint selection actually minimized - comparable with the
+        # training log's own val-loss numbers, not offset by the
+        # calibration factor.
+        sigma_raw = torch.as_tensor(getattr(result, f"sigma_{split}")) / torch.as_tensor(result.sigma_hat)
+        z = torch.as_tensor(getattr(result, f"z_labels_{split}"))
+        loss = float(gaussian_nll(mu, sigma_raw, z) + bce_weight * direction_bce(mu, sigma_raw, z))
+        hit_rate = float(np.mean(getattr(result, f"hit_rate_{split}")))
+
+        probs = getattr(result, f"probabilities_{split}")
+        next_returns = getattr(result, f"next_returns_{split}")
+        portfolio = compute_portfolio(
+            apply_neutral_band(probs, band), next_returns, direction_horizon, target_vol, cost_bps=cost_bps,
+        )
+        pnl = portfolio["pnl_modulated"]
+        sharpe = (
+            float(pnl.mean() / pnl.std() * (TRADING_DAYS_PER_YEAR ** 0.5))
+            if len(pnl) > 1 and pnl.std() > 0 else None
+        )
+        summary[split] = {"loss": loss, "hit_rate": hit_rate, "sharpe": sharpe}
+
+    return snapshot, result, summary
 
 
 def load_pipeline(args: argparse.Namespace) -> PredictionResult:
@@ -2311,7 +2764,10 @@ def run_pipeline(args: argparse.Namespace) -> PredictionResult:
     return _train_and_evaluate(_prepare_data(args), args)
 
 
-def run_pipeline_multi_seed(args: argparse.Namespace) -> PredictionResult:
+def run_pipeline_multi_seed(
+    args: argparse.Namespace,
+    on_best_checkpoint: Callable[[PredictionModel, "_PreparedData", argparse.Namespace, int, list], None] | None = None,
+) -> PredictionResult:
     """Train `n_seeds` independent PredictionModels - each seed optionally
     SWEPT over every `bce_weight` value given (pass a list, e.g.
     `[1.0, 1.5, 1.75, 2.0, 3.0]`, instead of a single float) - and keep
@@ -2347,6 +2803,12 @@ def run_pipeline_multi_seed(args: argparse.Namespace) -> PredictionResult:
 
     If --load-model is set, restarts don't apply at all - there's nothing
     to train, so this just delegates to load_pipeline().
+
+    `on_best_checkpoint`, if given, is forwarded to every _train_and_evaluate
+    call (see its own docstring) - so it always reflects whichever
+    seed/bce_weight combo is CURRENTLY running, not necessarily the
+    eventual overall winner across every restart (a caller that only
+    cares about n_seeds=1 sees no difference).
     """
     if args.load_model:
         return load_pipeline(args)
@@ -2376,7 +2838,7 @@ def run_pipeline_multi_seed(args: argparse.Namespace) -> PredictionResult:
                 seed + 1, n_seeds, seed, bw, lambda_idx + 1, n_lambdas,
             )
             lambda_args = argparse.Namespace(**{**vars(args), "bce_weight": bw})
-            candidates.append(_train_and_evaluate(data, lambda_args))
+            candidates.append(_train_and_evaluate(data, lambda_args, on_best_checkpoint=on_best_checkpoint))
 
         if n_lambdas == 1:
             seed_best = candidates[0]

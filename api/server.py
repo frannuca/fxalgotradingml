@@ -12,6 +12,11 @@ GET  /api/models             - list models saved in quant.model_registry
 POST /api/train               - kick off a training run (background job)
 GET  /api/train/{job_id}     - poll a training job's status/result
 POST /api/train/{job_id}/stop - request an in-progress job stop early
+POST /api/train/{job_id}/save-best - save whichever checkpoint is
+                                 CURRENTLY best (mid-run or after) to
+                                 quant.model_registry under a new name,
+                                 and return a train/val/test loss/hit-rate/
+                                 Sharpe summary
 POST /api/evaluate            - load a model by name and run inference:
                                  returns per-asset hit rate, confusion
                                  matrices, cumulative-return series (with
@@ -27,10 +32,12 @@ from __future__ import annotations
 import contextvars
 import io
 import logging
+import os
 import re
 import threading
 import uuid
 from argparse import Namespace
+from datetime import datetime
 from typing import Any
 
 import numpy as np
@@ -54,9 +61,16 @@ from models.portfolio_lstm import (
     load_close_prices,
     prediction_model_name,
     probit,
+    summarize_checkpoint,
     to_log_returns,
 )
-from models.portfolio_pnl import DEFAULT_TARGET_VOL, annual_sharpe_table, compute_portfolio, latest_position
+from models.portfolio_pnl import (
+    DEFAULT_COST_BPS,
+    DEFAULT_TARGET_VOL,
+    annual_sharpe_table,
+    compute_portfolio,
+    latest_position,
+)
 
 app = FastAPI(title="FX Direction Prediction API")
 app.add_middleware(
@@ -114,7 +128,8 @@ def refresh_quotes(req: RefreshQuotesRequest) -> dict:
 @app.get("/api/models")
 def list_models() -> list[dict]:
     """List every model saved in quant.model_registry, newest first - the
-    frontend's model picker (for the Evaluation view) reads this.
+    frontend's model picker (for the Evaluation and Continue Training
+    views) reads this.
 
     Includes each model's own `pairs` and `lookback`, decoded from its
     checkpoint blob, so the frontend can auto-select the FX pairs and
@@ -123,6 +138,16 @@ def list_models() -> list[dict]:
     exactly - see api/server.py's evaluate()/models/portfolio_lstm.py's
     load_pipeline() for why the model's own pairs/lookback are
     authoritative over anything a caller might guess.
+
+    Also includes every other ARCHITECTURE-defining property (n_channels,
+    hidden_size, num_layers, dropout, n_attn_heads, cross_pairs, features,
+    cma_windows, bandpass_windows, bandpass_order) plus neutral_band/
+    target_vol - not needed by the Evaluation view (which recovers them
+    server-side via the model's own checkpoint), but the Continue Training
+    view's whole point is showing a chosen model's full architecture
+    READ-ONLY (see /api/train's `continue_from`, which re-derives these
+    from the checkpoint itself server-side too - this payload is for
+    DISPLAY only, never trusted as a source of truth for training).
     """
     with get_connection() as conn, conn.cursor() as cur:
         cur.execute(
@@ -133,6 +158,7 @@ def list_models() -> list[dict]:
     result = []
     for name, model_type, description, created_at, updated_at, blob in rows:
         checkpoint = torch.load(io.BytesIO(bytes(blob)), map_location="cpu", weights_only=True)
+        config = checkpoint.get("config", {})
         result.append({
             "name": name,
             "model_type": model_type,
@@ -142,6 +168,18 @@ def list_models() -> list[dict]:
             "size_bytes": len(blob),
             "pairs": checkpoint.get("pairs"),
             "lookback": checkpoint.get("lookback"),
+            "n_channels": config.get("n_channels"),
+            "hidden_size": config.get("hidden_size"),
+            "num_layers": config.get("num_layers"),
+            "dropout": config.get("dropout"),
+            "n_attn_heads": config.get("n_attn_heads"),
+            "cross_pairs": config.get("cross_pairs"),
+            "features": checkpoint.get("features"),
+            "cma_windows": checkpoint.get("cma_windows"),
+            "bandpass_windows": checkpoint.get("bandpass_windows"),
+            "bandpass_order": checkpoint.get("bandpass_order"),
+            "neutral_band": checkpoint.get("neutral_band"),
+            "target_vol": checkpoint.get("target_vol"),
         })
     return result
 
@@ -152,7 +190,23 @@ def list_models() -> list[dict]:
 
 # In-memory job store - fine for a local, single-process dev server; a
 # multi-worker/production deployment would need a real job queue instead.
+# Every value in here must stay JSON-serializable: GET /api/train/{job_id}
+# (see get_training_status) returns `{"job_id": job_id, **job}` - anything
+# non-serializable (a torch model, a _PreparedData) stored under a job_id
+# here would crash EVERY subsequent status poll with a Pydantic
+# serialization error, not just whichever endpoint actually needed it. Raw
+# model/data/args/best_state references (see POST .../save-best) live in
+# the SEPARATE _BEST_CHECKPOINT_STATE dict below instead, precisely so
+# they can never leak into this one's wholesale dict-spread.
 _JOBS: dict[str, dict[str, Any]] = {}
+
+# job_id -> {"model", "data", "args", "epoch", "best_state"} - the raw
+# (non-JSON-serializable) references POST /api/train/{job_id}/save-best
+# needs to build a snapshot on demand (see _run_training_job's
+# on_best_checkpoint callback and models/portfolio_lstm.py's
+# summarize_checkpoint). Deliberately NOT part of _JOBS - see its own
+# comment on why.
+_BEST_CHECKPOINT_STATE: dict[str, dict[str, Any]] = {}
 
 # Which job_id (if any) is training on the CURRENT thread - contextvars are
 # thread-local, and each training job runs its own dedicated background
@@ -244,6 +298,20 @@ logging.getLogger("models").setLevel(logging.INFO)
 
 
 class TrainRequest(BaseModel):
+    # A quant.model_registry name or local .pt path (see
+    # load_prediction_model_auto) to CONTINUE TRAINING from instead of a
+    # fresh random init - see models/portfolio_lstm.py's continue_training.
+    # When set: `pairs`/`lookback`/`hidden_size`/`num_layers`/`dropout`/
+    # `n_attn_heads`/`cross_pairs`/`features`/`cma_windows`/
+    # `bandpass_windows`/`bandpass_order` below are ALL ignored (the
+    # server recovers them from the base model's own checkpoint instead -
+    # every architecture-defining property must match exactly, so none of
+    # them are free parameters here) - only training-behavior fields
+    # (epochs, lr, weight_decay, bce_weight, sharpe_weight, sharpe_window,
+    # direction_horizon, checkpoint_metric, neutral_band, target_vol) and
+    # the data window (years, cutoff_date, train_frac, test_frac, device)
+    # actually apply. `pairs` above may be sent as `[]` in this mode.
+    continue_from: str | None = None
     pairs: list[str]
     lookback: int = 30
     years: int = 8
@@ -294,21 +362,32 @@ class TrainRequest(BaseModel):
     # validated best, per seed and then overall.
     bce_weight: float | list[float] = 1.0
     # Optional COMPLEMENTARY training objective (see train_prediction_model's
-    # "Optional portfolio-Sharpe phase" docstring) - 0 (default) disables
-    # it, training is then unchanged. > 0 adds a joint portfolio-Sharpe
-    # training phase on top of NLL+BCE: risk-parity weight x this model's
-    # own probability signal, scaled to target_vol below, maximizing an
-    # averaged rolling Sharpe over sharpe_window days. Unlike every other
+    # own docstring on its "ONE combined step per epoch") - 0 (default)
+    # disables it, training is then unchanged. > 0 adds a joint portfolio-
+    # Sharpe term to the SAME combined loss as NLL+BCE: risk-parity weight
+    # x this model's own probability signal, scaled to target_vol below,
+    # maximizing an averaged Sharpe over NON-OVERLAPPING sharpe_window-day
+    # chunks (see _non_overlapping_sharpe_torch). Unlike every other
     # training parameter, > 0 means one asset's training depends on every
     # other asset's current output (the target-vol scaling is joint).
     sharpe_weight: float = 0.0
     sharpe_window: int = 20
+    # Which per-epoch VALIDATION metric selects each asset's own restored
+    # checkpoint (see models/portfolio_lstm.py's train_prediction_model
+    # docstring on checkpoint_metric) - independent of sharpe_weight above,
+    # which controls what TRAINS the weights, not which epoch's weights
+    # get kept. "val_loss" (default), "hit_rate", or "sharpe".
+    checkpoint_metric: str = "val_loss"
     neutral_band: float = 0.05  # abstention half-width around p=0.5 (see apply_neutral_band); 0 disables
     # Annualized volatility the evaluation-mode portfolio PnL calculator
     # (models/portfolio_pnl.py) scales this model's positions to - a
     # property of the model, persisted in its checkpoint alongside
     # neutral_band, not a free evaluation-time parameter.
     target_vol: float = DEFAULT_TARGET_VOL
+    # Linear transaction cost (basis points per unit of daily position
+    # change) charged in every reported portfolio PnL/Sharpe AND inside the
+    # sharpe_weight training objective - see models/portfolio_pnl.py.
+    cost_bps: float = DEFAULT_COST_BPS
     n_seeds: int = 1
     device: str = "auto"  # "auto" (Metal/MPS on Apple Silicon, else CUDA, else CPU), "cpu", "mps", or "cuda" - see get_device
     save_db: bool = True
@@ -456,6 +535,8 @@ def _run_training_job(job_id: str, config: dict) -> None:
     def _interim_callback(
         stage: str, epoch: int, epochs: int, train_loss: float, train_hit_rate: float,
         val_loss: float | None = None, val_hit_rate: float | None = None,
+        train_sharpe: float | None = None, val_sharpe: float | None = None,
+        best_score: float | None = None,
     ) -> None:
         """Registered below via _epoch_report_callback - called from INSIDE
         train_prediction_model's own epoch loop (same ~10%-of-epochs
@@ -463,6 +544,14 @@ def _run_training_job(job_id: str, config: dict) -> None:
         live-updating loss/hit-rate curve instead of only a progress bar
         and log text. `stage` is always "train" now (kept as a field for
         payload-shape stability).
+
+        `train_sharpe`/`val_sharpe` (only present when the optional
+        portfolio-Sharpe phase or checkpoint_metric="sharpe" is actually
+        computing them - see train_prediction_model) and `best_score` (the
+        running best checkpoint-selection score so far, in units matching
+        `config["checkpoint_metric"]` - see _report_epoch's own docstring)
+        let the Training view show the SAME "what is checkpoint selection
+        actually optimizing" picture live, not just afterward.
         """
         job = _JOBS.get(job_id)
         if job is None:
@@ -470,25 +559,82 @@ def _run_training_job(job_id: str, config: dict) -> None:
         interim = {
             "stage": stage, "epoch": epoch, "total_epochs": epochs,
             "train_loss": train_loss, "train_hit_rate": train_hit_rate,
+            "checkpoint_metric": config.get("checkpoint_metric") or "val_loss",
         }
         if val_loss is not None:
             interim["val_loss"] = val_loss
             interim["val_hit_rate"] = val_hit_rate
+        if train_sharpe is not None:
+            interim["train_sharpe"] = train_sharpe
+        if val_sharpe is not None:
+            interim["val_sharpe"] = val_sharpe
+        if best_score is not None:
+            interim["best_score"] = best_score
         job["interim"] = interim
         history = job.setdefault("interim_history", [])
         history.append(interim)
         if len(history) > 1000:
             del history[: len(history) - 1000]
 
+    def _on_best_checkpoint(model, data, run_args, epoch: int, best_state: list) -> None:
+        """Registered below via run_pipeline_multi_seed/continue_training's
+        own `on_best_checkpoint` param - fires after every VALIDATED epoch
+        with (that call's own model/data/args, the epoch, best_state) - see
+        models/portfolio_lstm.py's train_prediction_model docstring on why
+        this is cheap (no evaluation happens here, just storing references
+        for POST /api/train/{job_id}/save-best to build a full snapshot
+        from ON DEMAND, only when a user actually clicks "Save best model
+        so far" - not on every epoch).
+        """
+        if job_id not in _JOBS:
+            return
+        _BEST_CHECKPOINT_STATE[job_id] = {
+            "model": model, "data": data, "args": run_args, "epoch": epoch, "best_state": best_state,
+        }
+
     _epoch_report_callback.set(_interim_callback)
     _stop_check_callback.set(lambda: _JOBS.get(job_id, {}).get("stop_requested", False))
     _JOBS[job_id]["status"] = "running"
     try:
-        args = Namespace(**{**DEFAULT_CONFIG, **config, "load_model": None})
+        continue_from = config.get("continue_from")
+        if continue_from:
+            # Continue-training mode (see models/portfolio_lstm.py's
+            # continue_training): load the base model ONCE here, then
+            # overwrite `args`'s own copies of every ARCHITECTURE-defining
+            # field with the base model's actual values - not because
+            # continue_training itself needs `args` to carry them (it
+            # reads straight from `base_model`), but so the REST of this
+            # function (the save_model/save_to_db calls a few lines below,
+            # which read `args.features`/`args.cma_windows`/etc, not
+            # `result`'s) stays self-consistent with what was actually
+            # trained, exactly as if the user had submitted a normal
+            # config matching this model from scratch.
+            from models.portfolio_lstm import continue_training, load_prediction_model_auto
 
-        from models.portfolio_lstm import run_pipeline_multi_seed
+            base_model = load_prediction_model_auto(continue_from)
+            args = Namespace(**{
+                **DEFAULT_CONFIG, **config, "load_model": None,
+                "pairs": base_model.pairs, "lookback": base_model.lookback,
+                "features": base_model.features, "cma_windows": base_model.cma_windows,
+                "bandpass_windows": base_model.bandpass_windows, "bandpass_order": base_model.bandpass_order,
+                "hidden_size": base_model.hidden_size, "num_layers": base_model.num_layers,
+                "dropout": base_model.dropout_p, "n_attn_heads": base_model.n_attn_heads,
+                "cross_pairs": base_model.cross_pairs,
+            })
+            # Base name "save best model so far" (below) suffixes with ITS
+            # OWN timestamp - see that endpoint - distinct from the
+            # "_continued_<finish-time>" name this run's FINAL result gets
+            # a few lines down, so an early snapshot is never silently
+            # overwritten by (or collides with) the eventual final save.
+            _JOBS[job_id]["model_base_name"] = os.path.splitext(os.path.basename(continue_from))[0]
+            result = continue_training(args, base_model, on_best_checkpoint=_on_best_checkpoint)
+        else:
+            args = Namespace(**{**DEFAULT_CONFIG, **config, "load_model": None})
+            _JOBS[job_id]["model_base_name"] = prediction_model_name(args)
 
-        result = run_pipeline_multi_seed(args)
+            from models.portfolio_lstm import run_pipeline_multi_seed
+
+            result = run_pipeline_multi_seed(args, on_best_checkpoint=_on_best_checkpoint)
         pairs = result.pairs
         result.model.save_model(
             x_mean=result.x_mean, x_std=result.x_std, pairs=result.pairs, lookback=result.lookback,
@@ -497,7 +643,17 @@ def _run_training_job(job_id: str, config: dict) -> None:
             bandpass_windows=args.bandpass_windows, bandpass_order=args.bandpass_order,
         )
 
-        name = prediction_model_name(args)
+        if continue_from:
+            # Deliberately NOT prediction_model_name(args) - in continue
+            # mode `args`'s architecture fields now MATCH the base model
+            # exactly (see above), so that deterministic name would
+            # collide with (and silently overwrite) the base model itself.
+            # A distinct name, suffixed with THIS run's own finish time,
+            # guarantees the base model is never overwritten and every
+            # continued run gets its own separately browsable entry.
+            name = f"{_JOBS[job_id]['model_base_name']}_continued_{datetime.now().strftime('%Y%m%dT%H%M%S')}"
+        else:
+            name = _JOBS[job_id]["model_base_name"]
         if args.save_db:
             result.model.save_to_db(
                 name, x_mean=result.x_mean, x_std=result.x_std, pairs=result.pairs, lookback=result.lookback,
@@ -513,15 +669,19 @@ def _run_training_job(job_id: str, config: dict) -> None:
         # after training, without a separate evaluation round-trip.
         direction_horizon = getattr(args, "direction_horizon", 5) or 5
         target_vol = args.target_vol
+        cost_bps = getattr(args, "cost_bps", DEFAULT_COST_BPS)
         band = result.neutral_band
         portfolio_train = compute_portfolio(
             apply_neutral_band(result.probabilities_train, band), result.next_returns_train, direction_horizon, target_vol,
+            cost_bps=cost_bps,
         )
         portfolio_val = compute_portfolio(
             apply_neutral_band(result.probabilities_val, band), result.next_returns_val, direction_horizon, target_vol,
+            cost_bps=cost_bps,
         )
         portfolio_test = compute_portfolio(
             apply_neutral_band(result.probabilities_test, band), result.next_returns_test, direction_horizon, target_vol,
+            cost_bps=cost_bps,
         )
 
         _JOBS[job_id]["result"] = {
@@ -638,6 +798,52 @@ def stop_training(job_id: str) -> dict:
     return {"job_id": job_id, "status": "stopping"}
 
 
+@app.post("/api/train/{job_id}/save-best")
+def save_best_checkpoint(job_id: str) -> dict:
+    """Build a full snapshot from whichever checkpoint is CURRENTLY best
+    (per models/portfolio_lstm.py's train_prediction_model - each asset's
+    OWN lowest-validation-score epoch, by "checkpoint_metric"), save it to
+    quant.model_registry under a NEW, timestamped name (never overwriting
+    the base model or this run's own eventual final save - see
+    _run_training_job's own naming), and return a global summary (loss,
+    hit rate, and annualized Sharpe on ALL THREE splits) - usable at any
+    point during (or after) a training run, not just once it's finished.
+
+    Works whether the run is a fresh training job or a continue_training
+    one (see /api/train's `continue_from`) - both register the same
+    `on_best_checkpoint` hook. 400s if no epoch has been validated yet, or
+    (a rare edge case - see summarize_checkpoint) if some asset's every
+    score so far has been NaN, so it has no validated checkpoint of its
+    own yet.
+    """
+    job = _JOBS.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Unknown job_id")
+    state = _BEST_CHECKPOINT_STATE.get(job_id)
+    if state is None:
+        raise HTTPException(
+            status_code=400,
+            detail="No validated checkpoint yet - this needs at least one completed validation epoch.",
+        )
+    snapshot = summarize_checkpoint(state["model"], state["data"], state["args"], state["best_state"])
+    if snapshot is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Not every asset has a validated checkpoint yet (e.g. a NaN score so far) - try again shortly.",
+        )
+    snapshot_model, result, summary = snapshot
+    run_args = state["args"]
+    base_name = job.get("model_base_name") or prediction_model_name(run_args)
+    name = f"{base_name}_bestsofar_{datetime.now().strftime('%Y%m%dT%H%M%S')}"
+    snapshot_model.save_to_db(
+        name, x_mean=result.x_mean, x_std=result.x_std, pairs=result.pairs, lookback=result.lookback,
+        features=run_args.features, cma_windows=run_args.cma_windows, description=run_args.model_description,
+        sigma_hat=result.sigma_hat, neutral_band=result.neutral_band, target_vol=run_args.target_vol,
+        bandpass_windows=run_args.bandpass_windows, bandpass_order=run_args.bandpass_order,
+    )
+    return {"model_name": name, "epoch": state["epoch"], "summary": summary}
+
+
 # --------------------------------------------------------------------------
 # POST /api/evaluate
 # --------------------------------------------------------------------------
@@ -665,6 +871,10 @@ class EvaluateRequest(BaseModel):
     # this model as of that historical date instead.
     cutoff_date: str | None = None
     device: str = "auto"  # "auto" (Metal/MPS on Apple Silicon, else CUDA, else CPU), "cpu", "mps", or "cuda" - see get_device
+    # Linear transaction cost (basis points per unit of daily position
+    # change) charged in the reported portfolio PnL/annual Sharpe - see
+    # models/portfolio_pnl.py. Positions themselves are cost-independent.
+    cost_bps: float = DEFAULT_COST_BPS
 
 
 def _predict_latest_probabilities(args: Namespace, model) -> dict[str, float]:
@@ -801,7 +1011,9 @@ def evaluate(req: EvaluateRequest) -> dict:
         target_vol = getattr(result.model, "target_vol", DEFAULT_TARGET_VOL)
         band = result.neutral_band
         banded_probabilities = apply_neutral_band(result.probabilities_train, band)
-        portfolio = compute_portfolio(banded_probabilities, result.next_returns_train, direction_horizon, target_vol)
+        portfolio = compute_portfolio(
+            banded_probabilities, result.next_returns_train, direction_horizon, target_vol, cost_bps=req.cost_bps,
+        )
         latest_probabilities_array = np.array([latest_probabilities[p] for p in pairs], dtype=np.float32)
         today = latest_position(
             banded_probabilities, result.next_returns_train, latest_probabilities_array, direction_horizon, target_vol,

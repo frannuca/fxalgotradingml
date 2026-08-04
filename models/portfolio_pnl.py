@@ -13,14 +13,28 @@ complementary training objective.
 
 Strategy
 --------
-Each day t, the model reports a raw probability p_i(t) that pair i's
-`direction_horizon`-day-forward move is positive (see PredictionResult's
-`probabilities_*`, which are RAW/unsnapped - the neutral band never applies
-here, this strategy always has a view). That's converted to a signal in
-[-1, 1] via `(p - 0.5) * 2`, multiplied by a risk-parity weight (equal risk
-contribution, computed from a rolling covariance of realized returns), then
-the whole book is scaled so its OWN volatility hits a configured annualized
-`target_vol`.
+Each day t, the model reports a probability p_i(t) that pair i's
+`direction_horizon`-day-forward move is positive. PredictionResult's
+`probabilities_*` are stored RAW (unsnapped), and every caller of
+compute_portfolio (api/server.py's training/evaluation payloads,
+models/portfolio_lstm.py's summarize_checkpoint) applies the model's own
+persisted neutral band FIRST (portfolio_lstm.apply_neutral_band) - an
+in-band day arrives here as exactly p = 0.5, i.e. signal 0, a FLAT
+position for that pair: abstention means not trading, the same convention
+every reported Sharpe therefore shares. The probability is converted to a
+signal in [-1, 1] via `(p - 0.5) * 2`, multiplied by a risk-parity weight
+(equal risk contribution, computed from a rolling covariance of realized
+returns), then the whole book is scaled so its OWN volatility hits a
+configured annualized `target_vol`.
+
+Transaction costs
+-----------------
+`cost_bps` (basis points of traded notional, per unit of daily position
+CHANGE - see compute_portfolio) charges each day
+`cost_bps * 1e-4 * |position_t - position_{t-1}|` per asset, deducted from
+that asset's own daily PnL - so every reported PnL/Sharpe here is NET of
+linear costs, and high-turnover behavior is penalized exactly where it
+hurts. The first sized day pays for establishing the book from flat.
 
 Trade frequency vs. forecast horizon
 -------------------------------------
@@ -54,6 +68,7 @@ import pandas as pd
 from scipy.optimize import minimize
 
 DEFAULT_TARGET_VOL = 0.10  # 10% annualized
+DEFAULT_COST_BPS = 1.0  # linear transaction cost, basis points per unit of daily position change (~FX majors spread)
 DEFAULT_COV_WINDOW = 60  # trailing days for rolling_covariance_matrices/precompute_risk_parity
 TRADING_DAYS_PER_YEAR = 252
 _COV_EPS = 1e-10  # diagonal regularization - avoids a singular covariance on short/degenerate windows
@@ -171,21 +186,29 @@ def compute_portfolio(
     direction_horizon: int,
     target_vol: float = DEFAULT_TARGET_VOL,
     cov_window: int = DEFAULT_COV_WINDOW,
+    cost_bps: float = DEFAULT_COST_BPS,
 ) -> dict:
     """Drive the whole strategy over a (T, n) probabilities/next_returns
     pair (one split - train, val, or test; see PredictionResult).
+    `probabilities` are expected ALREADY neutral-banded by the caller (see
+    this module's docstring) - an abstention arrives as exactly 0.5 and
+    trades flat.
 
     Returns a dict of (T, n) arrays `positions_modulated`/`positions_baseline`
     (NaN on days without enough history to size a position - the first
     `cov_window`+`direction_horizon`-ish days), (T, n) arrays
     `pnl_per_asset_modulated`/`pnl_per_asset_baseline` (each asset's OWN
-    `position_i * next_return_i` - these sum across assets, per day, to
-    `pnl_modulated`/`pnl_baseline` below) and their cumulative
-    (`cumulative_pnl_per_asset_modulated`/`_baseline`), and (T,) arrays
-    `pnl_modulated`/`pnl_baseline`/`cumulative_pnl_modulated`/
-    `cumulative_pnl_baseline` (the WHOLE BOOK, summed across assets). All
-    0 (not NaN) on days without enough history to size a position, so
-    every cumsum is always defined.
+    `position_i * next_return_i` MINUS its own transaction cost
+    `cost_bps * 1e-4 * |position_i_t - position_i_{t-1}|` - these sum
+    across assets, per day, to `pnl_modulated`/`pnl_baseline` below) and
+    their cumulative (`cumulative_pnl_per_asset_modulated`/`_baseline`),
+    (T,) arrays `pnl_modulated`/`pnl_baseline`/`cumulative_pnl_modulated`/
+    `cumulative_pnl_baseline` (the WHOLE BOOK, summed across assets, net
+    of costs), and (T,) diagnostic arrays `turnover_modulated`/
+    `turnover_baseline` (sum of |daily position change| across assets).
+    All 0 (not NaN) on days without enough history to size a position, so
+    every cumsum is always defined. `cost_bps=0` recovers the frictionless
+    book.
     """
     t, n = probabilities.shape
     target_vol_daily = target_vol / np.sqrt(TRADING_DAYS_PER_YEAR)
@@ -210,16 +233,25 @@ def compute_portfolio(
         if not np.isnan(smoothed_modulated[i]).any():
             positions_modulated[i] = _scale_to_target_vol(smoothed_modulated[i], cov[i], target_vol_daily)
 
-    def _pnl_per_asset(positions: np.ndarray) -> np.ndarray:
+    def _pnl_per_asset(positions: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         # A day with NO valid position (any asset NaN, e.g. still in the
         # warm-up window) contributes exactly 0 to EVERY asset that day -
         # not just the ones that happen to be NaN - so a given asset's own
         # cumulative pnl never silently skips a day the whole book sat out.
+        # Those days are treated as FLAT (position 0) for turnover too, so
+        # the first sized day pays the cost of establishing the book from
+        # flat, and a mid-series unsized day pays to flatten/re-establish -
+        # consistent with contributing zero pnl while unsized.
         valid = ~np.isnan(positions).any(axis=1, keepdims=True)
-        return np.where(valid, np.nan_to_num(positions) * next_returns, 0.0)
+        pos_filled = np.where(valid, np.nan_to_num(positions), 0.0)
+        gross = pos_filled * next_returns
+        # |position change| per asset per day, day 0 measured from flat.
+        deltas = np.abs(np.diff(pos_filled, axis=0, prepend=np.zeros((1, pos_filled.shape[1]))))
+        costs = cost_bps * 1e-4 * deltas
+        return gross - costs, deltas.sum(axis=1)
 
-    pnl_per_asset_modulated = _pnl_per_asset(positions_modulated)
-    pnl_per_asset_baseline = _pnl_per_asset(positions_baseline)
+    pnl_per_asset_modulated, turnover_modulated = _pnl_per_asset(positions_modulated)
+    pnl_per_asset_baseline, turnover_baseline = _pnl_per_asset(positions_baseline)
     pnl_modulated = pnl_per_asset_modulated.sum(axis=1)
     pnl_baseline = pnl_per_asset_baseline.sum(axis=1)
 
@@ -234,6 +266,8 @@ def compute_portfolio(
         "pnl_baseline": pnl_baseline,
         "cumulative_pnl_modulated": np.cumsum(pnl_modulated),
         "cumulative_pnl_baseline": np.cumsum(pnl_baseline),
+        "turnover_modulated": turnover_modulated,
+        "turnover_baseline": turnover_baseline,
     }
 
 
@@ -281,6 +315,9 @@ def latest_position(
     target_vol: float = DEFAULT_TARGET_VOL,
     cov_window: int = DEFAULT_COV_WINDOW,
 ) -> dict:
+    # (cost_bps deliberately not a parameter here: costs affect reported
+    # PnL, never the position itself - compute_portfolio's positions are
+    # cost-independent, and only positions are returned from this.)
     """The position to book for TODAY - the not-yet-realized day
     `latest_probabilities` (shape (n,), today's probability per pair, e.g.
     from api/server.py's _predict_latest_probabilities) forecasts.

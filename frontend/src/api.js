@@ -51,6 +51,10 @@ export function stopTraining(jobId) {
   return request(`/api/train/${jobId}/stop`, { method: "POST" });
 }
 
+export function saveBestCheckpoint(jobId) {
+  return request(`/api/train/${jobId}/save-best`, { method: "POST" });
+}
+
 export function evaluate(config) {
   return request("/api/evaluate", {
     method: "POST",

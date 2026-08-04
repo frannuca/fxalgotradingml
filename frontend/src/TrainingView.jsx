@@ -1,13 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { getPairs, startTraining, getTrainingStatus, stopTraining } from "./api";
-import HitRateChart from "./charts/HitRateChart";
-import ColoredReturnChart from "./charts/ColoredReturnChart";
-import ProbabilityChart from "./charts/ProbabilityChart";
-import ReturnDistributionChart from "./charts/ReturnDistributionChart";
-import ConfusionMatrixTable from "./ConfusionMatrixTable";
-import AnnualSharpeTable from "./AnnualSharpeTable";
-import { SPLIT_LABEL } from "./theme";
-import { confusionMatrixForSplit, hitAbstainedSeries, hitRateForSplit } from "./metrics";
+import TrainingProgressPanel from "./TrainingProgressPanel";
+import TrainingResultPanel from "./TrainingResultPanel";
+import { confusionMatrixForSplit, hitRateForSplit } from "./metrics";
 
 // Every feature build_feature_dataframe knows how to produce (see
 // models/portfolio_lstm.py's FEATURE_CATALOG) - "cma" is special, it
@@ -26,6 +21,16 @@ const DEVICE_OPTIONS = [
   ["auto", "Auto (Metal/MPS if available, else CUDA, else CPU)"],
   ["cpu", "CPU"],
   ["mps", "MPS (Apple Silicon)"],
+];
+
+// Which per-epoch VALIDATION metric selects each asset's own restored
+// checkpoint (see models/portfolio_lstm.py's train_prediction_model
+// docstring on checkpoint_metric) - independent of "Sharpe weight", which
+// controls what TRAINS the weights, not which epoch's weights get kept.
+const CHECKPOINT_METRIC_OPTIONS = [
+  ["val_loss", "Validation loss (default)"],
+  ["hit_rate", "Validation hit rate"],
+  ["sharpe", "Validation Sharpe"],
 ];
 
 const DEFAULT_FORM = {
@@ -62,12 +67,20 @@ const DEFAULT_FORM = {
   bce_weight: "1.0", // free text: a single number, or comma-separated to SWEEP (see parseBceWeight)
   // Optional COMPLEMENTARY training objective - 0 (default) disables it,
   // training is then unchanged (own optimizer/loss per asset only). > 0
-  // adds a joint portfolio-Sharpe phase: risk-parity weight x this
-  // model's own probability signal, scaled to target_vol below,
-  // maximizing an averaged rolling Sharpe over sharpe_window days - see
-  // models/portfolio_lstm.py's train_prediction_model docstring.
+  // adds a joint portfolio-Sharpe term to the SAME combined training
+  // loss: risk-parity weight x this model's own probability signal,
+  // scaled to target_vol below, maximizing an averaged Sharpe over
+  // NON-OVERLAPPING sharpe_window-day chunks (walking backward from the
+  // last day) - see models/portfolio_lstm.py's
+  // _non_overlapping_sharpe_torch/train_prediction_model docstrings.
   sharpe_weight: 0,
   sharpe_window: 20,
+  // Which per-epoch VALIDATION metric selects each asset's own restored
+  // checkpoint - independent of sharpe_weight above (see
+  // models/portfolio_lstm.py's train_prediction_model docstring on
+  // checkpoint_metric). "val_loss" (default): unchanged original
+  // behavior. "hit_rate"/"sharpe": select on that instead.
+  checkpoint_metric: "val_loss",
   neutral_band: 0.05,
   // Annualized volatility the Evaluation view's portfolio PnL calculator
   // scales this model's positions to (see models/portfolio_pnl.py) -
@@ -97,6 +110,30 @@ function parseBceWeight(text) {
   return values.length === 1 ? values[0] : values;
 }
 
+// Inverse of submit()/downloadConfig()'s own transform - turns a raw
+// models/portfolio_lstm.py DEFAULT_CONFIG-shaped JSON (see main.py's own
+// docstring/configs/*.json, and this file's own "Save config" button)
+// back into this form's UI shape. Merged onto DEFAULT_FORM rather than
+// replacing it outright, matching main.py's own "any key left out falls
+// back to the default" behavior for a config that only sets SOME keys.
+function parseConfigToForm(raw) {
+  return {
+    ...DEFAULT_FORM,
+    ...raw,
+    pairs: raw.pairs || [],
+    cross_pairs: raw.cross_pairs || {},
+    features: raw.features || DEFAULT_FORM.features,
+    cutoff_date: raw.cutoff_date || "",
+    bce_weight: raw.bce_weight == null
+      ? DEFAULT_FORM.bce_weight
+      : Array.isArray(raw.bce_weight)
+        ? raw.bce_weight.join(", ")
+        : String(raw.bce_weight),
+    cma_windows: (raw.cma_windows || []).map(([short, long]) => ({ short, long })),
+    bandpass_windows: (raw.bandpass_windows || []).map(([short, long]) => ({ short, long })),
+  };
+}
+
 export default function TrainingView() {
   const [availablePairs, setAvailablePairs] = useState([]);
   const [form, setForm] = useState(DEFAULT_FORM);
@@ -118,6 +155,7 @@ export default function TrainingView() {
   const [error, setError] = useState(null);
   const pollRef = useRef(null);
   const logBoxRef = useRef(null);
+  const loadConfigInputRef = useRef(null);
 
   useEffect(() => {
     if (logBoxRef.current) {
@@ -213,6 +251,61 @@ export default function TrainingView() {
     });
   }
 
+  // Same transform submit() sends to POST /api/train, reused by
+  // downloadConfig() below - this IS the shape models/portfolio_lstm.py's
+  // DEFAULT_CONFIG expects (see main.py's own docstring/configs/*.json),
+  // so a saved file is directly usable as `python main.py path/to/this.json`
+  // as well as re-importable back into this form (see parseConfigToForm,
+  // its own inverse, used by handleLoadConfig below).
+  function buildConfig() {
+    return {
+      ...form,
+      cutoff_date: form.cutoff_date || null,
+      bce_weight: parseBceWeight(form.bce_weight),
+      cma_windows: form.cma_windows.map((w) => [w.short, w.long]),
+      bandpass_windows: form.bandpass_windows.map((w) => [w.short, w.long]),
+    };
+  }
+
+  function downloadConfig() {
+    if (form.pairs.length < 1) {
+      setError("Select at least one FX pair.");
+      return;
+    }
+    const blob = new Blob([JSON.stringify(buildConfig(), null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    a.href = url;
+    a.download = `training_config_${form.pairs.join("-")}_${stamp}.json`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }
+
+  function handleLoadConfig(e) {
+    const file = e.target.files[0];
+    e.target.value = ""; // reset so re-selecting the SAME file still fires onChange next time
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const raw = JSON.parse(reader.result);
+        setForm(parseConfigToForm(raw));
+        setError(null);
+        setResult(null);
+        setProgress(null);
+        setLogs([]);
+        setInterim(null);
+      } catch (err) {
+        setError(`Could not load config file: ${err.message}`);
+      }
+    };
+    reader.onerror = () => setError("Could not read the selected file.");
+    reader.readAsText(file);
+  }
+
   async function submit(e) {
     e.preventDefault();
     setError(null);
@@ -225,13 +318,7 @@ export default function TrainingView() {
       return;
     }
     try {
-      const { job_id } = await startTraining({
-        ...form,
-        cutoff_date: form.cutoff_date || null,
-        bce_weight: parseBceWeight(form.bce_weight),
-        cma_windows: form.cma_windows.map((w) => [w.short, w.long]),
-        bandpass_windows: form.bandpass_windows.map((w) => [w.short, w.long]),
-      });
+      const { job_id } = await startTraining(buildConfig());
       setJobId(job_id);
       setStatus("pending");
       pollRef.current = setInterval(async () => {
@@ -488,6 +575,14 @@ export default function TrainingView() {
             <NumField label="Target vol (annualized, for portfolio PnL)" name="target_vol" step="0.01" value={form.target_vol} onChange={updateField} />
             <NumField label="Sharpe weight (0 = disabled)" name="sharpe_weight" step="0.1" value={form.sharpe_weight} onChange={updateField} />
             <NumField label="Sharpe window (days)" name="sharpe_window" value={form.sharpe_window} onChange={updateField} />
+            <div className="field">
+              <label>Checkpoint selection metric</label>
+              <select value={form.checkpoint_metric} onChange={(e) => updateField("checkpoint_metric", e.target.value)}>
+                {CHECKPOINT_METRIC_OPTIONS.map(([key, label]) => (
+                  <option key={key} value={key}>{label}</option>
+                ))}
+              </select>
+            </div>
           </div>
           <p className="status-line" style={{ marginTop: 4 }}>
             Every asset's LSTM trains FULLY INDEPENDENTLY: its own optimizer, its own loss - never averaged or
@@ -500,14 +595,28 @@ export default function TrainingView() {
             best validation epoch independently, too - one asset's convergence never drags another's along.
           </p>
           <p className="status-line" style={{ marginTop: 4 }}>
-            "Sharpe weight" 0 keeps the above unchanged. {'>'} 0 adds a SECOND, complementary training phase: the
-            model's own probability signal × a precomputed (data-only, never optimized) risk-parity weight, scaled
-            to "Target vol", drives an averaged rolling Sharpe (over "Sharpe window" days) that gets maximized -
-            the same strategy the Evaluation page's portfolio PnL calculator reports. Unlike everything else here,
-            this phase is NOT per-asset independent: the vol-scaling denominator mixes every asset's current
-            signal, so one asset's training genuinely depends on what the others are currently predicting. Keep
-            this modest relative to "BCE direction weight" - directly maximizing Sharpe on noisy daily returns can
-            drift toward low-variance, low-conviction bets rather than genuine predictive signal.
+            "Sharpe weight" 0 keeps the above unchanged. {'>'} 0 adds a Sharpe term to the SAME combined loss every
+            epoch (one shared backward pass together with NLL+BCE, not a separate step - this avoids the two
+            gradients ever partially undoing each other, which a naive two-step version would risk): the model's
+            own probability signal × a precomputed (data-only, never optimized) risk-parity weight, scaled to
+            "Target vol", drives an averaged Sharpe - computed over NON-OVERLAPPING "Sharpe window"-day chunks,
+            walking backward from the most recent day, never a smoothed/overlapping rolling statistic - that gets
+            maximized, the same strategy the Evaluation page's portfolio PnL calculator reports. Unlike everything else here, this
+            term is NOT per-asset independent: the vol-scaling denominator mixes every asset's current signal, so
+            one asset's training genuinely depends on what the others are currently predicting. Keep this modest
+            relative to "BCE direction weight" - directly maximizing Sharpe on noisy daily returns can drift toward
+            low-variance, low-conviction bets rather than genuine predictive signal.
+          </p>
+          <p className="status-line" style={{ marginTop: 4 }}>
+            "Checkpoint selection metric" controls which epoch's weights each asset keeps at the end - independent
+            of "Sharpe weight" above, which controls what TRAINS the weights, not which epoch's checkpoint gets
+            restored. "Validation loss" (default) selects the epoch with the lowest own NLL+BCE validation loss
+            (minus the Sharpe term if "Sharpe weight" {'>'} 0). "Hit rate" instead keeps whichever epoch had the best
+            validation directional hit rate - a coarser, saturating metric (once every sample's sign is already
+            correct it can't improve further, so this tends to lock onto an early epoch and ignore later loss
+            improvements) offered as an explicit choice, not a recommendation. "Sharpe" keeps whichever epoch had
+            the best validation portfolio Sharpe - works even with "Sharpe weight" left at 0 (training stays pure
+            NLL+BCE; only which checkpoint gets kept changes).
           </p>
           <p className="status-line" style={{ marginTop: 4 }}>
             Enter several comma-separated values to SWEEP the BCE weight alongside the seeds below: every value is
@@ -571,6 +680,19 @@ export default function TrainingView() {
           <button className="primary" type="submit" disabled={isBusy}>
             {isBusy ? "Training…" : "Start training"}
           </button>
+          <button type="button" className="secondary" onClick={downloadConfig} disabled={isBusy}>
+            Save config
+          </button>
+          <button type="button" className="secondary" onClick={() => loadConfigInputRef.current.click()} disabled={isBusy}>
+            Load config
+          </button>
+          <input
+            type="file"
+            accept=".json,application/json"
+            ref={loadConfigInputRef}
+            onChange={handleLoadConfig}
+            style={{ display: "none" }}
+          />
           {isBusy && (
             <button type="button" className="secondary" onClick={stop}>
               Stop training
@@ -578,6 +700,13 @@ export default function TrainingView() {
           )}
           {status && <span className="status-line">Status: {status}</span>}
         </div>
+        <p className="status-line" style={{ marginTop: 4 }}>
+          "Save config" downloads the CURRENT form as a JSON file matching this project's config format (see
+          main.py's own docstring/configs/*.json) - directly runnable as <code>python main.py path/to/file.json</code>,
+          with no training run required first. "Load config" reads one back in (any key it leaves out keeps this
+          form's current value) - use it to replay a saved run's exact settings, or hand-edit a file and load it
+          back rather than clicking through every field.
+        </p>
       </form>
 
       {status === "stopped" && (
@@ -585,145 +714,18 @@ export default function TrainingView() {
       )}
 
       {progress && (status === "running" || status === "pending" || status === "done" || status === "stopped") && (
-        <div className="panel">
-          <h3 style={{ marginBottom: 6 }}>
-            Progress{progress.n_seeds > 1 ? ` — restart ${progress.seed_index}/${progress.n_seeds}` : ""}
-            {progress.n_lambdas > 1 ? ` — bce_weight ${progress.lambda_index}/${progress.n_lambdas}` : ""}
-            {" "}— epoch {progress.epoch}/{progress.total_epochs}
-          </h3>
-          <div className="progress-track">
-            <div className="progress-fill" style={{ width: `${progress.percent}%` }} />
-          </div>
-          <div className="progress-percent">{progress.percent.toFixed(1)}%</div>
-
-          {interim && (
-            <table className="weights-table" style={{ marginTop: 12 }}>
-              <thead>
-                <tr><th></th><th>Train</th>{interim.val_loss != null && <th>Validation</th>}</tr>
-              </thead>
-              <tbody>
-                <tr><td>Loss (NLL + BCE)</td><td>{interim.train_loss.toFixed(4)}</td>{interim.val_loss != null && <td>{interim.val_loss.toFixed(4)}</td>}</tr>
-                <tr><td>Decision-day hit rate</td><td>{(interim.train_hit_rate * 100).toFixed(1)}%</td>{interim.val_hit_rate != null && <td>{(interim.val_hit_rate * 100).toFixed(1)}%</td>}</tr>
-              </tbody>
-            </table>
-          )}
-
-          <h3 style={{ marginTop: 16, marginBottom: 6 }}>Training log</h3>
-          <div className="log-window" ref={logBoxRef}>
-            {logs.length === 0 ? (
-              <div className="log-line log-line-muted">Waiting for the first log line…</div>
-            ) : (
-              logs.map((line, i) => (
-                <div key={i} className="log-line">{line}</div>
-              ))
-            )}
-          </div>
-        </div>
+        <TrainingProgressPanel progress={progress} interim={interim} logs={logs} logBoxRef={logBoxRef} jobId={jobId} />
       )}
 
       {error && <p className="status-line error">{error}</p>}
 
-      {result && (
-        <>
-          <div className="result-box">
-            <strong>Training complete.</strong>
-            <table>
-              <tbody>
-                <tr><td>Model saved as</td><td><code>{result.model_name}</code></td></tr>
-              </tbody>
-            </table>
-          </div>
-
-          <div className="panel">
-            <h2 style={{ marginTop: 0 }}>Neutral band</h2>
-            <div className="form-grid">
-              <div className="field">
-                <label>Abstention half-width around p=0.5</label>
-                <input
-                  type="number"
-                  step="0.01"
-                  min="0"
-                  max="0.5"
-                  value={displayBand}
-                  onChange={(e) => setDisplayBand(Number(e.target.value))}
-                />
-              </div>
-            </div>
-            <p className="status-line" style={{ marginTop: 4 }}>
-              Pure postprocessing - never part of training (see the model's own docs). Everything below is
-              recomputed live from this model's raw predicted probabilities as you change it, with no retraining and
-              no new request. Trained with {result.neutral_band.toFixed(2)}.
-            </p>
-          </div>
-
-          <h2>Hit rate</h2>
-          <div className="chart-grid">
-            <HitRateChart pairs={result.pairs} hitRate={hitRate} />
-          </div>
-
-          <h2>Confusion matrix</h2>
-          <ConfusionMatrixTable pairs={result.pairs} confusionMatrix={confusionMatrix} />
-
-          <h2>Portfolio Sharpe by year (risk parity, probability-modulated)</h2>
-          {["train", "val", "test"].map((split) => (
-            <div key={split}>
-              <h3>{SPLIT_LABEL[split]}</h3>
-              <AnnualSharpeTable annualSharpe={result.annual_sharpe[split]} />
-            </div>
-          ))}
-
-          <h2>Cumulative returns (colored by prediction hit/miss)</h2>
-          {["train", "val", "test"].map((split) => (
-            <div key={split}>
-              <h3>{SPLIT_LABEL[split]}</h3>
-              <div className="chart-grid">
-                {result.pairs.map((pair) => {
-                  const { probability, label } = result.probabilities[split][pair];
-                  const { hit, abstained } = hitAbstainedSeries(probability, label, displayBand);
-                  return (
-                    <ColoredReturnChart
-                      key={pair}
-                      title={pair}
-                      dates={result.cumulative_returns[split].dates}
-                      series={{ cumulative: result.cumulative_returns[split][pair].cumulative, hit, abstained }}
-                    />
-                  );
-                })}
-              </div>
-            </div>
-          ))}
-
-          <h2>Predicted probability</h2>
-          {["train", "val", "test"].map((split) => (
-            <div key={split}>
-              <h3>{SPLIT_LABEL[split]}</h3>
-              <div className="chart-grid">
-                {result.pairs.map((pair) => (
-                  <ProbabilityChart
-                    key={pair}
-                    title={pair}
-                    dates={result.probabilities[split].dates}
-                    series={result.probabilities[split][pair]}
-                    band={displayBand}
-                  />
-                ))}
-              </div>
-            </div>
-          ))}
-
-          <h2>Forecasted vs actual return distribution</h2>
-          {["train", "val", "test"].map((split) => (
-            <div key={split}>
-              <h3>{SPLIT_LABEL[split]}</h3>
-              <div className="chart-grid">
-                {result.pairs.map((pair) => (
-                  <ReturnDistributionChart key={pair} title={pair} series={result.distribution[split][pair]} />
-                ))}
-              </div>
-            </div>
-          ))}
-        </>
-      )}
+      <TrainingResultPanel
+        result={result}
+        hitRate={hitRate}
+        confusionMatrix={confusionMatrix}
+        displayBand={displayBand}
+        setDisplayBand={setDisplayBand}
+      />
     </div>
   );
 }

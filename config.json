@@ -17,6 +17,7 @@
     "weight_decay": 0.0001,
     "bce_weight": 1.0,
     "neutral_band": 0.05,
+    "cost_bps": 1.0,
 
     "n_seeds": 5,
 
