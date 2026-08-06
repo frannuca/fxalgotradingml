@@ -15,17 +15,44 @@ Strategy
 --------
 Each day t, the model reports a probability p_i(t) that pair i's
 `direction_horizon`-day-forward move is positive. PredictionResult's
-`probabilities_*` are stored RAW (unsnapped), and every caller of
-compute_portfolio (api/server.py's training/evaluation payloads,
-models/portfolio_lstm.py's summarize_checkpoint) applies the model's own
-persisted neutral band FIRST (portfolio_lstm.apply_neutral_band) - an
-in-band day arrives here as exactly p = 0.5, i.e. signal 0, a FLAT
-position for that pair: abstention means not trading, the same convention
-every reported Sharpe therefore shares. The probability is converted to a
-signal in [-1, 1] via `(p - 0.5) * 2`, multiplied by a risk-parity weight
-(equal risk contribution, computed from a rolling covariance of realized
-returns), then the whole book is scaled so its OWN volatility hits a
-configured annualized `target_vol`.
+`probabilities_*` are stored RAW (unsnapped) - `probabilities` here is
+expected RAW too (a caller MAY still pre-apply portfolio_lstm.apply_neutral_band
+for its own reasons, e.g. before also using the result for hit rate, but
+compute_portfolio no longer needs that: it detects an abstained day itself
+from `neutral_band`, below). Outside the band, the probability is
+converted to a signal via a per-asset LINEAR map into
+`(signal_min_i, signal_max_i)` - `signal_min_i + (signal_max_i -
+signal_min_i) * p` - multiplied by a risk-parity weight (equal risk
+contribution, computed from a rolling covariance of realized returns).
+`signal_min`/`signal_max` default to (-1, 1) per asset - the fixed
+symmetric `(p - 0.5) * 2` map this module used before per-asset bounds
+existed - see models/portfolio_lstm.py's resolve_signal_bounds, the
+per-asset resolver every caller here uses, and PredictionModel's own
+persisted `signal_range`.
+
+Inside the band (`|p - 0.5| < neutral_band`, matching
+portfolio_lstm.apply_neutral_band's own threshold exactly) the model is
+treated as having NO view for that pair that day - rather than sizing a
+directional bet from a near-coin-flip probability (or, in an earlier
+version of this module, going FLAT), that day's signal is forced to
+exactly 1.0 BEFORE smoothing, i.e. that day's RAW contribution to the
+book is the UNMODULATED risk-parity weight for that pair, regardless of
+`signal_min`/`signal_max`: abstention means "no opinion, hold the
+diversified book", not "no position" and not "whatever the configured
+range's midpoint happens to be". `neutral_band=0.0` (default) disables
+this entirely, matching every day's raw probability straight through the
+signal map. Note this raw value still goes through the SAME trailing
+`direction_horizon`-day smoothing every day's signal does (see "Trade
+frequency vs. forecast horizon" below) before being scaled to
+`target_vol` - so the FINAL position on an abstained day only exactly
+equals `positions_baseline` when every day in its trailing window is
+ALSO abstained (e.g. a band wide enough to cover the whole series); a
+single abstained day inside an otherwise-directional window still blends
+with its neighbors, same as any other day's signal would.
+
+The whole book (baseline and, on non-abstained days, modulated alike) is
+then scaled so its OWN volatility hits a configured annualized
+`target_vol`.
 
 Transaction costs
 -----------------
@@ -187,12 +214,48 @@ def compute_portfolio(
     target_vol: float = DEFAULT_TARGET_VOL,
     cov_window: int = DEFAULT_COV_WINDOW,
     cost_bps: float = DEFAULT_COST_BPS,
+    signal_min: np.ndarray | float = -1.0,
+    signal_max: np.ndarray | float = 1.0,
+    neutral_band: float = 0.0,
+    attenuation: np.ndarray | None = None,
 ) -> dict:
     """Drive the whole strategy over a (T, n) probabilities/next_returns
     pair (one split - train, val, or test; see PredictionResult).
-    `probabilities` are expected ALREADY neutral-banded by the caller (see
-    this module's docstring) - an abstention arrives as exactly 0.5 and
-    trades flat.
+    `probabilities` are expected RAW (a caller MAY still pre-apply
+    portfolio_lstm.apply_neutral_band for its own reasons - see this
+    module's own docstring - but doesn't need to for THIS function's sake).
+
+    `attenuation` (optional, (T, n) - see models/risk_engine.py's
+    evaluate_risk_engine, which builds exactly this shape) is a per-asset,
+    per-day multiplier applied to `positions_modulated` AFTER target-vol
+    scaling - deliberately AFTER, never before: `_scale_to_target_vol`
+    renormalizes the whole book to a FIXED annualized vol every day, so
+    attenuating the PRE-scaling weight would just get renormalized right
+    back to the same target and have ZERO net effect (see
+    models/risk_engine.py's own module docstring for the full reasoning).
+    None (default) skips this entirely - `positions_modulated` and
+    everything derived from it are unchanged from this function's original
+    behavior, and none of the `*_risk_attenuated` keys below are present
+    in the returned dict at all (not even as NaN-filled arrays) - so a
+    caller for a model with no risk engine attached sees the EXACT same
+    dict shape as before this parameter existed.
+
+    `signal_min`/`signal_max` (each a scalar, applied to every asset, or a
+    (n,) per-asset array - see models/portfolio_lstm.py's
+    resolve_signal_bounds, which every caller in this codebase uses to
+    build them from a model's persisted `signal_range`) are the per-asset
+    bounds the probability is linearly mapped into (see this module's own
+    docstring) - default (-1, 1) recovers the original fixed
+    `(p - 0.5) * 2` map exactly.
+
+    `neutral_band` (see portfolio_lstm.apply_neutral_band - SAME threshold,
+    `|p - 0.5| < neutral_band`) marks a day as abstained - its RAW signal
+    (before this function's own trailing-average smoothing - see this
+    module's own docstring) is forced to exactly 1.0, i.e. that day
+    contributes the unmodulated risk-parity weight, rather than going
+    through the signal_min/signal_max map. 0.0 (default) disables this -
+    every day uses its raw probability, unchanged from this function's
+    original behavior.
 
     Returns a dict of (T, n) arrays `positions_modulated`/`positions_baseline`
     (NaN on days without enough history to size a position - the first
@@ -212,6 +275,13 @@ def compute_portfolio(
     """
     t, n = probabilities.shape
     target_vol_daily = target_vol / np.sqrt(TRADING_DAYS_PER_YEAR)
+    signal_min_arr = np.broadcast_to(np.asarray(signal_min, dtype=np.float64), (n,))
+    signal_max_arr = np.broadcast_to(np.asarray(signal_max, dtype=np.float64), (n,))
+    # See this function's own docstring: an abstained day rides the
+    # unmodulated risk-parity weight (signal 1.0) instead of the
+    # signal_min/signal_max map - `<= 0` disables abstention entirely,
+    # matching apply_neutral_band's own convention.
+    in_band = np.abs(probabilities - 0.5) < neutral_band if neutral_band > 0 else np.zeros_like(probabilities, dtype=bool)
 
     rp_weights, cov = precompute_risk_parity(next_returns, cov_window)
 
@@ -219,7 +289,9 @@ def compute_portfolio(
     for i in range(t):
         if np.isnan(cov[i]).any():
             continue
-        signal = (probabilities[i] - 0.5) * 2.0
+        signal = np.where(
+            in_band[i], 1.0, signal_min_arr + (signal_max_arr - signal_min_arr) * probabilities[i],
+        )
         raw_modulated[i] = rp_weights[i] * signal
 
     smoothed_modulated = _trailing_moving_average(raw_modulated, direction_horizon)
@@ -255,7 +327,7 @@ def compute_portfolio(
     pnl_modulated = pnl_per_asset_modulated.sum(axis=1)
     pnl_baseline = pnl_per_asset_baseline.sum(axis=1)
 
-    return {
+    out = {
         "positions_modulated": positions_modulated,
         "positions_baseline": positions_baseline,
         "pnl_per_asset_modulated": pnl_per_asset_modulated,
@@ -269,17 +341,36 @@ def compute_portfolio(
         "turnover_modulated": turnover_modulated,
         "turnover_baseline": turnover_baseline,
     }
+    if attenuation is not None:
+        # NaN stays NaN (NaN * anything = NaN) on days positions_modulated
+        # itself was already NaN (not enough warm-up history) - exactly the
+        # same "no valid position yet" convention _pnl_per_asset already
+        # treats as flat/zero-contributing.
+        positions_risk_attenuated = positions_modulated * attenuation
+        pnl_per_asset_risk_attenuated, turnover_risk_attenuated = _pnl_per_asset(positions_risk_attenuated)
+        pnl_risk_attenuated = pnl_per_asset_risk_attenuated.sum(axis=1)
+        out["positions_risk_attenuated"] = positions_risk_attenuated
+        out["pnl_per_asset_risk_attenuated"] = pnl_per_asset_risk_attenuated
+        out["cumulative_pnl_per_asset_risk_attenuated"] = np.cumsum(pnl_per_asset_risk_attenuated, axis=0)
+        out["pnl_risk_attenuated"] = pnl_risk_attenuated
+        out["cumulative_pnl_risk_attenuated"] = np.cumsum(pnl_risk_attenuated)
+        out["turnover_risk_attenuated"] = turnover_risk_attenuated
+    return out
 
 
-def annual_sharpe_table(dates, pnl_modulated: np.ndarray, pnl_baseline: np.ndarray) -> dict:
+def annual_sharpe_table(
+    dates, pnl_modulated: np.ndarray, pnl_baseline: np.ndarray, pnl_risk_attenuated: np.ndarray | None = None,
+) -> dict:
     """Group daily whole-book PnL (see compute_portfolio's `pnl_modulated`/
-    `pnl_baseline`) by CALENDAR YEAR and report each year's own annualized
-    Sharpe ratio (`mean(daily_pnl) / std(daily_pnl) * sqrt(252)`) for both
-    the probability-modulated book and the unmodulated risk-parity
-    baseline, alongside the year's day count and cumulative return - a
-    reviewer's first question about any backtest is usually "is this
-    driven by one lucky year", which a single all-period Sharpe number
-    can't answer.
+    `pnl_baseline`/`pnl_risk_attenuated`) by CALENDAR YEAR and report each
+    year's own annualized Sharpe ratio (`mean(daily_pnl) / std(daily_pnl) *
+    sqrt(252)`) for the probability-modulated book, the unmodulated
+    risk-parity baseline, and (if `pnl_risk_attenuated` is given - only
+    when a RiskEngine is attached, see models/risk_engine.py) the
+    risk-attenuated book too, alongside the year's day count and
+    cumulative return - a reviewer's first question about any backtest is
+    usually "is this driven by one lucky year", which a single all-period
+    Sharpe number can't answer.
 
     A year with fewer than 2 days (e.g. the partial first/last calendar
     year of a split) reports `None` for its Sharpe (std of 0-1 points is
@@ -297,13 +388,18 @@ def annual_sharpe_table(dates, pnl_modulated: np.ndarray, pnl_baseline: np.ndarr
                 return None
             return float(pnl.mean() / pnl.std() * np.sqrt(TRADING_DAYS_PER_YEAR))
 
-        table[str(year)] = {
+        row = {
             "n_days": n_days,
             "sharpe_modulated": _sharpe(mod),
             "sharpe_baseline": _sharpe(base),
             "return_modulated": float(mod.sum()),
             "return_baseline": float(base.sum()),
         }
+        if pnl_risk_attenuated is not None:
+            risk = pnl_risk_attenuated[mask]
+            row["sharpe_risk_attenuated"] = _sharpe(risk)
+            row["return_risk_attenuated"] = float(risk.sum())
+        table[str(year)] = row
     return table
 
 
@@ -314,6 +410,11 @@ def latest_position(
     direction_horizon: int,
     target_vol: float = DEFAULT_TARGET_VOL,
     cov_window: int = DEFAULT_COV_WINDOW,
+    signal_min: np.ndarray | float = -1.0,
+    signal_max: np.ndarray | float = 1.0,
+    neutral_band: float = 0.0,
+    attenuation: np.ndarray | None = None,
+    latest_attenuation: np.ndarray | None = None,
 ) -> dict:
     # (cost_bps deliberately not a parameter here: costs affect reported
     # PnL, never the position itself - compute_portfolio's positions are
@@ -332,11 +433,37 @@ def latest_position(
     realized yet) and reuses compute_portfolio's own causal machinery -
     the appended day's covariance matrix only ever looks at the REAL
     historical returns before it, never the placeholder.
+
+    `signal_min`/`signal_max`/`neutral_band` - see compute_portfolio's own
+    docstring - should be the SAME values the historical `probabilities`
+    were (or will be) sized with, so today's position uses the identical
+    rule - including: if today's own probability falls inside the band, it
+    rides the risk-parity weight, same as any other abstained day.
+
+    `attenuation`/`latest_attenuation` (both optional, see compute_portfolio's
+    own `attenuation` param) - `attenuation` is the historical (T, n)
+    series, `latest_attenuation` today's own (n,) value (a caller computes
+    both via models/risk_engine.py's evaluate_risk_engine - see
+    api/server.py's evaluate(), which builds `latest_attenuation` from the
+    SAME today's-own-weight/stats-window logic evaluate_risk_engine
+    already uses for history, just with today's own placeholder day
+    appended the same way this function appends `latest_probabilities`
+    above). Both must be given together (or neither) - returns an
+    additional `"position_risk_attenuated"` key only when they are.
     """
     extended_probabilities = np.vstack([probabilities, np.asarray(latest_probabilities).reshape(1, -1)])
     extended_returns = np.vstack([next_returns, np.zeros((1, next_returns.shape[1]))])
-    out = compute_portfolio(extended_probabilities, extended_returns, direction_horizon, target_vol, cov_window)
-    return {
+    extended_attenuation = None
+    if attenuation is not None and latest_attenuation is not None:
+        extended_attenuation = np.vstack([attenuation, np.asarray(latest_attenuation).reshape(1, -1)])
+    out = compute_portfolio(
+        extended_probabilities, extended_returns, direction_horizon, target_vol, cov_window,
+        signal_min=signal_min, signal_max=signal_max, neutral_band=neutral_band, attenuation=extended_attenuation,
+    )
+    result = {
         "position_modulated": out["positions_modulated"][-1],
         "position_baseline": out["positions_baseline"][-1],
     }
+    if extended_attenuation is not None:
+        result["position_risk_attenuated"] = out["positions_risk_attenuated"][-1]
+    return result

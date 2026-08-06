@@ -25,7 +25,7 @@ from pathlib import Path
 
 import numpy as np
 
-from models.portfolio_lstm import DEFAULT_CONFIG, apply_neutral_band, run_pipeline_multi_seed
+from models.portfolio_lstm import DEFAULT_CONFIG, run_pipeline_multi_seed
 from models.portfolio_pnl import annual_sharpe_table, compute_portfolio
 
 PAIRS = ["EURUSD", "USDJPY", "AUDUSD"]
@@ -82,8 +82,7 @@ def run_mode(name: str, overrides: dict) -> None:
         from models.portfolio_lstm import confusion_matrix_metrics
         cm = confusion_matrix_metrics(probs, labels, neutral_band=band)
 
-        banded = apply_neutral_band(probs, band)
-        portfolio = compute_portfolio(banded, next_returns, args.direction_horizon, target_vol)
+        portfolio = compute_portfolio(probs, next_returns, args.direction_horizon, target_vol, neutral_band=band)
         annual = annual_sharpe_table(dates, portfolio["pnl_modulated"], portfolio["pnl_baseline"])
 
         overall_sharpe_mod = float(

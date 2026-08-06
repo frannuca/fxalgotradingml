@@ -373,10 +373,20 @@ def rolling_moment_features(returns: pd.DataFrame, window: int) -> pd.DataFrame:
 #: respectively, not just one - see n_channels_per_pair.
 FEATURE_CATALOG: tuple[str, ...] = ("log_return", "vol", "skew", "kurt", "carry", "cma", "bandpass")
 
-#: Default feature selection - matches this module's original always-on
-#: set (raw return + rolling vol/skew/kurtosis), with carry/cma/bandpass
-#: all opt-in.
-DEFAULT_FEATURES: list[str] = ["log_return", "vol", "skew", "kurt"]
+#: Default feature selection for the per-asset PREDICTOR. "skew"/"kurt"
+#: are deliberately NOT included here (unlike this module's original
+#: always-on set) - they're risk-engine-EXCLUSIVE inputs now (see
+#: models/risk_engine.py's own docstring on the "split by purpose"
+#: design: skewness/kurtosis are genuine tail-risk statistics, not
+#: directional signal, so the risk overlay is the more natural place for
+#: them). Still listed in FEATURE_CATALOG and fully usable if a caller
+#: explicitly selects them - this only changes what a NEW config gets by
+#: default; an EXISTING checkpoint's own persisted `features` (see
+#: _checkpoint_dict) is unaffected either way. "cma"/"bandpass" stay
+#: opt-in dual-use (available to both the predictor and the risk engine,
+#: independently configured in each) since they carry genuine directional/
+#: trend information, not just risk.
+DEFAULT_FEATURES: list[str] = ["log_return", "vol"]
 
 #: Default (short, long) trailing windows for "cma" (see
 #: cross_moving_averages) when "cma" is selected but no windows are given.
@@ -903,18 +913,31 @@ class PredictionModel(nn.Module):
         sigma_hat: np.ndarray | None = None, neutral_band: float = 0.0,
         target_vol: float = DEFAULT_TARGET_VOL,
         bandpass_windows: list | None = None, bandpass_order: int = DEFAULT_BANDPASS_ORDER,
+        signal_range: dict | None = None,
+        direction_horizon: int = 5, rolling_stats_window: int = 20,
+        risk_engine: "RiskEngine | None" = None,  # noqa: F821 - see models/risk_engine.py
     ) -> dict:
         """Build the checkpoint dict shared by save_model() (-> local file)
         and save_to_db() (-> quant.model_registry blob).
 
         `pairs`/`cross_pairs` (in `config`, needed to reconstruct the
         model's own per-asset input-slicing - see __init__) and
-        `lookback`/`features`/`cma_windows` (top-level, needed to rebuild
-        an IDENTICAL feature dataframe for new data - see
-        build_feature_dataframe) are persisted the same way as before:
-        properties of the trained model, not free evaluation-time
+        `lookback`/`features`/`cma_windows`/`direction_horizon`/
+        `rolling_stats_window` (top-level, needed to rebuild an IDENTICAL
+        feature dataframe AND label for new data - see
+        build_feature_dataframe/make_sequences) are persisted the same way
+        as before: properties of the trained model, not free evaluation-time
         parameters a caller could change later without invalidating the
-        weights.
+        weights or corrupting what's being reported. `rolling_stats_window`
+        in particular directly changes the FEATURE VALUES the network
+        reads (rolling vol/skew/kurt, and the z-score label's own
+        normalization) - evaluating with a mismatched value would feed
+        the network data it never saw in training. `direction_horizon`
+        changes what the label/evaluation window means and what
+        compute_portfolio's smoothing window is - a mismatch would compare
+        the model's own forecast against the WRONG realized outcome. See
+        load_pipeline, which recovers both from here rather than from
+        whatever a caller's request happens to specify.
 
         `sigma_hat` (see evaluate_prediction_model's docstring on
         calibration) is the per-asset residual-std estimate the probit
@@ -925,7 +948,60 @@ class PredictionModel(nn.Module):
         validation set available when only a single new window is being
         scored. Defaults to all-ones (i.e. uncalibrated) when not given,
         so old checkpoints without it still load.
+
+        `signal_range` (a {pair: [min, max]} dict - see resolve_signal_bounds/
+        DEFAULT_CONFIG) is the per-asset bounds the decision-day probability
+        is linearly mapped into before scaling the risk-parity weight (see
+        models/portfolio_pnl.py's compute_portfolio) - a property of how the
+        model is meant to be traded, persisted the same way as
+        neutral_band/target_vol below. A pair missing from it defaults to
+        (-1, 1) wherever it's resolved (resolve_signal_bounds), so
+        `signal_range={}` (the default) recovers the original fixed
+        `(p - 0.5) * 2` map for every asset.
+
+        `risk_engine` (optional, see models/risk_engine.py) - an already-
+        TRAINED RiskEngine attached to this model, bundled here under its
+        own nested "risk_engine" key (see risk_engine_checkpoint_dict) so
+        ONE saved model name carries both the frozen predictor and its
+        risk overlay together - None (default, and every checkpoint saved
+        before this existed) means this model has no risk engine attached;
+        every downstream consumer (evaluate_prediction_model,
+        api/server.py's evaluate()) must treat that as "report the
+        prediction-only portfolio, skip the risk-attenuated series
+        entirely" rather than erroring.
+
+        BUG THIS GUARDS AGAINST: `self.risk_engine`, once set by
+        _from_checkpoint (loading a model that already had one bundled),
+        is a genuine registered nn.Module submodule of `self` (RiskEngine
+        extends nn.Module, and plain attribute assignment auto-registers
+        it) - so `self.state_dict()` below would otherwise silently
+        include "risk_engine.*" keys EVERY TIME this model gets resaved
+        from then on, regardless of whether a `risk_engine` argument was
+        even passed here (e.g. continue_training warm-starting from a
+        risk-engine-bundled model, then resaving with `risk_engine=None`
+        by design - see save_model's own docstring). That would bake a
+        STALE risk engine's weights into the base predictor's own
+        state_dict while the top-level "risk_engine" key stays None -
+        producing a checkpoint that can never be loaded again
+        (_from_checkpoint's own load_state_dict would see those keys as
+        genuinely "unexpected", since a freshly-constructed model has no
+        risk_engine submodule yet at that point). Filtering them out of
+        `self.state_dict()` here, unconditionally, keeps the base
+        predictor's own serialized weights free of risk-engine state no
+        matter what submodule `self` happens to carry - the top-level
+        "risk_engine" key built from the explicit `risk_engine` argument
+        above remains the ONLY sanctioned place those weights get saved.
         """
+        risk_engine_dict = None
+        if risk_engine is not None:
+            from models.risk_engine import risk_engine_checkpoint_dict
+
+            risk_engine_dict = risk_engine_checkpoint_dict(
+                risk_engine, risk_engine.pairs, risk_engine.risk_lookback, risk_engine.risk_cma_windows,
+                risk_engine.risk_bandpass_windows, risk_engine.risk_bandpass_order,
+                risk_engine.rolling_stats_window, risk_engine.min_risk_att, risk_engine.max_risk_att,
+            )
+        own_state_dict = {k: v for k, v in self.state_dict().items() if not k.startswith("risk_engine.")}
         return {
             "config": {
                 "n_assets": self.n_assets,
@@ -937,11 +1013,13 @@ class PredictionModel(nn.Module):
                 "n_attn_heads": self.n_attn_heads,
                 "cross_pairs": self.cross_pairs,
             },
-            "state_dict": self.state_dict(),
+            "state_dict": own_state_dict,
             "x_mean": torch.as_tensor(x_mean),
             "x_std": torch.as_tensor(x_std),
             "pairs": list(pairs),
             "lookback": lookback,
+            "direction_horizon": int(direction_horizon),
+            "rolling_stats_window": int(rolling_stats_window),
             "features": list(features) if features is not None else list(DEFAULT_FEATURES),
             "cma_windows": [list(w) for w in (cma_windows or [])],
             "bandpass_windows": [list(w) for w in (bandpass_windows or [])],
@@ -957,6 +1035,12 @@ class PredictionModel(nn.Module):
             # traded, not a free evaluation-time parameter, so it's
             # persisted the same way as neutral_band above.
             "target_vol": float(target_vol),
+            # Per-asset (min, max) the decision-day probability is linearly
+            # mapped into (see resolve_signal_bounds) - persisted the same
+            # way as neutral_band/target_vol above. A pair absent from this
+            # dict defaults to (-1, 1) wherever it's resolved.
+            "signal_range": {k: [float(v[0]), float(v[1])] for k, v in (signal_range or {}).items()},
+            "risk_engine": risk_engine_dict,
         }
 
     @classmethod
@@ -971,12 +1055,23 @@ class PredictionModel(nn.Module):
         probabilities without re-supplying any of it themselves.
         """
         model = cls(**checkpoint["config"])
-        model.load_state_dict(checkpoint["state_dict"])
+        # Strip any stray "risk_engine.*" keys before loading (tolerates
+        # checkpoints written by the bug _checkpoint_dict's own comment
+        # below describes - a FRESH `model` here has no risk_engine
+        # submodule registered yet regardless, so these keys are always
+        # "unexpected" to load_state_dict; everything else stays strict).
+        own_state_dict = {k: v for k, v in checkpoint["state_dict"].items() if not k.startswith("risk_engine.")}
+        model.load_state_dict(own_state_dict)
         model.eval()
         model.x_mean = checkpoint["x_mean"].numpy()
         model.x_std = checkpoint["x_std"].numpy()
         model.pairs = checkpoint["pairs"]
         model.lookback = checkpoint["lookback"]
+        # Defaults (5/20) match DEFAULT_CONFIG's own - old checkpoints saved
+        # before these were persisted still load with the values that were
+        # always implicitly used at the time.
+        model.direction_horizon = int(checkpoint.get("direction_horizon", 5))
+        model.rolling_stats_window = int(checkpoint.get("rolling_stats_window", 20))
         model.features = checkpoint.get("features", list(DEFAULT_FEATURES))
         model.cma_windows = checkpoint.get("cma_windows", [])
         model.bandpass_windows = checkpoint.get("bandpass_windows", [])
@@ -986,6 +1081,17 @@ class PredictionModel(nn.Module):
         model.sigma_hat = sigma_hat.numpy() if sigma_hat is not None else np.ones(n_assets, dtype=np.float32)
         model.neutral_band = float(checkpoint.get("neutral_band", 0.0))
         model.target_vol = float(checkpoint.get("target_vol", DEFAULT_TARGET_VOL))
+        model.signal_range = checkpoint.get("signal_range", {})
+        # None for every checkpoint saved before models/risk_engine.py
+        # existed, or for a model nobody ever trained one on top of - see
+        # this class's own _checkpoint_dict docstring on how downstream
+        # consumers must treat that.
+        risk_engine_checkpoint = checkpoint.get("risk_engine")
+        model.risk_engine = None
+        if risk_engine_checkpoint is not None:
+            from models.risk_engine import risk_engine_from_checkpoint
+
+            model.risk_engine = risk_engine_from_checkpoint(risk_engine_checkpoint)
         return model
 
     def save_model(
@@ -995,6 +1101,9 @@ class PredictionModel(nn.Module):
         sigma_hat: np.ndarray | None = None, neutral_band: float = 0.0,
         target_vol: float = DEFAULT_TARGET_VOL,
         bandpass_windows: list | None = None, bandpass_order: int = DEFAULT_BANDPASS_ORDER,
+        signal_range: dict | None = None,
+        direction_horizon: int = 5, rolling_stats_window: int = 20,
+        risk_engine: "RiskEngine | None" = None,  # noqa: F821 - see models/risk_engine.py
     ) -> None:
         """Persist every asset's trained LSTM weights, architecture
         config (including per-asset cross_pairs input slicing), input
@@ -1002,11 +1111,22 @@ class PredictionModel(nn.Module):
         the feature selection, and the validation-fit calibration scale -
         a self-contained checkpoint load_model() can rebuild and run
         calibrated inference from without retraining.
+
+        `risk_engine` deliberately defaults to None here, NOT to whatever
+        `self.risk_engine` might already hold - a caller that wants one
+        attached must pass it explicitly every time (see
+        models/risk_engine.py's train_risk_engine, the only place that
+        should ever set this). In particular, continue_training's own
+        resave of a warm-started model must NOT silently carry an old risk
+        engine forward: it was trained against THIS model's OLD
+        probability outputs, and continuing to train invalidates that
+        pairing - an attached-but-stale risk engine would be actively
+        misleading, not just unused.
         """
         torch.save(
             self._checkpoint_dict(
                 x_mean, x_std, pairs, lookback, features, cma_windows, sigma_hat, neutral_band, target_vol,
-                bandpass_windows, bandpass_order,
+                bandpass_windows, bandpass_order, signal_range, direction_horizon, rolling_stats_window, risk_engine,
             ),
             path,
         )
@@ -1019,6 +1139,9 @@ class PredictionModel(nn.Module):
         sigma_hat: np.ndarray | None = None, neutral_band: float = 0.0,
         target_vol: float = DEFAULT_TARGET_VOL,
         bandpass_windows: list | None = None, bandpass_order: int = DEFAULT_BANDPASS_ORDER,
+        signal_range: dict | None = None,
+        direction_horizon: int = 5, rolling_stats_window: int = 20,
+        risk_engine: "RiskEngine | None" = None,  # noqa: F821 - see models/risk_engine.py; see save_model's own docstring on this deliberately not defaulting to self.risk_engine
         description: str = "",
     ) -> None:
         """Serialize the same checkpoint save_model() would write, and
@@ -1031,7 +1154,7 @@ class PredictionModel(nn.Module):
         torch.save(
             self._checkpoint_dict(
                 x_mean, x_std, pairs, lookback, features, cma_windows, sigma_hat, neutral_band, target_vol,
-                bandpass_windows, bandpass_order,
+                bandpass_windows, bandpass_order, signal_range, direction_horizon, rolling_stats_window, risk_engine,
             ),
             buffer,
         )
@@ -1163,6 +1286,33 @@ def apply_neutral_band(probabilities: np.ndarray, neutral_band: float) -> np.nda
     out = probabilities.copy()
     out[np.abs(out - 0.5) < neutral_band] = 0.5
     return out
+
+
+def resolve_signal_bounds(pairs: list[str], signal_range: dict | None) -> tuple[np.ndarray, np.ndarray]:
+    """Per-asset (signal_min, signal_max), each a (len(pairs),) float32
+    array in `pairs` order - the bounds a decision-day probability p in
+    (0, 1) is linearly mapped into BEFORE multiplying the risk-parity
+    baseline weight: `signal = min_i + (max_i - min_i) * p`, replacing the
+    old fixed `(p - 0.5) * 2` map into [-1, 1] (see
+    models/portfolio_pnl.py's compute_portfolio and this module's own
+    _portfolio_sharpe_loss_from_predictions, the two consumers of this
+    function's output - one numpy, one torch, over the SAME strategy).
+    p=0.5 (the neutral_band's own abstention snap - see apply_neutral_band)
+    maps to the range's MIDPOINT, not necessarily 0 - e.g. min=0, max=1
+    (long-only) maps an abstained day to a HALF-SIZE long position, not
+    flat; that's what "factor scaling the risk-parity weight" means as
+    opposed to a signed direction, not a bug.
+
+    `signal_range` is a {pair: [min, max]} dict (see PredictionModel's own
+    persisted `signal_range` and DEFAULT_CONFIG) - a pair absent from it
+    (or `signal_range` itself being falsy) defaults to (-1.0, 1.0), i.e.
+    BYTE-IDENTICAL to the original fixed map for every asset nobody
+    configured.
+    """
+    signal_range = signal_range or {}
+    signal_min = np.array([float(signal_range.get(p, (-1.0, 1.0))[0]) for p in pairs], dtype=np.float32)
+    signal_max = np.array([float(signal_range.get(p, (-1.0, 1.0))[1]) for p in pairs], dtype=np.float32)
+    return signal_min, signal_max
 
 
 def confusion_matrix_counts(probabilities: np.ndarray, labels: np.ndarray, neutral_band: float = 0.0) -> dict:
@@ -1315,6 +1465,92 @@ def _non_overlapping_sharpe_torch(pnl: torch.Tensor, window: int, eps: float = 1
     return full_chunks.mean(dim=-1) / (full_chunks.std(dim=-1, unbiased=True) + eps)
 
 
+def compute_target_vol_positions_torch(
+    mu_dec: torch.Tensor,
+    sigma_dec: torch.Tensor,
+    rp_weights: torch.Tensor,
+    cov: torch.Tensor,
+    direction_horizon: int,
+    target_vol: float,
+    signal_min: torch.Tensor | None = None,
+    signal_max: torch.Tensor | None = None,
+    neutral_band: float = 0.0,
+) -> torch.Tensor:
+    """Differentiable, torch-side counterpart of models/portfolio_pnl.py's
+    compute_portfolio's own `positions_modulated`: probability -> per-asset
+    signal (via signal_min/signal_max, snapped to 1.0 - i.e. ride the
+    UNMODULATED risk-parity weight - inside neutral_band, see
+    apply_neutral_band) -> risk-parity-weighted -> smoothed over
+    direction_horizon -> scaled to target_vol. Returns `positions`,
+    (T, n_assets) - PRE-cost, and (see models/risk_engine.py) PRE any
+    risk-attenuation overlay: this is the quantity BOTH
+    _portfolio_sharpe_loss_from_predictions (below, for its own PnL/Sharpe)
+    and the risk engine's own training (which needs it as an INPUT feature,
+    computed once from an already-frozen PredictionModel - see
+    models/risk_engine.py's own docstring) are built on top of.
+
+    `rp_weights`/`cov` are the PRECOMPUTED, data-only constants from
+    models/portfolio_pnl.py's precompute_risk_parity (see _PreparedData) -
+    never a function of the model, so no gradient flows through them, only
+    through each asset's own probability signal. Rows where they're NaN
+    (not enough trailing covariance history yet) are zeroed via
+    nan_to_num BEFORE any arithmetic (not masked after) - a NaN multiplied
+    by anything, including 0, is still NaN in IEEE754, so zeroing early is
+    what actually makes those rows contribute exactly 0 to every downstream
+    quantity (signal weight, portfolio variance, position) instead of
+    poisoning the whole batch with NaN gradients.
+
+    `signal_min`/`signal_max` (each None, or a (n_assets,) tensor - see
+    resolve_signal_bounds) are the per-asset bounds the probability is
+    linearly mapped into - default (None) is (-1, 1) for every asset, the
+    torch-side counterpart of models/portfolio_pnl.py's compute_portfolio
+    accepting the SAME per-asset bounds, so what's optimized here and what
+    gets reported there are the identical strategy.
+
+    `neutral_band` (see apply_neutral_band/models/portfolio_pnl.py's
+    compute_portfolio) is the torch-side counterpart of the SAME hard
+    threshold: a probability within `0.5 +/- neutral_band` marks that day
+    as abstained, and its signal is forced to exactly 1.0 - riding the
+    UNMODULATED risk-parity weight for that pair, same as
+    `positions_baseline` - AFTER the signal_min/signal_max map, not the
+    map's midpoint, regardless of the configured range. This is the same
+    "no view -> hold the diversified book" convention every reported
+    Sharpe already uses at evaluation time (compute_portfolio's own
+    `neutral_band` param - see this module's own docstring). 0.0 (default)
+    disables this entirely. Implemented as a `torch.where` (not a boolean
+    mask/slice) so gradients keep flowing normally through every
+    OUT-of-band day; an in-band day simply contributes a constant (1.0)
+    with no gradient from `mu_dec`/`sigma_dec` at that position - correct,
+    since there's nothing to push a call the strategy won't actually size
+    directionally.
+    """
+    if signal_min is None:
+        signal_min = torch.full((mu_dec.shape[-1],), -1.0, device=mu_dec.device, dtype=mu_dec.dtype)
+    if signal_max is None:
+        signal_max = torch.ones((mu_dec.shape[-1],), device=mu_dec.device, dtype=mu_dec.dtype)
+    p = probit(mu_dec / sigma_dec.clamp_min(1e-8))
+    signal = signal_min + (signal_max - signal_min) * p  # (T, n_assets)
+    if neutral_band > 0:
+        in_band = (p - 0.5).abs() < neutral_band
+        signal = torch.where(in_band, torch.ones_like(signal), signal)
+
+    rp_weights_safe = torch.nan_to_num(rp_weights, nan=0.0)
+    cov_safe = torch.nan_to_num(cov, nan=0.0)
+    # Smooth the PRODUCT (rp_weight * signal), not the signal alone, then
+    # rp_weight-at-t - matches compute_portfolio's own raw_modulated ->
+    # _trailing_moving_average ordering exactly (models/portfolio_pnl.py).
+    # rp_weight itself drifts day to day (a rolling risk-parity solve), so
+    # these two orderings are NOT equivalent - MA(w*s) != w * MA(s) - and
+    # this function's whole point is to be the differentiable counterpart
+    # of THAT exact eval-time strategy, not a similar-looking one.
+    raw_modulated = rp_weights_safe * signal
+    w_mod = _trailing_moving_average_torch(raw_modulated, direction_horizon)
+    port_var = torch.einsum("ti,tij,tj->t", w_mod, cov_safe, w_mod)
+    target_vol_daily = target_vol / (TRADING_DAYS_PER_YEAR ** 0.5)
+    scale = torch.clamp(target_vol_daily / torch.sqrt(port_var.clamp_min(1e-16)), max=MAX_VOL_SCALE)
+    return w_mod * scale.unsqueeze(-1)
+
+
 def _portfolio_sharpe_loss_from_predictions(
     mu_dec: torch.Tensor,
     sigma_dec: torch.Tensor,
@@ -1325,15 +1561,19 @@ def _portfolio_sharpe_loss_from_predictions(
     sharpe_window: int,
     target_vol: float,
     cost_bps: float = DEFAULT_COST_BPS,
+    signal_min: torch.Tensor | None = None,
+    signal_max: torch.Tensor | None = None,
+    neutral_band: float = 0.0,
 ) -> torch.Tensor:
     """Differentiable, JOINT (whole-book) negative averaged Sharpe (over
     non-overlapping `sharpe_window`-day chunks - see
-    _non_overlapping_sharpe_torch) - the torch-side counterpart of models/portfolio_pnl.py's
-    compute_portfolio (same strategy: risk-parity weight x probability
-    signal, smoothed over direction_horizon, scaled to target_vol),
-    computed for ONE split (train or val), from ALREADY-COMPUTED
-    decision-day predictions (`mu_dec`/`sigma_dec`, each (T, n_assets) -
-    the window's LAST timestep, see PredictionModel.forward's docstring).
+    _non_overlapping_sharpe_torch), computed for ONE split (train or val),
+    from ALREADY-COMPUTED decision-day predictions (`mu_dec`/`sigma_dec`,
+    each (T, n_assets) - the window's LAST timestep, see
+    PredictionModel.forward's docstring). The position itself (risk-parity
+    weight x probability signal, smoothed over direction_horizon, scaled
+    to target_vol) is compute_target_vol_positions_torch (above) - see its
+    own docstring for `signal_min`/`signal_max`/`neutral_band`.
 
     Takes predictions rather than `model`+`X` so a caller that ALSO needs
     (mu, sigma) for something else that epoch (see train_prediction_model,
@@ -1351,40 +1591,15 @@ def _portfolio_sharpe_loss_from_predictions(
     one asset's loss genuinely depends on every other asset's CURRENT
     output.
 
-    `rp_weights`/`cov` are the PRECOMPUTED, data-only constants from
-    models/portfolio_pnl.py's precompute_risk_parity (see _PreparedData) -
-    never a function of the model, so no gradient flows through them, only
-    through each asset's own probability signal. Rows where they're NaN
-    (not enough trailing covariance history yet) are zeroed via
-    nan_to_num BEFORE any arithmetic (not masked after) - a NaN multiplied
-    by anything, including 0, is still NaN in IEEE754, so zeroing early is
-    what actually makes those rows contribute exactly 0 to every downstream
-    quantity (signal weight, portfolio variance, position, pnl) instead of
-    poisoning the whole batch with NaN gradients.
-
     No sigma_hat (calibration scale) is applied here, unlike
     evaluate_prediction_model's reported probabilities - sigma_hat is fit
     from THIS model's own validation residuals AFTER training finishes, so
     it doesn't exist yet mid-training. The sign/relative ordering a trading
     signal actually needs doesn't depend on that calibration scale.
     """
-    signal = (probit(mu_dec / sigma_dec.clamp_min(1e-8)) - 0.5) * 2.0  # (T, n_assets), in [-1, 1]
-
-    rp_weights_safe = torch.nan_to_num(rp_weights, nan=0.0)
-    cov_safe = torch.nan_to_num(cov, nan=0.0)
-    # Smooth the PRODUCT (rp_weight * signal), not the signal alone, then
-    # rp_weight-at-t - matches compute_portfolio's own raw_modulated ->
-    # _trailing_moving_average ordering exactly (models/portfolio_pnl.py).
-    # rp_weight itself drifts day to day (a rolling risk-parity solve), so
-    # these two orderings are NOT equivalent - MA(w*s) != w * MA(s) - and
-    # this function's whole point is to be the differentiable counterpart
-    # of THAT exact eval-time strategy, not a similar-looking one.
-    raw_modulated = rp_weights_safe * signal
-    w_mod = _trailing_moving_average_torch(raw_modulated, direction_horizon)
-    port_var = torch.einsum("ti,tij,tj->t", w_mod, cov_safe, w_mod)
-    target_vol_daily = target_vol / (TRADING_DAYS_PER_YEAR ** 0.5)
-    scale = torch.clamp(target_vol_daily / torch.sqrt(port_var.clamp_min(1e-16)), max=MAX_VOL_SCALE)
-    positions = w_mod * scale.unsqueeze(-1)
+    positions = compute_target_vol_positions_torch(
+        mu_dec, sigma_dec, rp_weights, cov, direction_horizon, target_vol, signal_min, signal_max, neutral_band,
+    )
 
     # NET daily pnl: gross minus linear transaction costs on daily position
     # CHANGE (day 0 pays for establishing from flat) - the differentiable
@@ -1421,6 +1636,9 @@ def _portfolio_sharpe_loss(
     sharpe_window: int,
     target_vol: float,
     cost_bps: float = DEFAULT_COST_BPS,
+    signal_min: torch.Tensor | None = None,
+    signal_max: torch.Tensor | None = None,
+    neutral_band: float = 0.0,
 ) -> torch.Tensor:
     """Convenience wrapper around _portfolio_sharpe_loss_from_predictions
     for a caller that only needs the Sharpe term on its own (a standalone
@@ -1434,7 +1652,7 @@ def _portfolio_sharpe_loss(
     mu, sigma = model(X)  # each (T, lookback, n_assets)
     return _portfolio_sharpe_loss_from_predictions(
         mu[:, -1, :], sigma[:, -1, :], next_returns, rp_weights, cov, direction_horizon, sharpe_window, target_vol,
-        cost_bps,
+        cost_bps, signal_min, signal_max, neutral_band,
     )
 
 
@@ -1485,7 +1703,10 @@ def train_prediction_model(
     cov_train: torch.Tensor | None = None,
     cov_val: torch.Tensor | None = None,
     checkpoint_metric: str = "val_loss",
-    on_checkpoint_update: Callable[[int, list], None] | None = None,
+    signal_min: torch.Tensor | None = None,
+    signal_max: torch.Tensor | None = None,
+    neutral_band: float = 0.0,
+    on_checkpoint_update: Callable[[int, list, float | None], None] | None = None,
 ) -> None:
     """Train every asset's LSTM with its OWN `torch.optim.Adam` instance
     (own momentum/variance state, entirely separate from every other
@@ -1641,15 +1862,44 @@ def train_prediction_model(
         which CHECKPOINT gets kept changes) - the caller must still supply
         next_returns_val/rp_weights_val/cov_val for this to be computable.
 
+    `signal_min`/`signal_max` (each None, or a (n_assets,) tensor) are the
+    per-asset bounds the Sharpe term's probability signal is linearly
+    mapped into instead of the old fixed [-1, 1] range - see
+    resolve_signal_bounds and _portfolio_sharpe_loss_from_predictions's own
+    docstring. Only affects the Sharpe term (train and, if computed, val);
+    irrelevant when `sharpe_weight=0` and `checkpoint_metric != "sharpe"`.
+
+    `neutral_band` (see apply_neutral_band) forces the Sharpe term's signal
+    to exactly 1.0 (-> ride the UNMODULATED risk-parity weight, same as
+    `positions_baseline` - not the signal_min/signal_max map's midpoint)
+    for any day inside the band, in BOTH the train and val Sharpe
+    computation - see _portfolio_sharpe_loss_from_predictions's own
+    docstring on why: without this, the Sharpe objective (and "sharpe"
+    checkpoint selection) would optimize/select on a strategy that trades
+    every day regardless of confidence, while every REPORTED Sharpe
+    (evaluate_prediction_model's downstream callers, summarize_checkpoint,
+    api/server.py) already treats an in-band day as "hold the diversified
+    book" - training and reporting would silently diverge. Same convention
+    as `checkpoint_metric`: irrelevant when `sharpe_weight=0` and
+    `checkpoint_metric != "sharpe"`. 0.0 (default) disables this,
+    unchanged from this function's original behavior.
+
     `on_checkpoint_update`, if given, is called after every VALIDATED
-    epoch with `best_state` itself (the SAME list object, whose per-asset
-    ENTRIES get reassigned - never mutated in place - to a fresh
-    `copy.deepcopy` whenever a new best is found) - cheap (no evaluation,
-    just handing over a reference), letting a caller elsewhere (e.g.
-    api/server.py's "save best model so far" endpoint) always read the
-    CURRENT best checkpoint on demand, without this function needing to
-    know anything about full evaluation, checkpoint metadata, or the DB -
-    see models/portfolio_lstm.py's summarize_checkpoint for that part.
+    epoch with `(epoch, best_state, best_score)` - `best_state` is the SAME
+    list object, whose per-asset ENTRIES get reassigned - never mutated in
+    place - to a fresh `copy.deepcopy` whenever a new best is found (cheap
+    to hand over, no evaluation happens here); `best_score` is the SAME
+    human-legible, higher-is-better-adjusted running score this function's
+    own sparse logging displays (None until at least one epoch has
+    validated). Passing `best_score` alongside `best_state` (not just the
+    state on its own) is what lets a caller with MULTIPLE restarts calling
+    it (e.g. run_pipeline_multi_seed's own seed/lambda sweep, forwarded to
+    api/server.py's "save best model so far" endpoint) tell whether THIS
+    restart's current best is actually an improvement over whatever it
+    already has on hand from an EARLIER restart, rather than blindly
+    overwriting with whichever restart happens to be running right now -
+    see api/server.py's own _on_best_checkpoint docstring for the bug this
+    fixes.
     """
     n_assets = model.n_assets
     optimizers = [
@@ -1717,7 +1967,7 @@ def train_prediction_model(
             if track_sharpe:
                 sharpe_loss = _portfolio_sharpe_loss_from_predictions(
                     mu[:, -1, :], sigma[:, -1, :], next_returns_train, rp_weights_train, cov_train,
-                    direction_horizon, sharpe_window, target_vol, cost_bps,
+                    direction_horizon, sharpe_window, target_vol, cost_bps, signal_min, signal_max, neutral_band,
                 )
                 total_loss = total_loss + sharpe_weight * sharpe_loss
                 train_sharpe = -sharpe_loss.detach().item()
@@ -1728,6 +1978,7 @@ def train_prediction_model(
             for opt in optimizers:
                 opt.step()
 
+            best_score = None
             if track_val:
                 model.eval()
                 with torch.no_grad():
@@ -1759,7 +2010,7 @@ def train_prediction_model(
                     if track_sharpe_val:
                         val_sharpe_loss = _portfolio_sharpe_loss_from_predictions(
                             val_mu_dec, val_sigma_dec, next_returns_val, rp_weights_val, cov_val,
-                            direction_horizon, sharpe_window, target_vol, cost_bps,
+                            direction_horizon, sharpe_window, target_vol, cost_bps, signal_min, signal_max, neutral_band,
                         )
                         val_sharpe = -val_sharpe_loss.item()
                     for i in range(n_assets):
@@ -1777,9 +2028,28 @@ def train_prediction_model(
                         if score_i < best_val_loss[i]:
                             best_val_loss[i] = score_i
                             best_state[i] = copy.deepcopy(model.assets[i].state_dict())
+
+                # Running best CHECKPOINT-SELECTION score so far THIS RUN,
+                # in human-legible units matching checkpoint_metric (see
+                # this function's own docstring) - "val_loss" is stored/
+                # displayed as-is (lower better); "hit_rate"/"sharpe" are
+                # stored NEGATED (see the score_i computation above, to fit
+                # best_val_loss's shared "<" convention), so un-negate them
+                # here for display (higher better). None until at least one
+                # epoch has actually updated a checkpoint. Computed EVERY
+                # validated epoch (not just the sparse ~10%-of-epochs
+                # logging cadence below) so on_checkpoint_update's caller
+                # (e.g. api/server.py's "save best model so far") always
+                # gets a score alongside best_state, fresh enough to compare
+                # against other restarts' own bests reliably - see that
+                # module's own _on_best_checkpoint docstring.
+                finite_bests = [v for v in best_val_loss if v != float("inf")]
+                if finite_bests:
+                    mean_best_score = sum(finite_bests) / len(finite_bests)
+                    best_score = mean_best_score if checkpoint_metric == "val_loss" else -mean_best_score
                 model.train()
                 if on_checkpoint_update is not None:
-                    on_checkpoint_update(epoch, best_state)
+                    on_checkpoint_update(epoch, best_state, best_score)
 
             if epoch == 1 or epoch % max(epochs // 10, 1) == 0:
                 val_loss_mean = sum(val_losses) / n_assets if track_val else None
@@ -1788,21 +2058,6 @@ def train_prediction_model(
                 sharpe_msg = f" | train sharpe {train_sharpe:.4f}" if track_sharpe else ""
                 if track_sharpe_val:
                     sharpe_msg += f" | val sharpe {val_sharpe:.4f}"
-
-                # Running best CHECKPOINT-SELECTION score so far this run,
-                # in human-legible units matching checkpoint_metric (see
-                # this function's own docstring) - "val_loss" is stored/
-                # displayed as-is (lower better); "hit_rate"/"sharpe" are
-                # stored NEGATED (see the score_i computation above, to fit
-                # best_val_loss's shared "<" convention), so un-negate them
-                # here for display (higher better). None until at least one
-                # epoch has actually updated a checkpoint.
-                best_score = None
-                if track_val:
-                    finite_bests = [v for v in best_val_loss if v != float("inf")]
-                    if finite_bests:
-                        mean_best_score = sum(finite_bests) / len(finite_bests)
-                        best_score = mean_best_score if checkpoint_metric == "val_loss" else -mean_best_score
                 if best_score is not None:
                     sharpe_msg += f" | best {checkpoint_metric} {best_score:.4f}"
 
@@ -2040,8 +2295,16 @@ DEFAULT_CONFIG: dict = {
     # 0.5 +/- this half-width are snapped to exactly 0.5 - the model
     # ABSTAINS instead of making a near-coin-flip call. Hit rate/
     # confusion-matrix metrics are then computed over decided samples
-    # only, alongside a `coverage` metric (how often the model speaks).
-    # 0.0 disables abstention entirely.
+    # only, alongside a `coverage` metric (how often the model speaks). At
+    # the portfolio level (models/portfolio_pnl.py's compute_portfolio) an
+    # abstained day rides the UNMODULATED risk-parity weight instead of a
+    # directional bet - "no view" means "hold the diversified book", not
+    # "no position". Also applied INSIDE the optional Sharpe training
+    # objective (see train_prediction_model's own docstring on its
+    # `neutral_band` param) when "sharpe_weight" > 0 or
+    # "checkpoint_metric" == "sharpe", so training/checkpoint-selection use
+    # the SAME abstention rule every reported Sharpe does. 0.0 disables
+    # abstention entirely, everywhere.
     "neutral_band": 0.05,
     # Annualized volatility the evaluation-mode portfolio PnL calculator
     # (models/portfolio_pnl.py) scales this model's risk-parity-weighted,
@@ -2051,6 +2314,19 @@ DEFAULT_CONFIG: dict = {
     # if "sharpe_weight" > 0 above - the same target the trained strategy
     # is evaluated at is what it's optimized toward.
     "target_vol": DEFAULT_TARGET_VOL,
+    # Per-asset (min, max) bounds the decision-day probability is linearly
+    # mapped into BEFORE multiplying the risk-parity baseline weight (see
+    # resolve_signal_bounds/models/portfolio_pnl.py's compute_portfolio) -
+    # a {pair: [min, max]} dict, persisted alongside target_vol/neutral_band
+    # above (PredictionModel._checkpoint_dict). A pair missing from this
+    # dict defaults to (-1, 1) - the original fixed `(p - 0.5) * 2` map, a
+    # signed direction. Narrowing the range changes what the mapped value
+    # MEANS: e.g. {"EURUSD": [0.0, 1.0]} makes EURUSD long-only (the
+    # risk-parity weight scaled by a factor in [0, 1], never negated) -
+    # p=0.5 (including an abstained day, see apply_neutral_band) then maps
+    # to a HALF-SIZE position, not flat, since 0 is no longer the range's
+    # midpoint. {} (default) recovers the original behavior for every asset.
+    "signal_range": {},
     # Multi-seed restarts: train `n_seeds` independent PredictionModels
     # and keep whichever restart had the lowest validation log loss.
     "n_seeds": 1,
@@ -2137,6 +2413,8 @@ def _prepare_data(
     cma_windows: list | None = None,
     bandpass_windows: list | None = None,
     bandpass_order: int | None = None,
+    direction_horizon: int | None = None,
+    rolling_stats_window: int | None = None,
 ) -> _PreparedData:
     """Load data (via db.py), build sequences, split by time, and
     standardize - everything a training (or inference) run needs that
@@ -2147,11 +2425,15 @@ def _prepare_data(
     standardize new data exactly the way the loaded model was trained.
 
     If `pairs`/`lookback`/`features`/`cma_windows`/`bandpass_windows`/
-    `bandpass_order` are given, they OVERRIDE the matching `args.*` value -
-    used when loading a saved model, whose checkpoint carries the exact
-    values it was trained with (see PredictionModel._from_checkpoint/
-    load_pipeline below); a loaded model's own stored values must win over
-    whatever a caller passes in.
+    `bandpass_order`/`direction_horizon`/`rolling_stats_window` are given,
+    they OVERRIDE the matching `args.*` value - used when loading a saved
+    model, whose checkpoint carries the exact values it was trained with
+    (see PredictionModel._from_checkpoint/load_pipeline below); a loaded
+    model's own stored values must win over whatever a caller passes in -
+    `rolling_stats_window` in particular changes the actual FEATURE VALUES
+    fed to the network (rolling vol/skew/kurt, z-score normalization), so
+    a mismatch here is not just a reporting inconsistency but a genuine
+    train/inference distribution shift.
     """
     if pairs is None:
         pairs = list(dict.fromkeys(args.pairs))  # de-duplicate, keep order
@@ -2165,14 +2447,16 @@ def _prepare_data(
         bandpass_windows = getattr(args, "bandpass_windows", None) or []
     if bandpass_order is None:
         bandpass_order = getattr(args, "bandpass_order", None) or DEFAULT_BANDPASS_ORDER
+    if direction_horizon is None:
+        direction_horizon = getattr(args, "direction_horizon", 5) or 5
+    if rolling_stats_window is None:
+        rolling_stats_window = getattr(args, "rolling_stats_window", 20) or 20
     cutoff_date = getattr(args, "cutoff_date", None) or DEFAULT_CUTOFF_DATE
 
     logger.info("Loading %s via db.py (cutoff_date=%s)", pairs, cutoff_date)
     prices = load_close_prices(pairs, years=args.years, cutoff_date=cutoff_date)
     returns = to_log_returns(prices)
 
-    direction_horizon = getattr(args, "direction_horizon", 5) or 5
-    rolling_stats_window = getattr(args, "rolling_stats_window", 20) or 20
     min_rows = lookback + direction_horizon + rolling_stats_window
     if len(returns) < min_rows:
         raise ValueError(
@@ -2464,7 +2748,7 @@ def evaluate_prediction_model(
 
 def _run_train_prediction_model(
     model: PredictionModel, data: "_PreparedData", args: argparse.Namespace,
-    on_checkpoint_update: Callable[[int, list], None] | None = None,
+    on_checkpoint_update: Callable[[int, list, float | None], None] | None = None,
 ) -> None:
     """Shared by _train_and_evaluate (fresh random-init model) and
     continue_training (warm-started from an existing checkpoint's
@@ -2491,6 +2775,10 @@ def _run_train_prediction_model(
     if sharpe_weight > 0 or checkpoint_metric == "sharpe":
         next_returns_val_t = torch.as_tensor(data.next_returns_val, dtype=torch.float32, device=data.device)
 
+    signal_min_arr, signal_max_arr = resolve_signal_bounds(data.pairs, getattr(args, "signal_range", None))
+    signal_min_t = torch.as_tensor(signal_min_arr, dtype=torch.float32, device=data.device)
+    signal_max_t = torch.as_tensor(signal_max_arr, dtype=torch.float32, device=data.device)
+
     train_prediction_model(
         model, data.X_train, data.z_labels_train,
         epochs=args.epochs, lr=args.lr, weight_decay=args.weight_decay,
@@ -2505,13 +2793,15 @@ def _run_train_prediction_model(
         rp_weights_train=data.rp_weights_train, rp_weights_val=data.rp_weights_val,
         cov_train=data.cov_train, cov_val=data.cov_val,
         checkpoint_metric=checkpoint_metric,
+        signal_min=signal_min_t, signal_max=signal_max_t,
+        neutral_band=getattr(args, "neutral_band", 0.0) or 0.0,
         on_checkpoint_update=on_checkpoint_update,
     )
 
 
 def _train_and_evaluate(
     data: _PreparedData, args: argparse.Namespace,
-    on_best_checkpoint: Callable[[PredictionModel, _PreparedData, argparse.Namespace, int, list], None] | None = None,
+    on_best_checkpoint: Callable[[PredictionModel, _PreparedData, argparse.Namespace, int, list, float | None], None] | None = None,
 ) -> PredictionResult:
     """Train one PredictionModel (whatever random seed is currently set) on
     already-prepared data - every asset's LSTM trained FULLY
@@ -2519,14 +2809,19 @@ def _train_and_evaluate(
     - and evaluate it on all three splits.
 
     `on_best_checkpoint`, if given, is called after every VALIDATED epoch
-    with `(model, data, args, epoch, best_state)` - `model`/`data`/`args` are
-    this call's OWN (architecture, prepared data, config), closed over
-    here so a caller several layers up (see api/server.py's "save best
-    model so far" endpoint) can build a full evaluated snapshot from
-    `best_state` at any later time - e.g. models/portfolio_lstm.py's
-    summarize_checkpoint - without needing to plumb `model`/`data`/`args`
-    through itself. See train_prediction_model's own docstring on why
-    handing over `best_state` here is cheap (no evaluation happens now).
+    with `(model, data, args, epoch, best_state, best_score)` - `model`/
+    `data`/`args` are this call's OWN (architecture, prepared data,
+    config), closed over here so a caller several layers up (see
+    api/server.py's "save best model so far" endpoint) can build a full
+    evaluated snapshot from `best_state` at any later time - e.g.
+    models/portfolio_lstm.py's summarize_checkpoint - without needing to
+    plumb `model`/`data`/`args` through itself. `best_score` is
+    train_prediction_model's own running best score THIS restart - see its
+    docstring on why a caller with MULTIPLE restarts (run_pipeline_multi_seed's
+    own seed/lambda sweep) needs it to tell an improvement from a
+    regression before overwriting anything it's already holding onto. See
+    train_prediction_model's own docstring on why handing over `best_state`
+    here is cheap (no evaluation happens now).
     """
     num_layers = getattr(args, "num_layers", 1)
     if str(data.device) == "mps" and num_layers > 1:
@@ -2551,7 +2846,7 @@ def _train_and_evaluate(
 
     on_checkpoint_update = None
     if on_best_checkpoint is not None:
-        on_checkpoint_update = lambda epoch, best_state: on_best_checkpoint(model, data, args, epoch, best_state)  # noqa: E731
+        on_checkpoint_update = lambda epoch, best_state, best_score: on_best_checkpoint(model, data, args, epoch, best_state, best_score)  # noqa: E731
 
     _run_train_prediction_model(model, data, args, on_checkpoint_update=on_checkpoint_update)
     return evaluate_prediction_model(model, data, neutral_band=getattr(args, "neutral_band", 0.0))
@@ -2559,7 +2854,7 @@ def _train_and_evaluate(
 
 def continue_training(
     args: argparse.Namespace, base_model: PredictionModel,
-    on_best_checkpoint: Callable[[PredictionModel, "_PreparedData", argparse.Namespace, int, list], None] | None = None,
+    on_best_checkpoint: Callable[[PredictionModel, "_PreparedData", argparse.Namespace, int, list, float | None], None] | None = None,
 ) -> PredictionResult:
     """Warm-start training from an ALREADY-TRAINED model's weights
     (`base_model` - loaded by the caller, e.g. via load_prediction_model_auto)
@@ -2582,8 +2877,8 @@ def continue_training(
 
     Everything else - epochs, lr, weight_decay, bce_weight, sharpe_weight,
     sharpe_window, direction_horizon, checkpoint_metric, target_vol,
-    neutral_band, and the data window (years, cutoff_date, train_frac,
-    test_frac, device) - comes from `args`, exactly like a fresh training
+    neutral_band, signal_range, and the data window (years, cutoff_date,
+    train_frac, test_frac, device) - comes from `args`, exactly like a fresh training
     run (see _train_and_evaluate) - e.g. to continue training over freshly
     extended history, or with a different optimization objective, without
     touching what the network architecturally is. Optimizer momentum
@@ -2610,11 +2905,22 @@ def continue_training(
         n_attn_heads=base_model.n_attn_heads,
         cross_pairs=base_model.cross_pairs,
     ).to(data.device)
-    model.load_state_dict(base_model.state_dict())
+    # `base_model.risk_engine`, when set (a model loaded with one bundled -
+    # see PredictionModel._from_checkpoint), is a genuine registered
+    # nn.Module submodule of base_model, so base_model.state_dict() would
+    # otherwise include "risk_engine.*" keys here - `model` above is a
+    # FRESH PredictionModel with no risk_engine submodule (continue_training
+    # only ever warm-starts the base PREDICTOR's own weights - see this
+    # function's own docstring; a risk engine, if any, stays attached to
+    # `base_model` and is never copied forward here), so those keys would
+    # be genuinely "unexpected" to load_state_dict. Strip them - this is
+    # about warm-starting the predictor's own weights, not its risk engine.
+    own_state_dict = {k: v for k, v in base_model.state_dict().items() if not k.startswith("risk_engine.")}
+    model.load_state_dict(own_state_dict)
 
     on_checkpoint_update = None
     if on_best_checkpoint is not None:
-        on_checkpoint_update = lambda epoch, best_state: on_best_checkpoint(model, data, args, epoch, best_state)  # noqa: E731
+        on_checkpoint_update = lambda epoch, best_state, best_score: on_best_checkpoint(model, data, args, epoch, best_state, best_score)  # noqa: E731
 
     _run_train_prediction_model(model, data, args, on_checkpoint_update=on_checkpoint_update)
     return evaluate_prediction_model(model, data, neutral_band=getattr(args, "neutral_band", 0.0))
@@ -2679,6 +2985,7 @@ def summarize_checkpoint(
     direction_horizon = getattr(args, "direction_horizon", 5) or 5
     target_vol = getattr(args, "target_vol", None) or DEFAULT_TARGET_VOL
     cost_bps = getattr(args, "cost_bps", DEFAULT_COST_BPS)
+    signal_min, signal_max = resolve_signal_bounds(data.pairs, getattr(args, "signal_range", None))
     bce_weight = getattr(args, "bce_weight", 1.0)
     if isinstance(bce_weight, (list, tuple)):
         bce_weight = bce_weight[0] if bce_weight else 1.0
@@ -2701,7 +3008,8 @@ def summarize_checkpoint(
         probs = getattr(result, f"probabilities_{split}")
         next_returns = getattr(result, f"next_returns_{split}")
         portfolio = compute_portfolio(
-            apply_neutral_band(probs, band), next_returns, direction_horizon, target_vol, cost_bps=cost_bps,
+            probs, next_returns, direction_horizon, target_vol, cost_bps=cost_bps,
+            signal_min=signal_min, signal_max=signal_max, neutral_band=band,
         )
         pnl = portfolio["pnl_modulated"]
         sharpe = (
@@ -2740,6 +3048,12 @@ def load_pipeline(args: argparse.Namespace) -> PredictionResult:
         args, x_mean=model.x_mean, x_std=model.x_std, pairs=model.pairs, lookback=model.lookback,
         features=getattr(model, "features", None), cma_windows=getattr(model, "cma_windows", None),
         bandpass_windows=getattr(model, "bandpass_windows", None), bandpass_order=getattr(model, "bandpass_order", None),
+        # Recovered from the checkpoint, NOT from `args` - a mismatched
+        # rolling_stats_window would feed the network different feature
+        # values than it was trained on, and a mismatched direction_horizon
+        # would compare its forecast against the wrong realized outcome
+        # (see _prepare_data's own docstring and PredictionModel._checkpoint_dict).
+        direction_horizon=getattr(model, "direction_horizon", None), rolling_stats_window=getattr(model, "rolling_stats_window", None),
     )
     # load_prediction_model_auto reconstructs the checkpoint on CPU
     # (torch.load(..., map_location="cpu")) regardless of what device it
@@ -2766,7 +3080,7 @@ def run_pipeline(args: argparse.Namespace) -> PredictionResult:
 
 def run_pipeline_multi_seed(
     args: argparse.Namespace,
-    on_best_checkpoint: Callable[[PredictionModel, "_PreparedData", argparse.Namespace, int, list], None] | None = None,
+    on_best_checkpoint: Callable[[PredictionModel, "_PreparedData", argparse.Namespace, int, list, float | None], None] | None = None,
 ) -> PredictionResult:
     """Train `n_seeds` independent PredictionModels - each seed optionally
     SWEPT over every `bce_weight` value given (pass a list, e.g.

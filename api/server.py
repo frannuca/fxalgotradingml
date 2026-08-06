@@ -22,6 +22,11 @@ POST /api/evaluate            - load a model by name and run inference:
                                  matrices, cumulative-return series (with
                                  per-day hit/miss), and the model's
                                  predicted probabilities for the next day.
+POST /api/evaluate/{eval_id}/portfolio - recompute portfolio PnL/annual
+                                 Sharpe/today's position for a DIFFERENT
+                                 neutral band than the one POST /api/evaluate
+                                 used, from cached raw probabilities/returns
+                                 (no re-fetch, no model re-run).
 
 Run with (from the repo root):
     uvicorn api.server:app --reload --port 8000
@@ -41,17 +46,20 @@ from datetime import datetime
 from typing import Any
 
 import numpy as np
+import pandas as pd
 import torch
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+import models.risk_engine as risk_engine_module
 from data.db import get_connection
 from data.fx_downloader import MAJOR_FX_PAIRS
 from models.portfolio_lstm import (
     DEFAULT_BANDPASS_ORDER,
     DEFAULT_CONFIG,
     DEFAULT_FEATURES,
+    PredictionModel,
     TrainingStopped,
     _epoch_report_callback,
     _stop_check_callback,
@@ -59,8 +67,11 @@ from models.portfolio_lstm import (
     build_feature_dataframe,
     confusion_matrix_metrics,
     load_close_prices,
+    load_prediction_model_auto,
+    logger,
     prediction_model_name,
     probit,
+    resolve_signal_bounds,
     summarize_checkpoint,
     to_log_returns,
 )
@@ -141,13 +152,17 @@ def list_models() -> list[dict]:
 
     Also includes every other ARCHITECTURE-defining property (n_channels,
     hidden_size, num_layers, dropout, n_attn_heads, cross_pairs, features,
-    cma_windows, bandpass_windows, bandpass_order) plus neutral_band/
-    target_vol - not needed by the Evaluation view (which recovers them
-    server-side via the model's own checkpoint), but the Continue Training
-    view's whole point is showing a chosen model's full architecture
-    READ-ONLY (see /api/train's `continue_from`, which re-derives these
-    from the checkpoint itself server-side too - this payload is for
-    DISPLAY only, never trusted as a source of truth for training).
+    cma_windows, bandpass_windows, bandpass_order) plus every other
+    persisted, non-architecture model property (direction_horizon,
+    rolling_stats_window, neutral_band, target_vol, signal_range) - not
+    needed by the Evaluation view to actually RUN inference (it recovers
+    them server-side via the model's own checkpoint - see load_pipeline),
+    but both the Evaluation and Continue Training views' whole point in
+    showing this is transparency: a chosen model's full configuration
+    READ-ONLY (see /api/train's `continue_from`, which re-derives the
+    architecture fields from the checkpoint itself server-side too - this
+    payload is for DISPLAY only, never trusted as a source of truth for
+    training).
     """
     with get_connection() as conn, conn.cursor() as cur:
         cur.execute(
@@ -178,10 +193,35 @@ def list_models() -> list[dict]:
             "cma_windows": checkpoint.get("cma_windows"),
             "bandpass_windows": checkpoint.get("bandpass_windows"),
             "bandpass_order": checkpoint.get("bandpass_order"),
+            "direction_horizon": checkpoint.get("direction_horizon", 5),
+            "rolling_stats_window": checkpoint.get("rolling_stats_window", 20),
             "neutral_band": checkpoint.get("neutral_band"),
             "target_vol": checkpoint.get("target_vol"),
+            "signal_range": checkpoint.get("signal_range", {}),
+            "risk_engine": _risk_engine_summary(checkpoint.get("risk_engine")),
         })
     return result
+
+
+def _risk_engine_summary(risk_engine_checkpoint: dict | None) -> dict | None:
+    """DISPLAY-only summary of a model's attached RiskEngine (see
+    models/risk_engine.py), if any - None for a model with none. Used by
+    list_models() (so the frontend can show whether a model already has a
+    risk engine, and its own hyperparameters, without decoding the full
+    nested checkpoint itself) - never used server-side as a source of
+    truth for training (recompute_portfolio/evaluate() always reconstruct
+    the actual RiskEngine via PredictionModel._from_checkpoint instead).
+    """
+    if risk_engine_checkpoint is None:
+        return None
+    return {
+        "risk_lookback": risk_engine_checkpoint.get("risk_lookback"),
+        "risk_cma_windows": risk_engine_checkpoint.get("risk_cma_windows", []),
+        "risk_bandpass_windows": risk_engine_checkpoint.get("risk_bandpass_windows", []),
+        "risk_bandpass_order": risk_engine_checkpoint.get("risk_bandpass_order"),
+        "min_risk_att": risk_engine_checkpoint.get("min_risk_att"),
+        "max_risk_att": risk_engine_checkpoint.get("max_risk_att"),
+    }
 
 
 # --------------------------------------------------------------------------
@@ -207,6 +247,16 @@ _JOBS: dict[str, dict[str, Any]] = {}
 # summarize_checkpoint). Deliberately NOT part of _JOBS - see its own
 # comment on why.
 _BEST_CHECKPOINT_STATE: dict[str, dict[str, Any]] = {}
+
+# eval_id -> everything POST /api/evaluate/{eval_id}/portfolio needs to
+# recompute the portfolio PnL/annual Sharpe/today's position for a
+# DIFFERENT neutral band, without re-fetching data or re-running the model
+# (see evaluate()'s own comment on why the portfolio can't just use
+# whatever band the frontend's live-adjustable slider is currently at -
+# this cache is what lets the Evaluation view's slider actually move it).
+# Fine for a local, single-process dev server - see _JOBS's own comment on
+# the same tradeoff; no eviction.
+_EVAL_CACHE: dict[str, dict[str, Any]] = {}
 
 # Which job_id (if any) is training on the CURRENT thread - contextvars are
 # thread-local, and each training job runs its own dedicated background
@@ -308,9 +358,10 @@ class TrainRequest(BaseModel):
     # every architecture-defining property must match exactly, so none of
     # them are free parameters here) - only training-behavior fields
     # (epochs, lr, weight_decay, bce_weight, sharpe_weight, sharpe_window,
-    # direction_horizon, checkpoint_metric, neutral_band, target_vol) and
-    # the data window (years, cutoff_date, train_frac, test_frac, device)
-    # actually apply. `pairs` above may be sent as `[]` in this mode.
+    # direction_horizon, checkpoint_metric, neutral_band, target_vol,
+    # signal_range) and the data window (years, cutoff_date, train_frac,
+    # test_frac, device) actually apply. `pairs` above may be sent as `[]`
+    # in this mode.
     continue_from: str | None = None
     pairs: list[str]
     lookback: int = 30
@@ -326,10 +377,15 @@ class TrainRequest(BaseModel):
     train_frac: float = 0.8
     test_frac: float = 0.1
     direction_horizon: int = 5  # forward days the z-score label (see make_sequences) looks
-    rolling_stats_window: int = 20  # trailing window for rolling vol/skew/kurtosis input features + z-score label normalization
+    rolling_stats_window: int = 20  # trailing window for the "vol" input feature + z-score label normalization
     # Which per-pair input channels to build (see models/portfolio_lstm.py's
-    # FEATURE_CATALOG: "log_return", "vol", "skew", "kurt", "carry", "cma").
-    features: list[str] = ["log_return", "vol", "skew", "kurt"]
+    # FEATURE_CATALOG: "log_return", "vol", "carry", "cma", "bandpass").
+    # "skew"/"kurt" remain in FEATURE_CATALOG for backward compatibility
+    # with OLD checkpoints that still list them (build_feature_dataframe
+    # still knows how to build them), but are no longer offered as a
+    # default or a frontend option - they're risk-engine-exclusive inputs
+    # now (see models/risk_engine.py, `risk_rolling_stats_window` below).
+    features: list[str] = ["log_return", "vol"]
     cma_windows: list[list[int]] = []  # [[short, long], ...] - only used if "cma" is in `features`
     # (short, long) period-in-days pairs for a causal Butterworth band-pass
     # filter (see build_feature_dataframe's own bandpass_windows param) - a
@@ -384,6 +440,19 @@ class TrainRequest(BaseModel):
     # property of the model, persisted in its checkpoint alongside
     # neutral_band, not a free evaluation-time parameter.
     target_vol: float = DEFAULT_TARGET_VOL
+    # Per-asset (min, max) bounds the decision-day probability is linearly
+    # mapped into before multiplying the risk-parity baseline weight (see
+    # models/portfolio_lstm.py's resolve_signal_bounds and
+    # models/portfolio_pnl.py's compute_portfolio) - a {pair: [min, max]}
+    # dict, persisted in the checkpoint alongside target_vol/neutral_band.
+    # A pair missing from this dict defaults to (-1, 1) - the original
+    # fixed `(p - 0.5) * 2` signed-direction map. Narrowing the range
+    # changes what the value MEANS, not just its scale: e.g.
+    # {"EURUSD": [0.0, 1.0]} makes EURUSD long-only (a [0, 1] factor on the
+    # risk-parity weight, never negated) - an abstained day (p=0.5) then
+    # sizes a HALF-SIZE position rather than flat, since 0 is no longer the
+    # range's midpoint.
+    signal_range: dict[str, list[float]] = {}
     # Linear transaction cost (basis points per unit of daily position
     # change) charged in every reported portfolio PnL/Sharpe AND inside the
     # sharpe_weight training objective - see models/portfolio_pnl.py.
@@ -392,6 +461,42 @@ class TrainRequest(BaseModel):
     device: str = "auto"  # "auto" (Metal/MPS on Apple Silicon, else CUDA, else CPU), "cpu", "mps", or "cuda" - see get_device
     save_db: bool = True
     model_description: str = ""
+
+    # --- Optional risk-engine second phase (see models/risk_engine.py) ---
+    # When True, _run_training_job continues STRAIGHT into training a NEW
+    # RiskEngine on top of THIS run's own just-trained (frozen) prediction
+    # model, in the SAME job/thread, right after phase 1 finishes - no
+    # separate save/reload round trip, no separate job submission. The
+    # bundled result (predictor + risk engine together, under ONE model
+    # name) is exactly what a separate POST /api/train-risk-engine call
+    # would produce, just concatenated into one optimization run with
+    # phase-aware progress reporting (see _run_training_job's own
+    # `progress["phase"]`). POST /api/train-risk-engine (TrainRiskEngineRequest)
+    # remains available separately, for retrofitting a risk engine onto an
+    # ALREADY-SAVED model without retraining its predictor.
+    train_risk_engine: bool = False
+    risk_lookback: int = risk_engine_module.DEFAULT_RISK_LOOKBACK
+    # Trailing window (days) for the risk engine's OWN skew/kurtosis
+    # computation - see models/risk_engine.py's DEFAULT_RISK_ROLLING_STATS_WINDOW;
+    # independent of `rolling_stats_window` above, which only affects the
+    # per-asset predictor's own "vol" feature now (skew/kurt are
+    # risk-engine-exclusive inputs - see `features` above, which no longer
+    # offers them).
+    risk_rolling_stats_window: int = risk_engine_module.DEFAULT_RISK_ROLLING_STATS_WINDOW
+    risk_cma_windows: list[list[int]] = []
+    risk_bandpass_windows: list[list[int]] = []
+    risk_bandpass_order: int = DEFAULT_BANDPASS_ORDER
+    min_risk_att: float = risk_engine_module.DEFAULT_MIN_RISK_ATT
+    max_risk_att: float = risk_engine_module.DEFAULT_MAX_RISK_ATT
+    risk_hidden_size: int = risk_engine_module.DEFAULT_RISK_HIDDEN_SIZE
+    risk_num_layers: int = risk_engine_module.DEFAULT_RISK_NUM_LAYERS
+    risk_dropout: float = risk_engine_module.DEFAULT_RISK_DROPOUT
+    risk_n_attn_heads: int = risk_engine_module.DEFAULT_RISK_N_ATTN_HEADS
+    risk_epochs: int = 100
+    risk_lr: float = 1e-3
+    risk_weight_decay: float = 0.0
+    risk_sortino_window: int = risk_engine_module.DEFAULT_RISK_SORTINO_WINDOW
+    full_exposure_penalty: float = risk_engine_module.DEFAULT_FULL_EXPOSURE_PENALTY
 
 
 def _hit_rate_payload(pairs: list[str], hit_rate: np.ndarray) -> dict:
@@ -508,16 +613,32 @@ def _portfolio_payload(dates, pairs: list[str], portfolio: dict) -> dict:
     ACROSS pairs, per day, to top-level `cumulative_pnl_modulated` (the
     whole book), so the Evaluation page can plot per-asset contributions
     alongside the book total in the same chart.
+
+    If `portfolio` has a `"positions_risk_attenuated"` key (see
+    compute_portfolio's own `attenuation` param - only present when a
+    RiskEngine is attached, models/risk_engine.py), the SAME per-pair
+    `position_risk_attenuated`/`cumulative_pnl_risk_attenuated` and
+    top-level `cumulative_pnl_risk_attenuated` are included alongside the
+    existing modulated/baseline series - never REPLACING them, so the
+    Evaluation view can plot all three lines together.
     """
     payload: dict[str, Any] = {"dates": [str(d.date()) if hasattr(d, "date") else str(d) for d in dates]}
+    has_risk = "positions_risk_attenuated" in portfolio
     for i, pair in enumerate(pairs):
         payload[pair] = {
             "position_modulated": [None if np.isnan(v) else float(v) for v in portfolio["positions_modulated"][:, i]],
             "position_baseline": [None if np.isnan(v) else float(v) for v in portfolio["positions_baseline"][:, i]],
             "cumulative_pnl": portfolio["cumulative_pnl_per_asset_modulated"][:, i].tolist(),
         }
+        if has_risk:
+            payload[pair]["position_risk_attenuated"] = [
+                None if np.isnan(v) else float(v) for v in portfolio["positions_risk_attenuated"][:, i]
+            ]
+            payload[pair]["cumulative_pnl_risk_attenuated"] = portfolio["cumulative_pnl_per_asset_risk_attenuated"][:, i].tolist()
     payload["cumulative_pnl_modulated"] = portfolio["cumulative_pnl_modulated"].tolist()
     payload["cumulative_pnl_baseline"] = portfolio["cumulative_pnl_baseline"].tolist()
+    if has_risk:
+        payload["cumulative_pnl_risk_attenuated"] = portfolio["cumulative_pnl_risk_attenuated"].tolist()
     return payload
 
 
@@ -552,14 +673,30 @@ def _run_training_job(job_id: str, config: dict) -> None:
         `config["checkpoint_metric"]` - see _report_epoch's own docstring)
         let the Training view show the SAME "what is checkpoint selection
         actually optimizing" picture live, not just afterward.
+
+        `best_score` is scoped to the CURRENT restart only - it resets to
+        "no best yet" every time run_pipeline_multi_seed starts a new
+        seed/bce_weight combo (a fresh train_prediction_model call, its own
+        fresh best_val_loss/best_state - see that function's own
+        docstring), so on its own it can visibly DROP the moment a new
+        restart begins even though a stronger checkpoint from an earlier
+        restart still exists (and may still end up the one actually kept -
+        see run_pipeline_multi_seed's own seed-selection, which compares
+        validation BCE across restarts independently of checkpoint_metric).
+        `best_score_overall`, computed here from `job`'s own running
+        history rather than from train_prediction_model, is the running
+        best across EVERY restart this job has completed so far - never
+        decreases within a job - so the Training view can show a
+        genuinely monotonic "best so far" instead.
         """
         job = _JOBS.get(job_id)
         if job is None:
             return
+        checkpoint_metric = config.get("checkpoint_metric") or "val_loss"
         interim = {
-            "stage": stage, "epoch": epoch, "total_epochs": epochs,
+            "phase": "prediction", "stage": stage, "epoch": epoch, "total_epochs": epochs,
             "train_loss": train_loss, "train_hit_rate": train_hit_rate,
-            "checkpoint_metric": config.get("checkpoint_metric") or "val_loss",
+            "checkpoint_metric": checkpoint_metric,
         }
         if val_loss is not None:
             interim["val_loss"] = val_loss
@@ -570,27 +707,99 @@ def _run_training_job(job_id: str, config: dict) -> None:
             interim["val_sharpe"] = val_sharpe
         if best_score is not None:
             interim["best_score"] = best_score
+            # "hit_rate"/"sharpe" are MAXIMIZED; "val_loss" is MINIMIZED -
+            # same direction train_prediction_model's own score_i
+            # comparison uses (see its docstring), just applied here across
+            # restarts instead of across epochs within one.
+            higher_is_better = checkpoint_metric in ("hit_rate", "sharpe")
+            overall = job.get("best_score_overall")
+            if overall is None or (best_score > overall if higher_is_better else best_score < overall):
+                job["best_score_overall"] = best_score
+            interim["best_score_overall"] = job["best_score_overall"]
         job["interim"] = interim
         history = job.setdefault("interim_history", [])
         history.append(interim)
         if len(history) > 1000:
             del history[: len(history) - 1000]
 
-    def _on_best_checkpoint(model, data, run_args, epoch: int, best_state: list) -> None:
+    def _on_best_checkpoint(model, data, run_args, epoch: int, best_state: list, best_score: float | None) -> None:
         """Registered below via run_pipeline_multi_seed/continue_training's
         own `on_best_checkpoint` param - fires after every VALIDATED epoch
-        with (that call's own model/data/args, the epoch, best_state) - see
-        models/portfolio_lstm.py's train_prediction_model docstring on why
-        this is cheap (no evaluation happens here, just storing references
-        for POST /api/train/{job_id}/save-best to build a full snapshot
-        from ON DEMAND, only when a user actually clicks "Save best model
-        so far" - not on every epoch).
+        with (that call's own model/data/args, the epoch, best_state,
+        best_score) - see models/portfolio_lstm.py's train_prediction_model
+        docstring on why this is cheap (no evaluation happens here, just
+        storing references for POST /api/train/{job_id}/save-best to build
+        a full snapshot from ON DEMAND, only when a user actually clicks
+        "Save best model so far" - not on every epoch).
+
+        BUG THIS FIXES: `best_state` here is scoped to whichever restart is
+        CURRENTLY running (see train_prediction_model's own docstring) -
+        with n_seeds/a bce_weight sweep > 1, this fires for EVERY restart
+        in turn, and an earlier restart's genuinely BETTER best_state must
+        not be silently replaced by a later restart's own (possibly worse,
+        especially early in ITS OWN training) current best just because it
+        happened to fire more recently. Previously this function
+        overwrote `_BEST_CHECKPOINT_STATE[job_id]` unconditionally on every
+        call - so "Save best model so far" could save a checkpoint visibly
+        WORSE than the "best so far" figure the Training view was showing
+        (which already correctly tracks the true cross-restart best via
+        `job["best_score_overall"]` - see _interim_callback above): the
+        display and the save were reading from two different notions of
+        "best". Now this compares `best_score` against whatever score is
+        already stored before overwriting, using the SAME higher-is-
+        better/lower-is-better direction _interim_callback uses - so
+        _BEST_CHECKPOINT_STATE[job_id] can only ever improve within a job,
+        exactly like the display.
         """
-        if job_id not in _JOBS:
+        job = _JOBS.get(job_id)
+        if job is None or best_score is None:
             return
+        checkpoint_metric = getattr(run_args, "checkpoint_metric", "val_loss") or "val_loss"
+        higher_is_better = checkpoint_metric in ("hit_rate", "sharpe")
+        stored = _BEST_CHECKPOINT_STATE.get(job_id)
+        if stored is not None:
+            stored_score = stored["score"]
+            improved = best_score > stored_score if higher_is_better else best_score < stored_score
+            if not improved:
+                return
         _BEST_CHECKPOINT_STATE[job_id] = {
             "model": model, "data": data, "args": run_args, "epoch": epoch, "best_state": best_state,
+            "score": best_score,
         }
+        # Keep the DISPLAYED "best so far" (see _interim_callback) in sync
+        # immediately - this fires every validated epoch, more often than
+        # _interim_callback's own sparse ~10%-of-epochs cadence, so it's
+        # frequently the FIRST to see a genuine new best.
+        overall = job.get("best_score_overall")
+        if overall is None or (best_score > overall if higher_is_better else best_score < overall):
+            job["best_score_overall"] = best_score
+
+    def _on_risk_epoch(epoch: int, epochs: int, train_sortino: float | None, val_sortino: float | None, best_val_sortino: float | None) -> None:
+        """Registered as train_risk_engine's own `on_epoch` for this job's
+        OPTIONAL phase 2 (see `config["train_risk_engine"]` below) - same
+        shape as standalone _run_risk_engine_job's own `_on_epoch`, except
+        `job["progress"]`/`job["interim"]` here carry a `"phase":
+        "risk_engine"` tag (set once, right before this phase starts - see
+        below) so the SAME polling payload phase 1 already used can tell
+        the Training view which phase is live without a second job/poll.
+        """
+        job = _JOBS.get(job_id)
+        if job is None:
+            return
+        progress = job["progress"]
+        progress["epoch"] = epoch
+        progress["total_epochs"] = epochs
+        progress["percent"] = round(epoch / max(epochs, 1) * 100, 1)
+        interim = {
+            "phase": "risk_engine",
+            "epoch": epoch, "total_epochs": epochs,
+            "train_sortino": train_sortino, "val_sortino": val_sortino, "best_val_sortino": best_val_sortino,
+        }
+        job["interim"] = interim
+        history = job.setdefault("interim_history", [])
+        history.append(interim)
+        if len(history) > 1000:
+            del history[: len(history) - 1000]
 
     _epoch_report_callback.set(_interim_callback)
     _stop_check_callback.set(lambda: _JOBS.get(job_id, {}).get("stop_requested", False))
@@ -636,11 +845,52 @@ def _run_training_job(job_id: str, config: dict) -> None:
 
             result = run_pipeline_multi_seed(args, on_best_checkpoint=_on_best_checkpoint)
         pairs = result.pairs
+
+        # --- Optional phase 2: risk engine (see TrainRequest.train_risk_engine) ---
+        # Trained INSIDE this same job/thread, right after phase 1 - no
+        # separate save/reload round trip. `result.model` itself doesn't
+        # carry x_mean/x_std/features/etc as instance attributes (those
+        # only get set by PredictionModel._from_checkpoint, i.e. after a
+        # save/load round trip - see that method's own docstring); rather
+        # than duplicate its attribute list here, build the SAME checkpoint
+        # dict save_model()/save_to_db() below use and reconstruct through
+        # _from_checkpoint - purely in-memory (no disk I/O), and guaranteed
+        # to stay consistent with save/load if that attribute list ever
+        # changes.
+        risk_engine_trained = None
+        risk_engine_summary = None
+        if getattr(args, "train_risk_engine", False):
+            logger.info("Phase 1 (prediction model) complete - continuing with phase 2 (risk engine)")
+            frozen_checkpoint = result.model._checkpoint_dict(
+                x_mean=result.x_mean, x_std=result.x_std, pairs=result.pairs, lookback=result.lookback,
+                features=args.features, cma_windows=args.cma_windows,
+                sigma_hat=result.sigma_hat, neutral_band=result.neutral_band, target_vol=args.target_vol,
+                bandpass_windows=args.bandpass_windows, bandpass_order=args.bandpass_order,
+                signal_range=args.signal_range,
+                direction_horizon=args.direction_horizon, rolling_stats_window=args.rolling_stats_window,
+            )
+            frozen_base = PredictionModel._from_checkpoint(frozen_checkpoint)
+            progress = _JOBS[job_id]["progress"]
+            progress["phase"] = "risk_engine"
+            progress["phase_index"] = 2
+            progress["epoch"] = 0
+            progress["total_epochs"] = getattr(args, "risk_epochs", None) or 100
+            progress["percent"] = 0.0
+            risk_engine_trained, risk_engine_summary = risk_engine_module.train_risk_engine(
+                frozen_base, args, on_epoch=_on_risk_epoch,
+                stop_check=lambda: _JOBS.get(job_id, {}).get("stop_requested", False),
+            )
+            progress["epoch"] = progress["total_epochs"]
+            progress["percent"] = 100.0
+
         result.model.save_model(
             x_mean=result.x_mean, x_std=result.x_std, pairs=result.pairs, lookback=result.lookback,
             features=args.features, cma_windows=args.cma_windows,
             sigma_hat=result.sigma_hat, neutral_band=result.neutral_band, target_vol=args.target_vol,
             bandpass_windows=args.bandpass_windows, bandpass_order=args.bandpass_order,
+            signal_range=args.signal_range,
+            direction_horizon=args.direction_horizon, rolling_stats_window=args.rolling_stats_window,
+            risk_engine=risk_engine_trained,
         )
 
         if continue_from:
@@ -660,6 +910,9 @@ def _run_training_job(job_id: str, config: dict) -> None:
                 features=args.features, cma_windows=args.cma_windows, description=args.model_description,
                 sigma_hat=result.sigma_hat, neutral_band=result.neutral_band, target_vol=args.target_vol,
                 bandpass_windows=args.bandpass_windows, bandpass_order=args.bandpass_order,
+                signal_range=args.signal_range,
+                direction_horizon=args.direction_horizon, rolling_stats_window=args.rolling_stats_window,
+                risk_engine=risk_engine_trained,
             )
 
         # Portfolio PnL + per-year Sharpe (see models/portfolio_pnl.py) for
@@ -671,17 +924,18 @@ def _run_training_job(job_id: str, config: dict) -> None:
         target_vol = args.target_vol
         cost_bps = getattr(args, "cost_bps", DEFAULT_COST_BPS)
         band = result.neutral_band
+        signal_min, signal_max = resolve_signal_bounds(pairs, args.signal_range)
         portfolio_train = compute_portfolio(
-            apply_neutral_band(result.probabilities_train, band), result.next_returns_train, direction_horizon, target_vol,
-            cost_bps=cost_bps,
+            result.probabilities_train, result.next_returns_train, direction_horizon, target_vol,
+            cost_bps=cost_bps, signal_min=signal_min, signal_max=signal_max, neutral_band=band,
         )
         portfolio_val = compute_portfolio(
-            apply_neutral_band(result.probabilities_val, band), result.next_returns_val, direction_horizon, target_vol,
-            cost_bps=cost_bps,
+            result.probabilities_val, result.next_returns_val, direction_horizon, target_vol,
+            cost_bps=cost_bps, signal_min=signal_min, signal_max=signal_max, neutral_band=band,
         )
         portfolio_test = compute_portfolio(
-            apply_neutral_band(result.probabilities_test, band), result.next_returns_test, direction_horizon, target_vol,
-            cost_bps=cost_bps,
+            result.probabilities_test, result.next_returns_test, direction_horizon, target_vol,
+            cost_bps=cost_bps, signal_min=signal_min, signal_max=signal_max, neutral_band=band,
         )
 
         _JOBS[job_id]["result"] = {
@@ -724,6 +978,13 @@ def _run_training_job(job_id: str, config: dict) -> None:
                 "val": annual_sharpe_table(result.dates_val, portfolio_val["pnl_modulated"], portfolio_val["pnl_baseline"]),
                 "test": annual_sharpe_table(result.dates_test, portfolio_test["pnl_modulated"], portfolio_test["pnl_baseline"]),
             },
+            # Only present when train_risk_engine was set - see phase 2
+            # above. The Evaluation view's risk-attenuated PnL series come
+            # from re-running evaluate_risk_engine on the SAVED model
+            # (models.risk_engine attached under this same name) rather
+            # than from here - this is just the final train/val Sortino a
+            # user can read off right after training finishes.
+            "risk_engine": risk_engine_summary,
         }
 
         # The last CAPTURED epoch log line may fall short of the true final
@@ -762,6 +1023,14 @@ def start_training(req: TrainRequest) -> dict:
             "lambda_index": 1, "n_lambdas": n_lambdas,
             "epoch": 0, "total_epochs": req.epochs,
             "percent": 0.0,
+            # "prediction" (phase 1) throughout, unless train_risk_engine
+            # is set, in which case _run_training_job switches this to
+            # "risk_engine" once phase 1 finishes - see its own
+            # _on_risk_epoch. n_phases/phase_index let the Training view
+            # show "Phase 2/2" without guessing from `phase` alone.
+            "phase": "prediction",
+            "n_phases": 2 if req.train_risk_engine else 1,
+            "phase_index": 1,
         },
         "interim": None,  # live train/val loss+hit-rate snapshot, updated during training - see _run_training_job
         "interim_history": [],
@@ -840,8 +1109,169 @@ def save_best_checkpoint(job_id: str) -> dict:
         features=run_args.features, cma_windows=run_args.cma_windows, description=run_args.model_description,
         sigma_hat=result.sigma_hat, neutral_band=result.neutral_band, target_vol=run_args.target_vol,
         bandpass_windows=run_args.bandpass_windows, bandpass_order=run_args.bandpass_order,
+        signal_range=getattr(run_args, "signal_range", None),
+        direction_horizon=getattr(run_args, "direction_horizon", 5) or 5,
+        rolling_stats_window=getattr(run_args, "rolling_stats_window", 20) or 20,
     )
     return {"model_name": name, "epoch": state["epoch"], "summary": summary}
+
+
+# --------------------------------------------------------------------------
+# POST /api/train-risk-engine
+# --------------------------------------------------------------------------
+
+class TrainRiskEngineRequest(BaseModel):
+    """Train a NEW RiskEngine (see models/risk_engine.py) on top of an
+    already-trained, EXISTING PredictionModel, which is used strictly
+    FROZEN throughout - see train_risk_engine's own docstring on why this
+    is a separate second stage, not a joint retraining. The result is
+    saved as a NEW model (base predictor + attached risk engine bundled
+    together - see PredictionModel._checkpoint_dict's own `risk_engine`
+    key), never overwriting `base_model`.
+    """
+
+    base_model: str  # a quant.model_registry name or local .pt path
+    years: int = 8
+    cutoff_date: str | None = None
+    train_frac: float = 0.8
+    test_frac: float = 0.1
+    device: str = "auto"
+    risk_lookback: int = risk_engine_module.DEFAULT_RISK_LOOKBACK
+    # Trailing window (days) for the risk engine's OWN skew/kurtosis
+    # computation - INDEPENDENT of the base predictor's own
+    # rolling_stats_window (see models/risk_engine.py's own
+    # DEFAULT_RISK_ROLLING_STATS_WINDOW comment: skew/kurtosis are
+    # risk-engine-exclusive inputs now, so there's no reason to couple the
+    # two windows).
+    risk_rolling_stats_window: int = risk_engine_module.DEFAULT_RISK_ROLLING_STATS_WINDOW
+    # (short, long) window pairs - independent of, and in addition to,
+    # whatever the base predictor's OWN cma_windows/bandpass_windows are -
+    # see models/risk_engine.py's own module docstring.
+    risk_cma_windows: list[list[int]] = []
+    risk_bandpass_windows: list[list[int]] = []
+    risk_bandpass_order: int = DEFAULT_BANDPASS_ORDER
+    # Per-asset attenuation bounds - see models/risk_engine.py's own
+    # attenuation_from_raw. (0, 1) (the default) can only REDUCE exposure,
+    # never amplify it.
+    min_risk_att: float = risk_engine_module.DEFAULT_MIN_RISK_ATT
+    max_risk_att: float = risk_engine_module.DEFAULT_MAX_RISK_ATT
+    risk_hidden_size: int = risk_engine_module.DEFAULT_RISK_HIDDEN_SIZE
+    risk_num_layers: int = risk_engine_module.DEFAULT_RISK_NUM_LAYERS
+    risk_dropout: float = risk_engine_module.DEFAULT_RISK_DROPOUT
+    risk_n_attn_heads: int = risk_engine_module.DEFAULT_RISK_N_ATTN_HEADS
+    risk_epochs: int = 100
+    risk_lr: float = 1e-3
+    risk_weight_decay: float = 0.0
+    # Chunk size (days, in DECISION-day units - see
+    # models/risk_engine.py's own train_risk_engine docstring) each
+    # non-overlapping period Sortino is computed over.
+    risk_sortino_window: int = risk_engine_module.DEFAULT_RISK_SORTINO_WINDOW
+    # Regularizes the engine's own output toward max_risk_att (full
+    # exposure) - see models/risk_engine.py's own module docstring on why
+    # a risk-reduction overlay needs this anchor by default.
+    full_exposure_penalty: float = risk_engine_module.DEFAULT_FULL_EXPOSURE_PENALTY
+    cost_bps: float = DEFAULT_COST_BPS
+    save_db: bool = True
+    model_description: str = ""
+
+
+def _run_risk_engine_job(job_id: str, config: dict) -> None:
+    """Runs on a background thread, same shape as _run_training_job (see
+    its own docstring) - reuses the SAME `_JOBS` dict, GET /api/train/{job_id}
+    polling endpoint, and POST /api/train/{job_id}/stop endpoint, since a
+    risk-engine job's `status`/`progress`/`interim`/`logs`/`stop_requested`
+    fields are structurally identical; only `interim`'s own CONTENTS differ
+    (train/val Sortino here, not NLL+BCE+Sharpe - see
+    models/risk_engine.py's train_risk_engine `on_epoch` callback).
+    """
+    _current_job_id.set(job_id)
+
+    def _on_epoch(epoch, epochs, train_sortino, val_sortino, best_val_sortino) -> None:
+        job = _JOBS.get(job_id)
+        if job is None:
+            return
+        progress = job["progress"]
+        progress["epoch"] = epoch
+        progress["total_epochs"] = epochs
+        progress["percent"] = round(epoch / max(epochs, 1) * 100, 1)
+        interim = {
+            "epoch": epoch, "total_epochs": epochs,
+            "train_sortino": train_sortino, "val_sortino": val_sortino, "best_val_sortino": best_val_sortino,
+        }
+        job["interim"] = interim
+        history = job.setdefault("interim_history", [])
+        history.append(interim)
+        if len(history) > 1000:
+            del history[: len(history) - 1000]
+
+    _stop_check_callback.set(lambda: _JOBS.get(job_id, {}).get("stop_requested", False))
+    _JOBS[job_id]["status"] = "running"
+    try:
+        base_model = load_prediction_model_auto(config["base_model"])
+        args = Namespace(**{**DEFAULT_CONFIG, **config})
+        base_name = os.path.splitext(os.path.basename(config["base_model"]))[0]
+        _JOBS[job_id]["model_base_name"] = base_name
+
+        engine, summary = risk_engine_module.train_risk_engine(
+            base_model, args, on_epoch=_on_epoch, stop_check=lambda: _JOBS.get(job_id, {}).get("stop_requested", False),
+        )
+
+        # Distinct from base_model's own name, suffixed with THIS run's own
+        # finish time - never overwrites the base predictor (same naming
+        # discipline as continue_training's own resave - see
+        # _run_training_job).
+        name = f"{base_name}_risk_{datetime.now().strftime('%Y%m%dT%H%M%S')}"
+        save_kwargs = dict(
+            x_mean=base_model.x_mean, x_std=base_model.x_std, pairs=base_model.pairs, lookback=base_model.lookback,
+            features=base_model.features, cma_windows=base_model.cma_windows,
+            sigma_hat=base_model.sigma_hat, neutral_band=base_model.neutral_band, target_vol=base_model.target_vol,
+            bandpass_windows=base_model.bandpass_windows, bandpass_order=base_model.bandpass_order,
+            signal_range=getattr(base_model, "signal_range", None),
+            direction_horizon=base_model.direction_horizon, rolling_stats_window=base_model.rolling_stats_window,
+            risk_engine=engine,
+        )
+        base_model.save_model(**save_kwargs)
+        if args.save_db:
+            base_model.save_to_db(name, description=args.model_description, **save_kwargs)
+
+        _JOBS[job_id]["result"] = {
+            "model_name": name, "base_model": config["base_model"],
+            "train_sortino": summary["train_sortino"], "val_sortino": summary["val_sortino"],
+        }
+        progress = _JOBS[job_id]["progress"]
+        progress["epoch"] = progress["total_epochs"]
+        progress["percent"] = 100.0
+        _JOBS[job_id]["status"] = "done"
+    except TrainingStopped:
+        _JOBS[job_id]["status"] = "stopped"
+    except Exception as exc:  # noqa: BLE001 - surface any failure to the polling client
+        _JOBS[job_id]["status"] = "error"
+        _JOBS[job_id]["error"] = str(exc)
+
+
+@app.post("/api/train-risk-engine")
+def start_risk_engine_training(req: TrainRiskEngineRequest) -> dict:
+    """Kick off risk-engine training on a background thread - see
+    _run_risk_engine_job. Polled/stopped via the SAME GET /api/train/{job_id}
+    and POST /api/train/{job_id}/stop endpoints a normal training job uses.
+    """
+    job_id = str(uuid.uuid4())
+    _JOBS[job_id] = {
+        "status": "pending",
+        "result": None,
+        "error": None,
+        "logs": [],
+        "progress": {
+            "seed_index": 1, "n_seeds": 1, "lambda_index": 1, "n_lambdas": 1,
+            "epoch": 0, "total_epochs": req.risk_epochs, "percent": 0.0,
+        },
+        "interim": None,
+        "interim_history": [],
+        "stop_requested": False,
+    }
+    thread = threading.Thread(target=_run_risk_engine_job, args=(job_id, req.model_dump()), daemon=True)
+    thread.start()
+    return {"job_id": job_id}
 
 
 # --------------------------------------------------------------------------
@@ -877,7 +1307,7 @@ class EvaluateRequest(BaseModel):
     cost_bps: float = DEFAULT_COST_BPS
 
 
-def _predict_latest_probabilities(args: Namespace, model) -> dict[str, float]:
+def _predict_latest_probabilities(args: Namespace, model) -> tuple[dict[str, float], str]:
     """Compute the model's predicted probability for the NEXT (as-yet-
     unrealized) `direction_horizon`-day-forward outcome, using the most
     recent `lookback`-day window of real data - distinct from the
@@ -889,6 +1319,17 @@ def _predict_latest_probabilities(args: Namespace, model) -> dict[str, float]:
     model's own checkpoint - rather than anything from
     the request, so the fetched data, window length, and returned feature
     set always match what the model was actually trained on.
+
+    Returns `(probabilities, as_of_date)`: `as_of_date` is the most recent
+    date with a REAL realized close (the last row of `returns`, i.e. the
+    lookback window's own last day) - the day the model is actually
+    treating as "today" when it reports these probabilities, which can lag
+    behind the calendar date this endpoint is called on (a weekend, a
+    holiday, or `cutoff_date`/stale quotes - see /api/quotes/refresh). The
+    forecast itself is for the `direction_horizon` TRADING days after this
+    date, not a specific calendar date (holidays/weekends make that exact
+    date caller-dependent, so it's left to the frontend to describe
+    relative to `as_of_date` rather than computed here).
     """
     pairs = model.pairs
     lookback = model.lookback
@@ -903,7 +1344,10 @@ def _predict_latest_probabilities(args: Namespace, model) -> dict[str, float]:
     cma_windows = getattr(model, "cma_windows", None) or []
     bandpass_windows = getattr(model, "bandpass_windows", None) or []
     bandpass_order = getattr(model, "bandpass_order", None) or DEFAULT_BANDPASS_ORDER
-    rolling_stats_window = getattr(args, "rolling_stats_window", 20) or 20
+    # From the model's own checkpoint, NOT the request - rolling_stats_window
+    # changes the actual feature values (rolling vol/skew/kurt) the network
+    # reads; a mismatch here would feed it data unlike anything it trained on.
+    rolling_stats_window = getattr(model, "rolling_stats_window", 20) or 20
     min_days = lookback + rolling_stats_window
     cutoff_date = getattr(args, "cutoff_date", None)
 
@@ -941,7 +1385,72 @@ def _predict_latest_probabilities(args: Namespace, model) -> dict[str, float]:
     # apply_neutral_band): inside the band the model reports exactly 0.5 -
     # an explicit "no call today", not a weak directional lean.
     probs = apply_neutral_band(probs, getattr(model, "neutral_band", 0.0))
-    return {pair: float(p) for pair, p in zip(pairs, probs[0])}
+    as_of_date = str(returns.index[-1].date()) if hasattr(returns.index[-1], "date") else str(returns.index[-1])
+    return {pair: float(p) for pair, p in zip(pairs, probs[0])}, as_of_date
+
+
+def _compute_portfolio_and_today(
+    probabilities: np.ndarray, next_returns: np.ndarray, latest_probabilities_array: np.ndarray,
+    direction_horizon: int, target_vol: float, cost_bps: float, signal_min: np.ndarray, signal_max: np.ndarray,
+    band: float, dates: pd.DatetimeIndex, risk_engine, returns_df: pd.DataFrame | None,
+) -> tuple[dict, dict, np.ndarray | None]:
+    """Shared by evaluate()/recompute_portfolio: compute_portfolio +
+    latest_position, PLUS (if `risk_engine` is given - an already-trained
+    RiskEngine, see models/risk_engine.py) a SECOND pass that additionally
+    reports a risk-attenuated series.
+
+    Two passes, not one, because the risk engine's own input is the
+    prediction stage's OWN `positions_modulated` (see
+    models/risk_engine.py's own module docstring on why attenuation must
+    be computed FROM an already-fully-formed position, not folded into
+    computing it) - the first pass produces that; the second re-runs
+    compute_portfolio/latest_position WITH the resulting attenuation
+    applied. `returns_df` (raw log returns, needed for the risk engine's
+    own skew/kurt/CMA/bandpass inputs) is REQUIRED whenever `risk_engine`
+    is given.
+
+    "Today"'s own attenuation is computed by appending `today`'s own
+    (pre-attenuation) position as one more day onto the historical
+    `positions_modulated` series (see models/risk_engine.py's
+    evaluate_risk_engine's own docstring on why a synthetic date past
+    `returns_df`'s own last row is safe here - its own ffill carries the
+    last REAL day's skew/kurt/CMA/bandpass forward) - the same
+    "positions and dates get an extra placeholder day" pattern
+    models/portfolio_pnl.py's own latest_position already uses for
+    `next_returns`.
+
+    Returns `(portfolio, today, attenuation_hist_or_None)` - the third
+    element lets a caller (see _EVAL_CACHE) cache the historical
+    attenuation series without recomputing it from scratch elsewhere.
+    """
+    portfolio = compute_portfolio(
+        probabilities, next_returns, direction_horizon, target_vol, cost_bps=cost_bps,
+        signal_min=signal_min, signal_max=signal_max, neutral_band=band,
+    )
+    today = latest_position(
+        probabilities, next_returns, latest_probabilities_array, direction_horizon, target_vol,
+        signal_min=signal_min, signal_max=signal_max, neutral_band=band,
+    )
+    if risk_engine is None:
+        return portfolio, today, None
+
+    from models.risk_engine import evaluate_risk_engine
+
+    extended_positions = np.vstack([portfolio["positions_modulated"], today["position_modulated"].reshape(1, -1)])
+    extended_dates = dates.append(pd.DatetimeIndex([dates[-1] + pd.Timedelta(days=1)]))
+    attenuation_full = evaluate_risk_engine(risk_engine, extended_positions, returns_df, extended_dates)
+    attenuation_hist, attenuation_today = attenuation_full[:-1], attenuation_full[-1]
+
+    portfolio = compute_portfolio(
+        probabilities, next_returns, direction_horizon, target_vol, cost_bps=cost_bps,
+        signal_min=signal_min, signal_max=signal_max, neutral_band=band, attenuation=attenuation_hist,
+    )
+    today = latest_position(
+        probabilities, next_returns, latest_probabilities_array, direction_horizon, target_vol,
+        signal_min=signal_min, signal_max=signal_max, neutral_band=band,
+        attenuation=attenuation_hist, latest_attenuation=attenuation_today,
+    )
+    return portfolio, today, attenuation_hist
 
 
 @app.post("/api/evaluate")
@@ -970,6 +1479,10 @@ def evaluate(req: EvaluateRequest) -> dict:
       - latest_position: today's not-yet-booked position per asset (same
         modulated/baseline split) alongside the probability it was sized
         from - what a trader would book for today's EoD.
+      - eval_id: opaque key for POST /api/evaluate/{eval_id}/portfolio,
+        which recomputes portfolio/annual_sharpe/latest_position for a
+        DIFFERENT neutral band without re-fetching data or re-running the
+        model - see that endpoint and _EVAL_CACHE's own comment.
 
     `pairs` and `lookback` are deliberately NOT accepted from `req` - both
     are recovered from the loaded model's own checkpoint (see
@@ -996,44 +1509,86 @@ def evaluate(req: EvaluateRequest) -> dict:
 
         result = run_pipeline_multi_seed(args)  # load_model set -> pure inference, no training
         pairs = result.pairs
-        latest_probabilities = _predict_latest_probabilities(args, result.model)
+        latest_probabilities, latest_as_of_date = _predict_latest_probabilities(args, result.model)
 
         # Portfolio PnL (see models/portfolio_pnl.py): risk-parity weights
         # modulated by the model's own probabilities, scaled to the
         # model's own persisted target_vol (a checkpoint property, like
         # neutral_band - see PredictionModel._checkpoint_dict). Uses the
-        # RAW probabilities with the model's persisted neutral_band
-        # applied (an explicit "no view" -> flat position for that pair,
-        # NOT the frontend's live-adjustable display band - sizing a real
-        # position needs one fixed, reported value, not something that
-        # changes as the user drags a slider).
-        direction_horizon = getattr(args, "direction_horizon", 5) or 5
+        # model's own persisted neutral_band as the INITIAL value - an
+        # in-band day rides the unmodulated risk-parity weight (see
+        # compute_portfolio's own docstring) - the frontend's
+        # live-adjustable display band can recompute this against a
+        # DIFFERENT band via POST /api/evaluate/{eval_id}/portfolio (see
+        # _EVAL_CACHE) without a full re-run, so a band change actually
+        # moves the PnL/positions below, not just hit rate/confusion matrix.
+        direction_horizon = getattr(result.model, "direction_horizon", 5) or 5
         target_vol = getattr(result.model, "target_vol", DEFAULT_TARGET_VOL)
         band = result.neutral_band
-        banded_probabilities = apply_neutral_band(result.probabilities_train, band)
-        portfolio = compute_portfolio(
-            banded_probabilities, result.next_returns_train, direction_horizon, target_vol, cost_bps=req.cost_bps,
-        )
+        signal_min, signal_max = resolve_signal_bounds(pairs, getattr(result.model, "signal_range", None))
         latest_probabilities_array = np.array([latest_probabilities[p] for p in pairs], dtype=np.float32)
-        today = latest_position(
-            banded_probabilities, result.next_returns_train, latest_probabilities_array, direction_horizon, target_vol,
+
+        risk_engine = getattr(result.model, "risk_engine", None)
+        returns_df = None
+        if risk_engine is not None:
+            # Raw log returns - the risk engine's own skew/kurt/CMA/bandpass
+            # inputs (see models/risk_engine.py) - a cheap extra Postgres
+            # read (see load_close_prices), not a live API call.
+            prices = load_close_prices(pairs, years=req.years, cutoff_date=req.cutoff_date)
+            returns_df = to_log_returns(prices)
+
+        portfolio, today, attenuation_hist = _compute_portfolio_and_today(
+            result.probabilities_train, result.next_returns_train, latest_probabilities_array, direction_horizon,
+            target_vol, req.cost_bps, signal_min, signal_max, band, result.dates_train, risk_engine, returns_df,
         )
 
+        eval_id = str(uuid.uuid4())
+        _EVAL_CACHE[eval_id] = {
+            "pairs": pairs,
+            "probabilities_train": result.probabilities_train,
+            "next_returns_train": result.next_returns_train,
+            "dates_train": result.dates_train,
+            "direction_horizon": direction_horizon,
+            "target_vol": target_vol,
+            "cost_bps": req.cost_bps,
+            "signal_min": signal_min,
+            "signal_max": signal_max,
+            "latest_probabilities": latest_probabilities,
+            "latest_probabilities_array": latest_probabilities_array,
+            "risk_engine": risk_engine,
+            "returns_df": returns_df,
+        }
+
         return {
+            "eval_id": eval_id,
             "pairs": pairs,
             "latest_probabilities": latest_probabilities,
+            # The most recent date with a REAL realized close - the day the
+            # model is treating as "today" (its lookback window's last day)
+            # when it reports latest_probabilities/latest_position below -
+            # see _predict_latest_probabilities's own docstring on why this
+            # can lag the calendar date this endpoint is called on.
+            "latest_as_of_date": latest_as_of_date,
             "neutral_band": result.neutral_band,  # initial value for the frontend's neutral-band control - see start_training's result dict
             "target_vol": target_vol,
+            "signal_range": getattr(result.model, "signal_range", {}),
+            "direction_horizon": direction_horizon,
+            "rolling_stats_window": getattr(result.model, "rolling_stats_window", 20) or 20,
             "latest_position": {
                 pair: {
                     "position_modulated": float(today["position_modulated"][i]),
                     "position_baseline": float(today["position_baseline"][i]),
+                    **({"position_risk_attenuated": float(today["position_risk_attenuated"][i])} if risk_engine is not None else {}),
                     "probability": latest_probabilities[pair],
                 }
                 for i, pair in enumerate(pairs)
             },
+            "has_risk_engine": risk_engine is not None,
             "portfolio": _portfolio_payload(result.dates_train, pairs, portfolio),
-            "annual_sharpe": annual_sharpe_table(result.dates_train, portfolio["pnl_modulated"], portfolio["pnl_baseline"]),
+            "annual_sharpe": annual_sharpe_table(
+                result.dates_train, portfolio["pnl_modulated"], portfolio["pnl_baseline"],
+                portfolio.get("pnl_risk_attenuated"),
+            ),
             "hit_rate": _hit_rate_payload(pairs, result.hit_rate_train),
             "confusion_matrix": _confusion_matrix_payload(pairs, result.probabilities_train, result.direction_labels_train, result.neutral_band),
             "cumulative_returns": _cumulative_return_payload(result.dates_train, pairs, result.next_returns_train),
@@ -1047,3 +1602,54 @@ def evaluate(req: EvaluateRequest) -> dict:
         # clear, actionable error from load_pipeline/
         # _predict_latest_probabilities, not a 500.
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+class RecomputePortfolioRequest(BaseModel):
+    neutral_band: float
+
+
+@app.post("/api/evaluate/{eval_id}/portfolio")
+def recompute_portfolio(eval_id: str, req: RecomputePortfolioRequest) -> dict:
+    """Recompute portfolio/annual_sharpe/latest_position for a DIFFERENT
+    neutral band than whatever POST /api/evaluate originally used, from
+    the cached raw probabilities/returns it stored under `eval_id` (see
+    _EVAL_CACHE) - no data re-fetch, no model forward pass, just re-running
+    compute_portfolio/latest_position/annual_sharpe_table on already-
+    computed arrays, so this is cheap enough to call on every tick of the
+    Evaluation view's neutral-band slider.
+
+    Inside the band, compute_portfolio treats that day as having no view -
+    the position rides the UNMODULATED risk-parity weight (see its own
+    docstring) rather than a directional bet, so widening the band actually
+    shifts more days' positions toward the diversified baseline, not just
+    the reported hit rate.
+    """
+    cached = _EVAL_CACHE.get(eval_id)
+    if cached is None:
+        raise HTTPException(status_code=404, detail="Unknown eval_id - re-run evaluation first")
+
+    pairs = cached["pairs"]
+    risk_engine = cached.get("risk_engine")
+    portfolio, today, _ = _compute_portfolio_and_today(
+        cached["probabilities_train"], cached["next_returns_train"], cached["latest_probabilities_array"],
+        cached["direction_horizon"], cached["target_vol"], cached["cost_bps"], cached["signal_min"], cached["signal_max"],
+        req.neutral_band, cached["dates_train"], risk_engine, cached.get("returns_df"),
+    )
+    latest_probabilities = cached["latest_probabilities"]
+
+    return {
+        "neutral_band": req.neutral_band,
+        "latest_position": {
+            pair: {
+                "position_modulated": float(today["position_modulated"][i]),
+                "position_baseline": float(today["position_baseline"][i]),
+                **({"position_risk_attenuated": float(today["position_risk_attenuated"][i])} if risk_engine is not None else {}),
+                "probability": latest_probabilities[pair],
+            }
+            for i, pair in enumerate(pairs)
+        },
+        "portfolio": _portfolio_payload(cached["dates_train"], pairs, portfolio),
+        "annual_sharpe": annual_sharpe_table(
+            cached["dates_train"], portfolio["pnl_modulated"], portfolio["pnl_baseline"], portfolio.get("pnl_risk_attenuated"),
+        ),
+    }

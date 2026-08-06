@@ -10,8 +10,6 @@ import { confusionMatrixForSplit, hitRateForSplit } from "./metrics";
 const FEATURE_OPTIONS = [
   ["log_return", "Log return"],
   ["vol", "Rolling volatility"],
-  ["skew", "Rolling skewness"],
-  ["kurt", "Rolling excess kurtosis"],
   ["carry", "Carry (interest-rate differential)"],
   ["cma", "Cross moving averages (trend)"],
   ["bandpass", "Butterworth bandpass (faster-reacting trend)"],
@@ -47,7 +45,7 @@ const DEFAULT_FORM = {
   test_frac: 0.1,
   direction_horizon: 5,
   rolling_stats_window: 20,
-  features: ["log_return", "vol", "skew", "kurt"],
+  features: ["log_return", "vol"],
   cma_windows: [], // [{short, long}, ...] - UI shape; converted to [[short,long],...] on submit
   bandpass_windows: [], // same UI shape as cma_windows - short/long PERIODS in days for a causal Butterworth bandpass filter
   bandpass_order: 3,
@@ -88,10 +86,40 @@ const DEFAULT_FORM = {
   // evaluation-time parameter. Also used DURING training if
   // sharpe_weight above is > 0.
   target_vol: 0.1,
+  // {pair: [min, max]} - per-asset bounds the decision-day probability is
+  // linearly mapped into before scaling the risk-parity baseline weight
+  // (see models/portfolio_lstm.py's resolve_signal_bounds/
+  // models/portfolio_pnl.py's compute_portfolio). A pair missing here
+  // defaults to (-1, 1) - the original signed-direction map. Narrowing a
+  // pair's range (e.g. [0, 1]) makes it long-only instead of a signed bet.
+  signal_range: {},
   n_seeds: 1,
   device: "auto",
   save_db: true,
   model_description: "",
+
+  // --- Optional risk-engine second phase (see models/risk_engine.py) ---
+  // When true, api/server.py's _run_training_job continues STRAIGHT into
+  // training a NEW RiskEngine on top of THIS run's own just-trained
+  // (frozen) model, right after phase 1 finishes, in the SAME job - one
+  // bundled checkpoint gets saved, not two separate models.
+  train_risk_engine: false,
+  risk_lookback: 20,
+  risk_rolling_stats_window: 20,
+  risk_cma_windows: [], // UI shape [{short, long}, ...] - converted to [[short,long],...] on submit
+  risk_bandpass_windows: [],
+  risk_bandpass_order: 3,
+  min_risk_att: 0.0,
+  max_risk_att: 1.0,
+  risk_hidden_size: 16,
+  risk_num_layers: 1,
+  risk_dropout: 0.1,
+  risk_n_attn_heads: 4,
+  risk_epochs: 100,
+  risk_lr: 0.001,
+  risk_weight_decay: 0.0,
+  risk_sortino_window: 20,
+  full_exposure_penalty: 0.05,
 };
 
 const NUMERIC_FIELDS = new Set([
@@ -99,6 +127,9 @@ const NUMERIC_FIELDS = new Set([
   "hidden_size", "num_layers", "dropout", "n_attn_heads",
   "epochs", "lr", "weight_decay", "neutral_band", "target_vol",
   "n_seeds", "bandpass_order", "sharpe_weight", "sharpe_window",
+  "risk_lookback", "risk_rolling_stats_window", "risk_bandpass_order", "min_risk_att", "max_risk_att",
+  "risk_hidden_size", "risk_num_layers", "risk_dropout", "risk_n_attn_heads",
+  "risk_epochs", "risk_lr", "risk_weight_decay", "risk_sortino_window", "full_exposure_penalty",
 ]);
 
 // "1.0" -> 1.0 (single value); "1.0, 1.5, 2.0" -> [1.0, 1.5, 2.0] (sweep -
@@ -122,6 +153,7 @@ function parseConfigToForm(raw) {
     ...raw,
     pairs: raw.pairs || [],
     cross_pairs: raw.cross_pairs || {},
+    signal_range: raw.signal_range || {},
     features: raw.features || DEFAULT_FORM.features,
     cutoff_date: raw.cutoff_date || "",
     bce_weight: raw.bce_weight == null
@@ -131,6 +163,8 @@ function parseConfigToForm(raw) {
         : String(raw.bce_weight),
     cma_windows: (raw.cma_windows || []).map(([short, long]) => ({ short, long })),
     bandpass_windows: (raw.bandpass_windows || []).map(([short, long]) => ({ short, long })),
+    risk_cma_windows: (raw.risk_cma_windows || []).map(([short, long]) => ({ short, long })),
+    risk_bandpass_windows: (raw.risk_bandpass_windows || []).map(([short, long]) => ({ short, long })),
   };
 }
 
@@ -178,8 +212,10 @@ export default function TrainingView() {
       const pairs = wasIncluded ? f.pairs.filter((p) => p !== pair) : [...f.pairs, pair];
       // Removing a pair also drops it as a cross_pairs KEY, and out of
       // every OTHER pair's linked list - a removed pair can't stay
-      // referenced as an input source.
+      // referenced as an input source. Same for signal_range: a removed
+      // pair can't stay configured with a bound that no longer applies.
       let cross_pairs = f.cross_pairs;
+      let signal_range = f.signal_range;
       if (wasIncluded) {
         cross_pairs = Object.fromEntries(
           Object.entries(f.cross_pairs)
@@ -187,8 +223,9 @@ export default function TrainingView() {
             .map(([p, others]) => [p, others.filter((o) => o !== pair)])
             .filter(([, others]) => others.length > 0),
         );
+        signal_range = Object.fromEntries(Object.entries(f.signal_range).filter(([p]) => p !== pair));
       }
-      return { ...f, pairs, cross_pairs };
+      return { ...f, pairs, cross_pairs, signal_range };
     });
   }
 
@@ -237,6 +274,56 @@ export default function TrainingView() {
     setForm((f) => ({ ...f, bandpass_windows: f.bandpass_windows.filter((_, i) => i !== index) }));
   }
 
+  function addRiskCmaWindow() {
+    setForm((f) => ({ ...f, risk_cma_windows: [...f.risk_cma_windows, { short: 10, long: 50 }] }));
+  }
+
+  function updateRiskCmaWindow(index, field, value) {
+    setForm((f) => ({
+      ...f,
+      risk_cma_windows: f.risk_cma_windows.map((w, i) => (i === index ? { ...w, [field]: Number(value) } : w)),
+    }));
+  }
+
+  function removeRiskCmaWindow(index) {
+    setForm((f) => ({ ...f, risk_cma_windows: f.risk_cma_windows.filter((_, i) => i !== index) }));
+  }
+
+  function addRiskBandpassWindow() {
+    setForm((f) => ({ ...f, risk_bandpass_windows: [...f.risk_bandpass_windows, { short: 10, long: 50 }] }));
+  }
+
+  function updateRiskBandpassWindow(index, field, value) {
+    setForm((f) => ({
+      ...f,
+      risk_bandpass_windows: f.risk_bandpass_windows.map((w, i) => (i === index ? { ...w, [field]: Number(value) } : w)),
+    }));
+  }
+
+  function removeRiskBandpassWindow(index) {
+    setForm((f) => ({ ...f, risk_bandpass_windows: f.risk_bandpass_windows.filter((_, i) => i !== index) }));
+  }
+
+  // (min, max) default to (-1, 1) - the same default the backend applies
+  // to any pair absent from form.signal_range (see models/portfolio_lstm.py's
+  // resolve_signal_bounds) - so the field always shows a meaningful value
+  // even before the pair has an explicit override.
+  function updateSignalRange(pair, which, value) {
+    setForm((f) => {
+      const [min, max] = f.signal_range[pair] || [-1, 1];
+      const updated = which === "min" ? [Number(value), max] : [min, Number(value)];
+      return { ...f, signal_range: { ...f.signal_range, [pair]: updated } };
+    });
+  }
+
+  function resetSignalRange(pair) {
+    setForm((f) => {
+      const signal_range = { ...f.signal_range };
+      delete signal_range[pair];
+      return { ...f, signal_range };
+    });
+  }
+
   function toggleCrossPair(pair, otherPair) {
     setForm((f) => {
       const current = f.cross_pairs[pair] || [];
@@ -264,6 +351,8 @@ export default function TrainingView() {
       bce_weight: parseBceWeight(form.bce_weight),
       cma_windows: form.cma_windows.map((w) => [w.short, w.long]),
       bandpass_windows: form.bandpass_windows.map((w) => [w.short, w.long]),
+      risk_cma_windows: form.risk_cma_windows.map((w) => [w.short, w.long]),
+      risk_bandpass_windows: form.risk_bandpass_windows.map((w) => [w.short, w.long]),
     };
   }
 
@@ -315,6 +404,10 @@ export default function TrainingView() {
     setInterim(null);
     if (form.pairs.length < 1) {
       setError("Select at least one FX pair.");
+      return;
+    }
+    if (form.train_risk_engine && form.min_risk_att >= form.max_risk_att) {
+      setError("Min risk attenuation must be less than max risk attenuation.");
       return;
     }
     try {
@@ -417,7 +510,7 @@ export default function TrainingView() {
               onChange={updateField}
             />
             <NumField
-              label="Rolling stats window (vol/skew/kurtosis)"
+              label="Rolling stats window (volatility)"
               name="rolling_stats_window"
               value={form.rolling_stats_window}
               onChange={updateField}
@@ -443,10 +536,11 @@ export default function TrainingView() {
           </div>
           <p className="status-line" style={{ marginTop: 4 }}>
             Each selected feature becomes one input channel per pair (see models/portfolio_lstm.py's
-            FEATURE_CATALOG) - "Rolling volatility/skewness/kurtosis" use the {form.rolling_stats_window}-day window
-            above; "Carry" is the interest-rate differential (FRED); "Cross moving averages" adds a trend/momentum
-            channel PER window pair below (short-window mean return minus long-window mean return - positive when
-            the recent trend runs above the longer-run one).
+            FEATURE_CATALOG) - "Rolling volatility" uses the {form.rolling_stats_window}-day window above; "Carry" is
+            the interest-rate differential (FRED); "Cross moving averages" adds a trend/momentum channel PER window
+            pair below (short-window mean return minus long-window mean return - positive when the recent trend runs
+            above the longer-run one). Rolling skewness/kurtosis are risk-engine-only inputs now - configure them
+            below under "Risk engine".
           </p>
           {form.features.includes("cma") && (
             <div style={{ marginTop: 8 }}>
@@ -631,6 +725,43 @@ export default function TrainingView() {
           </p>
         </div>
 
+        {form.pairs.length > 0 && (
+          <div className="panel">
+            <h2 style={{ marginTop: 0 }}>Signal range (portfolio position limits)</h2>
+            <p className="status-line" style={{ marginTop: 0 }}>
+              The decision-day probability is linearly mapped into a (min, max) range, then multiplied by that
+              pair's risk-parity baseline weight to size its position - by DEFAULT (-1, 1) for every pair, a signed
+              direction (positive probability -&gt; long, negative -&gt; short). Narrow a pair's range to change what the
+              mapped value MEANS: e.g. (0, 1) makes that pair LONG-ONLY (a 0-1 factor scaling the risk-parity
+              weight, never negated); (-0.1, 1.0) allows only a little short. A day inside the "Neutral band" above
+              is treated as no view regardless of this range - it rides the UNMODULATED risk-parity weight (the same
+              diversified position "Risk-parity baseline" reports), not a value from this map.
+            </p>
+            {form.pairs.map((pair) => {
+              const [min, max] = form.signal_range[pair] || [-1, 1];
+              const isDefault = !form.signal_range[pair];
+              return (
+                <div key={pair} style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 6 }}>
+                  <strong style={{ fontSize: 13, minWidth: 70 }}>{pair}</strong>
+                  <div className="field" style={{ maxWidth: 110 }}>
+                    <label>Min</label>
+                    <input type="number" step="0.05" value={min} onChange={(e) => updateSignalRange(pair, "min", e.target.value)} />
+                  </div>
+                  <div className="field" style={{ maxWidth: 110 }}>
+                    <label>Max</label>
+                    <input type="number" step="0.05" value={max} onChange={(e) => updateSignalRange(pair, "max", e.target.value)} />
+                  </div>
+                  {!isDefault && (
+                    <button type="button" className="secondary" onClick={() => resetSignalRange(pair)} style={{ alignSelf: "end" }}>
+                      Reset to default (-1, 1)
+                    </button>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+
         <div className="panel">
           <h2 style={{ marginTop: 0 }}>Multi-seed restarts &amp; execution</h2>
           <div className="form-grid">
@@ -651,6 +782,109 @@ export default function TrainingView() {
             training fails with a non-finite-gradient error, try "CPU" (a known PyTorch MPS bug affects some
             multi-layer, large-hidden-size architectures - see models/portfolio_lstm.py's train_prediction_model).
           </p>
+        </div>
+
+        <div className="panel">
+          <h2 style={{ marginTop: 0 }}>Risk engine (optional second phase)</h2>
+          <label className="field checkbox">
+            <input
+              type="checkbox"
+              checked={form.train_risk_engine}
+              onChange={(e) => setForm((f) => ({ ...f, train_risk_engine: e.target.checked }))}
+            />
+            Train a risk engine on top of this run's own model, right after it finishes
+          </label>
+          <p className="status-line" style={{ marginTop: 4 }}>
+            A second, independently-trained LSTM that reads THIS run's own (pre-attenuation) position weights
+            alongside each pair's rolling skewness/kurtosis, cross moving averages, and Butterworth bandpass below,
+            and learns a per-asset ATTENUATION FACTOR (bounded between "Min risk attenuation"/"Max risk
+            attenuation") applied to the position AFTER it's already been scaled to target volatility - trained with
+            a downside-focused (Sortino) objective, with the just-trained predictor above used strictly FROZEN. Runs
+            as PHASE 2 of this SAME job, right after phase 1 (the prediction model above) finishes, with its own
+            progress reporting below - one bundled checkpoint gets saved at the end, not two separate models. Skew
+            and kurtosis are risk-engine-exclusive inputs now (see "Features" above, which no longer offers them for
+            the predictor itself).
+          </p>
+
+          {form.train_risk_engine && (
+            <>
+              <div className="form-grid" style={{ marginTop: 8 }}>
+                <NumField label="Risk lookback (decision days)" name="risk_lookback" value={form.risk_lookback} onChange={updateField} />
+                <NumField label="Rolling stats window for skew/kurtosis (days)" name="risk_rolling_stats_window" value={form.risk_rolling_stats_window} onChange={updateField} />
+                <NumField label="Min risk attenuation" name="min_risk_att" step="0.05" value={form.min_risk_att} onChange={updateField} />
+                <NumField label="Max risk attenuation" name="max_risk_att" step="0.05" value={form.max_risk_att} onChange={updateField} />
+                <NumField label="Hidden size" name="risk_hidden_size" value={form.risk_hidden_size} onChange={updateField} />
+                <NumField label="LSTM layers" name="risk_num_layers" value={form.risk_num_layers} onChange={updateField} />
+                <NumField label="Dropout" name="risk_dropout" step="0.01" value={form.risk_dropout} onChange={updateField} />
+                <NumField label="Attention heads" name="risk_n_attn_heads" value={form.risk_n_attn_heads} onChange={updateField} />
+                <NumField label="Epochs" name="risk_epochs" value={form.risk_epochs} onChange={updateField} />
+                <NumField label="Learning rate" name="risk_lr" step="0.0001" value={form.risk_lr} onChange={updateField} />
+                <NumField label="Weight decay" name="risk_weight_decay" step="0.0001" value={form.risk_weight_decay} onChange={updateField} />
+                <NumField label="Sortino window (decision days)" name="risk_sortino_window" value={form.risk_sortino_window} onChange={updateField} />
+                <NumField label="Full-exposure penalty" name="full_exposure_penalty" step="0.01" value={form.full_exposure_penalty} onChange={updateField} />
+              </div>
+              <p className="status-line" style={{ marginTop: 4 }}>
+                Default attenuation bounds (0, 1): the engine can only REDUCE exposure, never amplify it. "Full-
+                exposure penalty" regularizes the engine's own output toward "Max risk attenuation" so it must
+                actually EARN a de-risking move via the Sortino objective rather than trivially collapsing exposure -
+                0 disables this.
+              </p>
+
+              <div style={{ marginTop: 8 }}>
+                <strong style={{ fontSize: 13 }}>
+                  Cross moving average windows (risk engine - independent of the predictor's own above)
+                </strong>
+                {form.risk_cma_windows.map((w, i) => (
+                  <div key={i} style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 6 }}>
+                    <div className="field" style={{ maxWidth: 100 }}>
+                      <label>Short window</label>
+                      <input type="number" value={w.short} onChange={(e) => updateRiskCmaWindow(i, "short", e.target.value)} />
+                    </div>
+                    <div className="field" style={{ maxWidth: 100 }}>
+                      <label>Long window</label>
+                      <input type="number" value={w.long} onChange={(e) => updateRiskCmaWindow(i, "long", e.target.value)} />
+                    </div>
+                    <button type="button" className="secondary" onClick={() => removeRiskCmaWindow(i)} style={{ alignSelf: "end" }}>
+                      Remove
+                    </button>
+                  </div>
+                ))}
+                <button type="button" className="secondary" onClick={addRiskCmaWindow} style={{ marginTop: 6 }}>
+                  Add CMA window
+                </button>
+              </div>
+
+              <div style={{ marginTop: 12 }}>
+                <strong style={{ fontSize: 13 }}>Butterworth bandpass windows (risk engine)</strong>
+                {form.risk_bandpass_windows.map((w, i) => (
+                  <div key={i} style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 6 }}>
+                    <div className="field" style={{ maxWidth: 100 }}>
+                      <label>Short period</label>
+                      <input type="number" value={w.short} onChange={(e) => updateRiskBandpassWindow(i, "short", e.target.value)} />
+                    </div>
+                    <div className="field" style={{ maxWidth: 100 }}>
+                      <label>Long period</label>
+                      <input type="number" value={w.long} onChange={(e) => updateRiskBandpassWindow(i, "long", e.target.value)} />
+                    </div>
+                    <button type="button" className="secondary" onClick={() => removeRiskBandpassWindow(i)} style={{ alignSelf: "end" }}>
+                      Remove
+                    </button>
+                  </div>
+                ))}
+                <button type="button" className="secondary" onClick={addRiskBandpassWindow} style={{ marginTop: 6 }}>
+                  Add bandpass window
+                </button>
+                <div className="field" style={{ maxWidth: 140, marginTop: 8 }}>
+                  <label>Filter order</label>
+                  <input
+                    type="number"
+                    value={form.risk_bandpass_order}
+                    onChange={(e) => updateField("risk_bandpass_order", e.target.value)}
+                  />
+                </div>
+              </div>
+            </>
+          )}
         </div>
 
         <div className="panel">

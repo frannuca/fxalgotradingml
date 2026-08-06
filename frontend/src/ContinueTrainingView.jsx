@@ -45,6 +45,12 @@ const DEFAULT_FORM = {
   checkpoint_metric: "val_loss",
   neutral_band: 0.05,
   target_vol: 0.1,
+  // {pair: [min, max]} - per-asset bounds the decision-day probability is
+  // linearly mapped into before scaling the risk-parity baseline weight
+  // (see models/portfolio_lstm.py's resolve_signal_bounds). Pre-filled
+  // from the chosen base model's own persisted value in selectModel()
+  // below, same as neutral_band/target_vol - still freely editable.
+  signal_range: {},
   device: "auto",
   save_db: true,
   model_description: "",
@@ -100,22 +106,43 @@ export default function ContinueTrainingView() {
 
   function selectModel(name) {
     setModelName(name);
-    // Pre-fill the editable "how this model is meant to be traded" fields
-    // from the chosen model's OWN persisted values - a reasonable starting
-    // point for continuing it, still freely overridable (unlike the
-    // architecture table below, these are NOT locked).
+    // Pre-fill every editable field this model has its OWN persisted value
+    // for (how it's meant to be traded, AND what its labels/features mean -
+    // direction_horizon/rolling_stats_window) - a reasonable starting point
+    // for continuing it, still freely overridable (unlike the architecture
+    // table below, none of these are actually LOCKED by continue_training -
+    // see models/portfolio_lstm.py's own docstring on why).
     const model = models.find((m) => m.name === name);
     if (model) {
       setForm((f) => ({
         ...f,
         neutral_band: model.neutral_band ?? f.neutral_band,
         target_vol: model.target_vol ?? f.target_vol,
+        signal_range: model.signal_range ?? f.signal_range,
+        direction_horizon: model.direction_horizon ?? f.direction_horizon,
+        rolling_stats_window: model.rolling_stats_window ?? f.rolling_stats_window,
       }));
     }
   }
 
   function updateField(name, value) {
     setForm((f) => ({ ...f, [name]: NUMERIC_FIELDS.has(name) ? Number(value) : value }));
+  }
+
+  function updateSignalRange(pair, which, value) {
+    setForm((f) => {
+      const [min, max] = f.signal_range[pair] || [-1, 1];
+      const updated = which === "min" ? [Number(value), max] : [min, Number(value)];
+      return { ...f, signal_range: { ...f.signal_range, [pair]: updated } };
+    });
+  }
+
+  function resetSignalRange(pair) {
+    setForm((f) => {
+      const signal_range = { ...f.signal_range };
+      delete signal_range[pair];
+      return { ...f, signal_range };
+    });
   }
 
   async function submit(e) {
@@ -244,6 +271,28 @@ export default function ContinueTrainingView() {
               </table>
             </div>
           )}
+
+          {selectedModel && (
+            <div className="result-box" style={{ marginTop: 14 }}>
+              <strong>Currently saved as (pre-filled into the editable fields below - freely changeable there):</strong>
+              <table>
+                <tbody>
+                  <tr><td>Direction horizon</td><td>{selectedModel.direction_horizon != null ? `${selectedModel.direction_horizon} days` : "—"}</td></tr>
+                  <tr><td>Rolling stats window</td><td>{selectedModel.rolling_stats_window != null ? `${selectedModel.rolling_stats_window} days` : "—"}</td></tr>
+                  <tr><td>Neutral band</td><td>{selectedModel.neutral_band ?? "—"}</td></tr>
+                  <tr><td>Target vol (annualized)</td><td>{selectedModel.target_vol != null ? `${(selectedModel.target_vol * 100).toFixed(1)}%` : "—"}</td></tr>
+                  <tr>
+                    <td>Signal range (min, max)</td>
+                    <td>
+                      {selectedModel.signal_range && Object.keys(selectedModel.signal_range).length > 0
+                        ? Object.entries(selectedModel.signal_range).map(([p, [min, max]]) => `${p}: (${min}, ${max})`).join("; ")
+                        : "default (-1, 1) for every pair"}
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          )}
         </div>
 
         <div className="panel">
@@ -312,6 +361,41 @@ export default function ContinueTrainingView() {
             it works starting from ANY base model, including one that was never trained with it before.
           </p>
         </div>
+
+        {selectedModel && (
+          <div className="panel">
+            <h2 style={{ marginTop: 0 }}>Signal range (portfolio position limits)</h2>
+            <p className="status-line" style={{ marginTop: 0 }}>
+              Per-pair (min, max) the decision-day probability is linearly mapped into before scaling the
+              risk-parity baseline weight - pre-filled from the base model's own saved value, still freely editable.
+              Default (-1, 1) is a signed direction; narrowing a pair's range (e.g. (0, 1)) makes it long-only
+              instead. A day inside "Neutral band" below rides the unmodulated risk-parity weight regardless of this
+              range, not a value from this map.
+            </p>
+            {selectedModel.pairs.map((pair) => {
+              const [min, max] = form.signal_range[pair] || [-1, 1];
+              const isDefault = !form.signal_range[pair];
+              return (
+                <div key={pair} style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 6 }}>
+                  <strong style={{ fontSize: 13, minWidth: 70 }}>{pair}</strong>
+                  <div className="field" style={{ maxWidth: 110 }}>
+                    <label>Min</label>
+                    <input type="number" step="0.05" value={min} onChange={(e) => updateSignalRange(pair, "min", e.target.value)} />
+                  </div>
+                  <div className="field" style={{ maxWidth: 110 }}>
+                    <label>Max</label>
+                    <input type="number" step="0.05" value={max} onChange={(e) => updateSignalRange(pair, "max", e.target.value)} />
+                  </div>
+                  {!isDefault && (
+                    <button type="button" className="secondary" onClick={() => resetSignalRange(pair)} style={{ alignSelf: "end" }}>
+                      Reset to default (-1, 1)
+                    </button>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
 
         <div className="panel">
           <h2 style={{ marginTop: 0 }}>4. Save</h2>

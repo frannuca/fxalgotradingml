@@ -67,3 +67,10 @@ export const FORECAST_DIST_COLOR = "#d97706"; // amber - model-implied outcomes
 // asset identity).
 export const MODULATED_COLOR = "#2563eb"; // blue - probability-modulated, vol-targeted
 export const BASELINE_COLOR = "#94a3b8"; // slate - unmodulated risk-parity baseline
+// A third, optional series - only present when the loaded model has a
+// RiskEngine attached (see models/risk_engine.py) - the SAME modulated
+// book with its per-asset attenuation applied on top. Green: this line is
+// the one specifically trying to reduce losses, not just a third
+// arbitrary category - distinct from MODULATED_COLOR/BASELINE_COLOR and
+// from every PAIR_PALETTE entry.
+export const RISK_ATTENUATED_COLOR = "#059669";

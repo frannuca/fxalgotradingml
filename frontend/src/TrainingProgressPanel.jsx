@@ -15,9 +15,18 @@ import { saveBestCheckpoint } from "./api";
 // checkpoint_metric) - only shown on the ONE row that's actually driving
 // checkpoint selection this run, so it's clear which quantity "best"
 // refers to instead of a generic, metric-agnostic label.
+//
+// Uses `best_score_overall` (the running best across every restart this
+// JOB has completed so far - see api/server.py's _interim_callback), not
+// the per-restart `best_score` - the latter resets to "no best yet" every
+// time a new seed/bce_weight restart begins (a fresh train_prediction_model
+// call, its own fresh tracking), so showing it directly would make "best
+// so far" visibly DROP at every restart boundary even though a stronger
+// checkpoint from an earlier restart is still the one that will actually
+// be compared for the final save.
 function bestSuffix(interim, metric, formatValue) {
-  if (interim.best_score == null || interim.checkpoint_metric !== metric) return null;
-  return ` (best so far: ${formatValue(interim.best_score)})`;
+  if (interim.best_score_overall == null || interim.checkpoint_metric !== metric) return null;
+  return ` (best so far: ${formatValue(interim.best_score_overall)})`;
 }
 
 const SPLIT_COLUMNS = [["train", "Train"], ["val", "Validation"], ["test", "Test"]];
@@ -42,11 +51,20 @@ export default function TrainingProgressPanel({ progress, interim, logs, logBoxR
     }
   }
 
+  // Phase 2 (see api/server.py's _run_training_job own `progress["phase"]`,
+  // only ever set when TrainRequest.train_risk_engine was on) reports an
+  // entirely different interim shape (train/val Sortino, not loss/hit-rate/
+  // Sharpe) - branch on it explicitly rather than probing for a field that
+  // would otherwise just read as `undefined` mid-transition.
+  const isRiskPhase = progress.phase === "risk_engine";
+
   return (
     <div className="panel">
       <h3 style={{ marginBottom: 6 }}>
-        Progress{progress.n_seeds > 1 ? ` — restart ${progress.seed_index}/${progress.n_seeds}` : ""}
-        {progress.n_lambdas > 1 ? ` — bce_weight ${progress.lambda_index}/${progress.n_lambdas}` : ""}
+        Progress
+        {progress.n_phases > 1 ? ` — phase ${progress.phase_index}/${progress.n_phases} (${isRiskPhase ? "risk engine" : "prediction model"})` : ""}
+        {!isRiskPhase && progress.n_seeds > 1 ? ` — restart ${progress.seed_index}/${progress.n_seeds}` : ""}
+        {!isRiskPhase && progress.n_lambdas > 1 ? ` — bce_weight ${progress.lambda_index}/${progress.n_lambdas}` : ""}
         {" "}— epoch {progress.epoch}/{progress.total_epochs}
       </h3>
       <div className="progress-track">
@@ -54,7 +72,27 @@ export default function TrainingProgressPanel({ progress, interim, logs, logBoxR
       </div>
       <div className="progress-percent">{progress.percent.toFixed(1)}%</div>
 
-      {interim && (
+      {interim && isRiskPhase && (
+        <table className="weights-table" style={{ marginTop: 12 }}>
+          <thead>
+            <tr><th></th><th>Train</th><th>Validation</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Sortino ratio</td>
+              <td>{interim.train_sortino != null ? interim.train_sortino.toFixed(4) : "—"}</td>
+              <td>
+                {interim.val_sortino != null ? interim.val_sortino.toFixed(4) : "—"}
+                {interim.best_val_sortino != null && (
+                  <strong> (best so far: {interim.best_val_sortino.toFixed(4)})</strong>
+                )}
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      )}
+
+      {interim && !isRiskPhase && (
         <>
           <table className="weights-table" style={{ marginTop: 12 }}>
             <thead>
@@ -98,11 +136,15 @@ export default function TrainingProgressPanel({ progress, interim, logs, logBoxR
               )}
             </tbody>
           </table>
-          {interim.best_score != null && (
+          {interim.best_score_overall != null && (
             <p className="status-line" style={{ marginTop: 6 }}>
-              "Best so far" is this run's checkpoint-selection score (averaged across assets; each asset's own
-              best epoch is restored independently at the end) - shown on whichever row "Checkpoint selection
-              metric" is currently set to.
+              "Best so far" is the checkpoint-selection score (averaged across assets; each asset's own best epoch
+              is restored independently at the end) of the strongest restart across the WHOLE optimization so far -
+              never decreases within a run, even across "Number of seeds"/BCE-weight-sweep restart boundaries -
+              shown on whichever row "Checkpoint selection metric" is currently set to. Note the model that's
+              actually SAVED at the end is still picked by validation loss across restarts regardless of this
+              metric (see models/portfolio_lstm.py's run_pipeline_multi_seed) - this is a live read on the training
+              objective, not a preview of which restart wins.
             </p>
           )}
         </>

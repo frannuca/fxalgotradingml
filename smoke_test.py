@@ -13,16 +13,52 @@ import numpy as np
 db_stub = types.ModuleType("data.db")
 db_stub.get_time_series = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no db in test"))
 db_stub.upsert_pairs = lambda *a, **k: None
+# get_connection is only imported at api/server.py's own MODULE level (its
+# list_models() endpoint body is the only actual caller, never exercised
+# below) - stubbed just so `import api.server` itself succeeds (test 20).
+db_stub.get_connection = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no db in test"))
 fx_stub = types.ModuleType("data.fx_downloader")
 fx_stub.FXDownloader = object
 fx_stub.MAJOR_FX_PAIRS = {}
+# prediction_model_name() (models/portfolio_lstm.py) lazily imports
+# build_model_name UNCONDITIONALLY (even when save_db=False - it's only
+# used to derive a deterministic LOCAL job name, see _run_training_job's
+# own model_base_name) - stubbed with a simple deterministic name-builder,
+# never actually hitting a DB (save_model_blob/load_model_blob deliberately
+# left unstubbed - not needed below, since test 20 stops short of the real
+# save_to_db call).
+registry_stub = types.ModuleType("data.model_registry")
+registry_stub.build_model_name = lambda kind, **kwargs: f"{kind}_" + "_".join(f"{k}={v}" for k, v in sorted(kwargs.items()))
 data_pkg = types.ModuleType("data"); data_pkg.__path__ = []
 sys.modules["data"] = data_pkg
 sys.modules["data.db"] = db_stub
 sys.modules["data.fx_downloader"] = fx_stub
+sys.modules["data.model_registry"] = registry_stub
 
 import torch
 from models import portfolio_lstm as pl
+from models import risk_engine as re
+
+# GLOBAL SAFETY NET, installed before any test runs: models/prediction_model.pt
+# is a REAL, git-tracked file in this repo - PredictionModel.save_model()'s
+# own default `path` param points straight at it (see its docstring), and
+# several tests below (esp. 20/21, which exercise the real
+# api/server.py._run_training_job end to end) call it without an explicit
+# path. Redirecting that ONE literal default string to a throwaway tmpdir
+# for this entire process means ANY call to save_model() anywhere below that
+# forgets to pass a path - a new test added later, a code path inside
+# _run_training_job neither of the per-test patches happens to wrap - can
+# never overwrite the tracked file, rather than relying on every individual
+# test to bracket itself correctly (tests 20/21 additionally redirect to
+# their OWN named tmp path on top of this, since they need to read the
+# saved file back afterward - this is just the last line of defense).
+_SMOKE_TEST_SAVE_DIR = tempfile.mkdtemp()
+_unsafe_default_save_model = pl.PredictionModel.save_model
+def _safe_default_save_model(self, path="models/prediction_model.pt", **kwargs):
+    if path == "models/prediction_model.pt":
+        path = os.path.join(_SMOKE_TEST_SAVE_DIR, "unbracketed_save.pt")
+    return _unsafe_default_save_model(self, path, **kwargs)
+pl.PredictionModel.save_model = _safe_default_save_model
 
 # Captured before test 7 permanently monkeypatches pl.load_close_prices -
 # test 12b needs the REAL function (it's testing load_close_prices itself),
@@ -330,6 +366,59 @@ assert (bullish_today["position_modulated"] > bearish_today["position_modulated"
 )
 print("9d. latest_position OK: today's probability moves the booked position in the right direction")
 
+# 9e. compute_portfolio's signal_min/signal_max: default (-1, 1) must be
+# BYTE-IDENTICAL to the original fixed (p - 0.5) * 2 map (no args at all);
+# a narrowed per-asset range (e.g. long-only [0, 1] for one asset) must
+# actually change what gets traded - never go short on that asset - while
+# leaving an unbounded asset's own behavior untouched.
+out_default_explicit = pp.compute_portfolio(
+    probs, returns, direction_horizon=5, target_vol=target_vol, cov_window=60, signal_min=-1.0, signal_max=1.0,
+)
+assert np.allclose(out_default_explicit["positions_modulated"], out["positions_modulated"], equal_nan=True), (
+    "explicit signal_min=-1/signal_max=1 must reproduce the no-args default exactly"
+)
+signal_min_9e = np.array([0.0] + [-1.0] * (n - 1), dtype=np.float64)  # asset 0 long-only, rest unbounded
+signal_max_9e = np.array([1.0] * n, dtype=np.float64)
+out_longonly = pp.compute_portfolio(
+    probs, returns, direction_horizon=5, target_vol=target_vol, cov_window=60,
+    signal_min=signal_min_9e, signal_max=signal_max_9e,
+)
+valid_9e = ~np.isnan(out_longonly["positions_modulated"]).any(axis=1)
+assert (out_longonly["positions_modulated"][valid_9e, 0] >= 0).all(), "asset 0 was configured long-only (min=0) but went short"
+# (Other assets' own positions DO shift too, even though their own signal
+# map is untouched - _scale_to_target_vol scales the WHOLE portfolio by one
+# shared factor derived from every asset's current weight, same joint
+# coupling _portfolio_sharpe_loss_from_predictions's own docstring
+# describes for the training-time counterpart - not a bug.)
+print("9e. compute_portfolio OK: default signal_min/max reproduces the original map; a per-asset long-only range holds")
+
+# 9f. compute_portfolio's neutral_band: 0.0 (default) is a no-op; a band
+# wide enough to cover every probability here (`probs` is built as
+# 0.5 +/- 0.15, so |p - 0.5| = 0.15 for every entry) forces every day's
+# signal to exactly 1.0 - riding the unmodulated risk-parity weight -
+# which must be IDENTICAL to passing signal_min=signal_max=1.0 with no
+# band at all (that map also produces signal=1.0 unconditionally).
+out_zero_band9f = pp.compute_portfolio(
+    probs, returns, direction_horizon=5, target_vol=target_vol, cov_window=60, neutral_band=0.0,
+)
+assert np.allclose(out_zero_band9f["positions_modulated"], out["positions_modulated"], equal_nan=True), (
+    "neutral_band=0.0 must be a byte-identical no-op"
+)
+out_full_band9f = pp.compute_portfolio(
+    probs, returns, direction_horizon=5, target_vol=target_vol, cov_window=60, neutral_band=0.2,
+)
+out_all_ones9f = pp.compute_portfolio(
+    probs, returns, direction_horizon=5, target_vol=target_vol, cov_window=60,
+    signal_min=np.ones(n), signal_max=np.ones(n),
+)
+assert np.allclose(out_full_band9f["positions_modulated"], out_all_ones9f["positions_modulated"], equal_nan=True), (
+    "a band covering every probability should force every day's signal to 1.0, matching an all-ones signal map"
+)
+assert not np.allclose(out_full_band9f["positions_modulated"], out["positions_modulated"], equal_nan=True), (
+    "a full neutral band must actually change the modulated positions vs no band"
+)
+print("9f. compute_portfolio OK: neutral_band=0.0 is a no-op; a full band forces every day onto the unmodulated risk-parity weight")
+
 # --- 10. train_prediction_model's optional portfolio-Sharpe phase (sharpe_weight) ---
 
 def _make_sharpe_data(n_assets_, seed, t=250):
@@ -601,10 +690,13 @@ with tempfile.TemporaryDirectory() as ct_dir:
 
 # 14a. on_best_checkpoint fires with the RIGHT references (model/data/args
 # match what actually trained; epoch increases; best_state is populated
-# for every asset after at least one validated epoch).
+# for every asset after at least one validated epoch); best_score is a
+# finite number matching the running best displayed elsewhere.
 captured_calls = []
-def _on_best14(model, data, args, epoch, best_state):
-    captured_calls.append({"model": model, "data": data, "args": args, "epoch": epoch, "best_state": best_state})
+def _on_best14(model, data, args, epoch, best_state, best_score):
+    captured_calls.append({
+        "model": model, "data": data, "args": args, "epoch": epoch, "best_state": best_state, "best_score": best_score,
+    })
 
 best_args14 = argparse.Namespace(**{
     **pl.DEFAULT_CONFIG,
@@ -617,7 +709,10 @@ assert len(captured_calls) >= 1, "on_best_checkpoint should have fired at least 
 last = captured_calls[-1]
 assert all(s is not None for s in last["best_state"]), "every asset should have a validated checkpoint by the end"
 assert last["epoch"] == best_args14.epochs, f"last call should be from the final epoch ({best_args14.epochs}), got {last['epoch']}"
-print(f"14a. on_best_checkpoint OK: fired {len(captured_calls)} times, last at epoch {last['epoch']}, every asset validated")
+assert all(c["best_score"] is not None and np.isfinite(c["best_score"]) for c in captured_calls), (
+    "best_score should be a finite number on every validated-epoch call, not just the sparse logging cadence"
+)
+print(f"14a. on_best_checkpoint OK: fired {len(captured_calls)} times, last at epoch {last['epoch']}, every asset validated, best_score always finite")
 
 # 14b. summarize_checkpoint returns None if any asset lacks a validated checkpoint.
 assert pl.summarize_checkpoint(last["model"], last["data"], last["args"], [None, {"dummy": 1}]) is None
@@ -688,5 +783,540 @@ with torch.no_grad():
     mu15d2, _ = model15d2(X15d)
 assert torch.isfinite(mu15d2).all(), "training with a too-short split for sharpe_window should stay finite (neutral, not crashing)"
 print("15d. _portfolio_sharpe_loss OK: a split shorter than sharpe_window yields a neutral zero loss and trains without crashing")
+
+# --- 16. Per-asset signal_range (resolve_signal_bounds + checkpoint persistence) ---
+
+# 16a. resolve_signal_bounds: an unlisted pair defaults to (-1, 1); a listed
+# one uses its own configured bounds; order matches the `pairs` argument.
+smin16, smax16 = pl.resolve_signal_bounds(["A", "B", "C"], {"B": [0.0, 1.0]})
+assert np.allclose(smin16, [-1.0, 0.0, -1.0]) and np.allclose(smax16, [1.0, 1.0, 1.0]), (
+    f"expected B alone narrowed to [0, 1], got min={smin16}, max={smax16}"
+)
+smin16_empty, smax16_empty = pl.resolve_signal_bounds(["A", "B"], None)
+assert np.allclose(smin16_empty, [-1.0, -1.0]) and np.allclose(smax16_empty, [1.0, 1.0]), (
+    "signal_range=None must resolve to (-1, 1) for every asset"
+)
+print("16a. resolve_signal_bounds OK: per-pair override applied, unlisted pairs default to (-1, 1)")
+
+# 16b. _portfolio_sharpe_loss_from_predictions: explicit (-1, 1) tensors
+# must reproduce the None-default loss exactly (same map, different code
+# path), and narrowing one asset's range must change the loss (the signal
+# actually gets clipped into the new range, not silently ignored). Reuses
+# X10/ret10/rp10/cov10 (test 10's t=250 fixture) rather than the t=15
+# fixtures above - those have NO valid (non-NaN) risk-parity/covariance
+# rows at all (t=15 < rolling_covariance_matrices' min_periods=20), which
+# would zero out the signal's effect entirely regardless of signal_min/max.
+model16b = pl.PredictionModel(n_assets=2, pairs=["A", "B"], n_channels=n_channels, hidden_size=4, dropout=0.0)
+mu16, sigma16 = model16b(X10)
+mu16_dec, sigma16_dec = mu16[:, -1, :].detach(), sigma16[:, -1, :].detach()
+loss_default16 = pl._portfolio_sharpe_loss_from_predictions(
+    mu16_dec, sigma16_dec, ret10, rp10, cov10, direction_horizon=5, sharpe_window=20, target_vol=0.10,
+)
+symmetric_min16 = torch.full((2,), -1.0)
+symmetric_max16 = torch.ones(2)
+loss_explicit16 = pl._portfolio_sharpe_loss_from_predictions(
+    mu16_dec, sigma16_dec, ret10, rp10, cov10, direction_horizon=5, sharpe_window=20, target_vol=0.10,
+    signal_min=symmetric_min16, signal_max=symmetric_max16,
+)
+assert torch.allclose(loss_default16, loss_explicit16), "explicit (-1, 1) tensors must reproduce the None-default Sharpe loss"
+narrowed_min16 = torch.tensor([0.0, -1.0])
+loss_narrowed16 = pl._portfolio_sharpe_loss_from_predictions(
+    mu16_dec, sigma16_dec, ret10, rp10, cov10, direction_horizon=5, sharpe_window=20, target_vol=0.10,
+    signal_min=narrowed_min16, signal_max=symmetric_max16,
+)
+assert not torch.allclose(loss_default16, loss_narrowed16), "narrowing asset 0's range should change the joint Sharpe loss"
+print("16b. _portfolio_sharpe_loss_from_predictions OK: default matches explicit (-1, 1); a narrowed range changes the loss")
+
+# 16c. signal_range persists through save_model/load_model, defaulting to
+# {} (i.e. every asset (-1, 1)) for a checkpoint that never set it.
+with tempfile.TemporaryDirectory() as tmp16:
+    path16 = os.path.join(tmp16, "signal_range.pt")
+    model16 = pl.PredictionModel(n_assets=2, pairs=["A", "B"], n_channels=n_channels, hidden_size=4, dropout=0.0)
+    model16.save_model(
+        path16, x_mean=np.zeros(n_channels * 2, dtype=np.float32), x_std=np.ones(n_channels * 2, dtype=np.float32),
+        pairs=["A", "B"], lookback=5, signal_range={"A": [0.0, 1.0]},
+    )
+    loaded16 = pl.load_prediction_model(path16)
+    assert loaded16.signal_range == {"A": [0.0, 1.0]}, f"expected the saved signal_range to round-trip, got {loaded16.signal_range}"
+
+    path16b = os.path.join(tmp16, "no_signal_range.pt")
+    model16.save_model(
+        path16b, x_mean=np.zeros(n_channels * 2, dtype=np.float32), x_std=np.ones(n_channels * 2, dtype=np.float32),
+        pairs=["A", "B"], lookback=5,
+    )
+    loaded16b = pl.load_prediction_model(path16b)
+    assert loaded16b.signal_range == {}, f"expected an unset signal_range to load back as {{}}, got {loaded16b.signal_range}"
+print("16c. PredictionModel.signal_range OK: round-trips through save_model/load_model, defaults to {} when unset")
+
+# --- 17. neutral_band inside the Sharpe training objective ---
+
+# 17a. neutral_band=0.0 (default) is a byte-identical no-op - regression
+# guarantee for every earlier Sharpe test in this file, which never pass
+# neutral_band at all.
+model17 = pl.PredictionModel(n_assets=2, pairs=["A", "B"], n_channels=n_channels, hidden_size=4, dropout=0.0)
+mu17, sigma17 = model17(X10)
+mu17_dec, sigma17_dec = mu17[:, -1, :].detach(), sigma17[:, -1, :].detach()
+loss_no_band17 = pl._portfolio_sharpe_loss_from_predictions(
+    mu17_dec, sigma17_dec, ret10, rp10, cov10, direction_horizon=5, sharpe_window=20, target_vol=0.10,
+)
+loss_zero_band17 = pl._portfolio_sharpe_loss_from_predictions(
+    mu17_dec, sigma17_dec, ret10, rp10, cov10, direction_horizon=5, sharpe_window=20, target_vol=0.10,
+    neutral_band=0.0,
+)
+assert torch.equal(loss_no_band17, loss_zero_band17), "neutral_band=0.0 must be a byte-identical no-op"
+print("17a. _portfolio_sharpe_loss_from_predictions OK: neutral_band=0.0 is a byte-identical no-op")
+
+# 17b. a band wide enough to cover every possible probability (probit's
+# output is strictly inside (0, 1), so |p - 0.5| < 0.5 always) forces
+# EVERY day's signal to exactly 1.0 - the book rides the unmodulated
+# risk-parity weight the whole series - which must be IDENTICAL to simply
+# passing signal_min=signal_max=1.0 with NO band at all (that map also
+# produces signal=1.0 unconditionally, regardless of p, so both scenarios
+# feed the exact same raw per-day signal series through the rest of the
+# pipeline).
+ones17 = torch.ones(2)
+loss_all_ones17 = pl._portfolio_sharpe_loss_from_predictions(
+    mu17_dec, sigma17_dec, ret10, rp10, cov10, direction_horizon=5, sharpe_window=20, target_vol=0.10,
+    signal_min=ones17, signal_max=ones17,
+)
+loss_full_band17 = pl._portfolio_sharpe_loss_from_predictions(
+    mu17_dec, sigma17_dec, ret10, rp10, cov10, direction_horizon=5, sharpe_window=20, target_vol=0.10,
+    neutral_band=0.5,
+)
+assert torch.allclose(loss_all_ones17, loss_full_band17, atol=1e-6), (
+    f"a band covering every probability should force every day's signal to 1.0, matching an all-ones signal map - "
+    f"got {loss_full_band17} vs {loss_all_ones17}"
+)
+assert not torch.allclose(loss_no_band17, loss_full_band17), "a full neutral band must actually change the loss vs no band"
+print("17b. _portfolio_sharpe_loss_from_predictions OK: a full band forces every day onto the unmodulated risk-parity weight")
+
+# 17c. wired end-to-end: train_prediction_model with sharpe_weight>0 AND a
+# neutral_band actually threads it into both the train and val Sharpe
+# terms (checked by comparing a trained model's train_sharpe against one
+# trained identically but with neutral_band=0 - not asserting a direction,
+# just that the band is not silently ignored) and doesn't crash.
+X17d, z17d, ret17d, rp17d, cov17d = _make_sharpe_data(2, seed=17, t=250)
+torch.manual_seed(21)
+model17d_band = pl.PredictionModel(n_assets=2, pairs=["A", "B"], n_channels=n_channels, hidden_size=8, dropout=0.0)
+pl.train_prediction_model(
+    model17d_band, X17d, z17d, epochs=5, lr=1e-2, bce_weight=1.0,
+    sharpe_weight=1.0, sharpe_window=20, direction_horizon=5, target_vol=0.10,
+    next_returns_train=ret17d, rp_weights_train=rp17d, cov_train=cov17d, neutral_band=0.3,
+)
+torch.manual_seed(21)
+model17d_noband = pl.PredictionModel(n_assets=2, pairs=["A", "B"], n_channels=n_channels, hidden_size=8, dropout=0.0)
+pl.train_prediction_model(
+    model17d_noband, X17d, z17d, epochs=5, lr=1e-2, bce_weight=1.0,
+    sharpe_weight=1.0, sharpe_window=20, direction_horizon=5, target_vol=0.10,
+    next_returns_train=ret17d, rp_weights_train=rp17d, cov_train=cov17d, neutral_band=0.0,
+)
+weights_differ17d = any(
+    not torch.equal(p1, p2)
+    for p1, p2 in zip(model17d_band.state_dict().values(), model17d_noband.state_dict().values())
+)
+assert weights_differ17d, "training with vs. without neutral_band (same seed, same data) should produce different weights"
+with torch.no_grad():
+    mu17d, _ = model17d_band(X17d)
+assert torch.isfinite(mu17d).all(), "training with sharpe_weight>0 and a neutral_band should stay finite"
+print("17c. train_prediction_model OK: neutral_band is threaded into the Sharpe objective and changes what's learned")
+
+# --- 18. direction_horizon/rolling_stats_window persistence + recovery ---
+
+# 18a. Round-trip through save_model/load_model, defaulting to 5/20
+# (DEFAULT_CONFIG's own values) for a checkpoint saved before these
+# existed as persisted fields.
+with tempfile.TemporaryDirectory() as tmp18:
+    path18 = os.path.join(tmp18, "horizon.pt")
+    model18 = pl.PredictionModel(n_assets=2, pairs=["A", "B"], n_channels=n_channels, hidden_size=4, dropout=0.0)
+    model18.save_model(
+        path18, x_mean=np.zeros(n_channels * 2, dtype=np.float32), x_std=np.ones(n_channels * 2, dtype=np.float32),
+        pairs=["A", "B"], lookback=5, direction_horizon=7, rolling_stats_window=15,
+    )
+    loaded18 = pl.load_prediction_model(path18)
+    assert loaded18.direction_horizon == 7 and loaded18.rolling_stats_window == 15, (
+        f"expected the saved direction_horizon/rolling_stats_window to round-trip, got "
+        f"{loaded18.direction_horizon}/{loaded18.rolling_stats_window}"
+    )
+
+    path18b = os.path.join(tmp18, "no_horizon.pt")
+    model18.save_model(
+        path18b, x_mean=np.zeros(n_channels * 2, dtype=np.float32), x_std=np.ones(n_channels * 2, dtype=np.float32),
+        pairs=["A", "B"], lookback=5,
+    )
+    loaded18b = pl.load_prediction_model(path18b)
+    assert loaded18b.direction_horizon == 5 and loaded18b.rolling_stats_window == 20, (
+        f"expected an unset direction_horizon/rolling_stats_window to default to 5/20, got "
+        f"{loaded18b.direction_horizon}/{loaded18b.rolling_stats_window}"
+    )
+print("18a. PredictionModel.direction_horizon/rolling_stats_window OK: round-trip through save_model/load_model, default to 5/20 when unset")
+
+# 18b. load_pipeline recovers direction_horizon/rolling_stats_window from
+# the LOADED MODEL's own checkpoint, not from whatever `args` happens to
+# specify - a mismatch would silently compare the model's forecast against
+# the wrong realized outcome (direction_horizon) or feed it feature values
+# it never trained on (rolling_stats_window).
+with tempfile.TemporaryDirectory() as tmp18c:
+    path18c = os.path.join(tmp18c, "load_pipeline_horizon.pt")
+    torch.manual_seed(55)
+    model18c = pl.PredictionModel(n_assets=2, pairs=sweep_pairs, n_channels=n_channels, hidden_size=4, dropout=0.0)
+    x_mean_18c = np.zeros(n_channels * 2, dtype=np.float32)
+    x_std_18c = np.ones(n_channels * 2, dtype=np.float32)
+    model18c.save_model(
+        path18c, x_mean=x_mean_18c, x_std=x_std_18c,
+        pairs=sweep_pairs, lookback=15, direction_horizon=7, rolling_stats_window=15,
+        # Explicit - must match model18c's own n_channels=4 construction
+        # above (this file's shared synthetic-architecture constant); left
+        # unset, save_model would fall back to DEFAULT_FEATURES, which
+        # doesn't necessarily produce 4 channels/pair.
+        features=["log_return", "vol", "skew", "kurt"],
+    )
+    # `load_args18c` deliberately specifies the WRONG (mismatched)
+    # direction_horizon/rolling_stats_window - load_pipeline must ignore
+    # them entirely and use the model's own persisted 7/15 instead.
+    load_args18c = argparse.Namespace(**{
+        **pl.DEFAULT_CONFIG, "pairs": sweep_pairs, "lookback": None, "years": 3,
+        # Explicit (not DEFAULT_CONFIG's own default) - must match model18c's
+        # own n_channels=4 (this file's shared synthetic-architecture
+        # constant, set at the top - see its own comment), independent of
+        # whatever models.portfolio_lstm.DEFAULT_FEATURES currently is.
+        "features": ["log_return", "vol", "skew", "kurt"],
+        "direction_horizon": 1, "rolling_stats_window": 2,
+        "train_frac": 0.8, "test_frac": 0.1, "device": "cpu", "load_model": path18c,
+    })
+    result18c = pl.load_pipeline(load_args18c)
+    # Cross-check against _prepare_data called directly with the SAME
+    # (correct) overrides - if load_pipeline is genuinely using the
+    # model's own persisted values, the resulting split size must match
+    # exactly; if it were still reading args' mismatched 1/2, it would
+    # match `data18c_wrong` below instead.
+    data18c_expected = pl._prepare_data(
+        load_args18c, x_mean=x_mean_18c, x_std=x_std_18c, pairs=sweep_pairs, lookback=15,
+        direction_horizon=7, rolling_stats_window=15,
+    )
+    data18c_wrong = pl._prepare_data(
+        load_args18c, x_mean=x_mean_18c, x_std=x_std_18c, pairs=sweep_pairs, lookback=15,
+        direction_horizon=1, rolling_stats_window=2,
+    )
+    assert len(data18c_expected.dates_train) != len(data18c_wrong.dates_train), (
+        "test setup issue: direction_horizon 7/15 vs 1/2 produced the SAME split size - the test itself would be "
+        "meaningless if these coincided"
+    )
+    assert len(result18c.dates_train) == len(data18c_expected.dates_train), (
+        f"load_pipeline did not use the model's own persisted direction_horizon/rolling_stats_window - got "
+        f"{len(result18c.dates_train)} train dates, expected {len(data18c_expected.dates_train)} "
+        f"(args' mismatched values would have given {len(data18c_wrong.dates_train)})"
+    )
+print("18b. load_pipeline OK: recovers direction_horizon/rolling_stats_window from the model's own checkpoint, not from args")
+
+# --- 19. models/risk_engine.py: a second-stage risk-attenuation overlay ---
+re.load_close_prices = pl.load_close_prices  # same continue_returns-backed fake as test 18's own patch
+
+# 19a. n_risk_channels_per_asset: weight + skew + kurt always, + one
+# channel per (short, long) window pair in risk_cma_windows/risk_bandpass_windows.
+assert re.n_risk_channels_per_asset([], []) == 3
+assert re.n_risk_channels_per_asset([[10, 50]], [[10, 50]]) == 5
+print("19a. n_risk_channels_per_asset OK")
+
+# 19b. build_risk_stats_dataframe: correct shape, no NaN left over (ffill +
+# fillna(0.0) warm-up handling, same as build_feature_dataframe's own).
+stats19 = re.build_risk_stats_dataframe(continue_returns, continue_pairs, 20, [[10, 50]], [], 3)
+assert stats19.shape == (len(continue_returns), 2 * 3), stats19.shape
+assert not stats19.isna().any().any()
+print("19b. build_risk_stats_dataframe OK, shape", stats19.shape)
+
+# 19c. RiskEngine forward shape + attenuation_from_raw bounds.
+engine19 = re.RiskEngine(n_assets=2, risk_channels_per_asset=3, hidden_size=4, num_layers=1, dropout=0.0, n_attn_heads=2)
+x19 = torch.randn(5, 10, 2 * 3)
+raw19 = engine19(x19)
+assert raw19.shape == (5, 10, 2)
+att19 = re.attenuation_from_raw(raw19, 0.0, 1.0)
+assert att19.min() >= 0.0 and att19.max() <= 1.0
+att19b = re.attenuation_from_raw(raw19, -0.1, 1.0)
+assert att19b.min() >= -0.1 and att19b.max() <= 1.0
+print("19c. RiskEngine.forward/attenuation_from_raw OK: shapes and bounds hold for both (0, 1) and (-0.1, 1) ranges")
+
+# 19d. _non_overlapping_sortino_torch: shape + a regression guard for the
+# sqrt-at-zero gradient blowup this function originally had (a chunk with
+# NO down days has downside deviation exactly 0 pre-fix, and d/du sqrt(u)
+# at u=0 is infinite - see this function's own docstring on the `+ eps`
+# INSIDE the sqrt).
+pnl19 = torch.tensor([0.01, 0.02, -0.01, 0.03, -0.02, 0.01, 0.02, -0.01, 0.01, 0.0], requires_grad=True)
+sortinos19 = re._non_overlapping_sortino_torch(pnl19, window=5)
+assert sortinos19.shape == (2,)
+sortinos19.sum().backward()
+assert torch.isfinite(pnl19.grad).all(), "non-overlapping Sortino produced a non-finite gradient"
+pnl19_allpos = torch.tensor([0.01] * 10, requires_grad=True)  # a chunk with ZERO down days - the exact failure mode
+re._non_overlapping_sortino_torch(pnl19_allpos, window=5).sum().backward()
+assert torch.isfinite(pnl19_allpos.grad).all(), "a zero-downside chunk produced a non-finite (sqrt-at-zero) gradient"
+print("19d. _non_overlapping_sortino_torch OK: finite gradients even for a chunk with zero down days")
+
+# 19e. train_risk_engine end to end: runs without crashing, restores its
+# own best-validation checkpoint, reports finite train/val Sortino.
+torch.manual_seed(21)
+base_args19 = argparse.Namespace(**{
+    **pl.DEFAULT_CONFIG, "pairs": continue_pairs, "lookback": 15, "years": 3, "train_frac": 0.8, "test_frac": 0.1,
+    "epochs": 3, "n_seeds": 1, "device": "cpu", "hidden_size": 4,
+})
+base_result19 = pl.run_pipeline_multi_seed(base_args19)
+with tempfile.TemporaryDirectory() as tmp19:
+    base_path19 = os.path.join(tmp19, "base19.pt")
+    base_result19.model.save_model(
+        base_path19, x_mean=base_result19.x_mean, x_std=base_result19.x_std, pairs=base_result19.pairs,
+        lookback=base_result19.lookback, features=base_args19.features, cma_windows=[],
+        sigma_hat=base_result19.sigma_hat, neutral_band=0.0, target_vol=pl.DEFAULT_TARGET_VOL,
+        direction_horizon=5, rolling_stats_window=20,
+    )
+    base_model19 = pl.load_prediction_model(base_path19)
+
+    risk_args19 = argparse.Namespace(**{
+        **pl.DEFAULT_CONFIG, "pairs": continue_pairs, "years": 3, "train_frac": 0.8, "test_frac": 0.1, "device": "cpu",
+        "risk_lookback": 10, "risk_cma_windows": [[10, 50]], "risk_bandpass_windows": [], "risk_bandpass_order": 3,
+        "min_risk_att": 0.0, "max_risk_att": 1.0, "risk_hidden_size": 4, "risk_num_layers": 1, "risk_dropout": 0.0,
+        "risk_n_attn_heads": 2, "risk_epochs": 3, "risk_lr": 1e-2, "risk_weight_decay": 0.0,
+        "risk_sortino_window": 8, "full_exposure_penalty": 0.05,
+    })
+    risk_engine19, summary19 = re.train_risk_engine(base_model19, risk_args19)
+    assert summary19["train_sortino"] is None or np.isfinite(summary19["train_sortino"])
+    assert summary19["val_sortino"] is None or np.isfinite(summary19["val_sortino"])
+    assert risk_engine19.pairs == continue_pairs
+    assert risk_engine19.risk_lookback == 10
+    print(f"19e. train_risk_engine OK: train_sortino={summary19['train_sortino']}, val_sortino={summary19['val_sortino']}")
+
+    # 19f. checkpoint round-trip: risk_engine_checkpoint_dict/risk_engine_from_checkpoint.
+    ckpt19 = re.risk_engine_checkpoint_dict(
+        risk_engine19, continue_pairs, risk_engine19.risk_lookback, risk_engine19.risk_cma_windows,
+        risk_engine19.risk_bandpass_windows, risk_engine19.risk_bandpass_order, risk_engine19.rolling_stats_window,
+        risk_engine19.min_risk_att, risk_engine19.max_risk_att,
+    )
+    loaded_engine19 = re.risk_engine_from_checkpoint(ckpt19)
+    assert loaded_engine19.pairs == continue_pairs
+    assert loaded_engine19.risk_lookback == 10
+    assert loaded_engine19.rolling_stats_window == 20
+    with torch.no_grad():
+        x19f = torch.randn(3, 10, risk_engine19.n_assets * risk_engine19.risk_channels_per_asset)
+        assert torch.allclose(risk_engine19(x19f), loaded_engine19(x19f))
+    print("19f. risk_engine_checkpoint_dict/risk_engine_from_checkpoint OK: round-trips weights and every hyperparameter")
+
+    # 19g. PredictionModel bundles the risk engine into its OWN checkpoint -
+    # save_model/load_model round-trip; a model with none loads with
+    # model.risk_engine is None (backward compatible with every checkpoint
+    # saved before this existed).
+    bundled_path19 = os.path.join(tmp19, "bundled19.pt")
+    base_model19.save_model(
+        bundled_path19, x_mean=base_model19.x_mean, x_std=base_model19.x_std, pairs=base_model19.pairs,
+        lookback=base_model19.lookback, features=base_model19.features, cma_windows=base_model19.cma_windows,
+        sigma_hat=base_model19.sigma_hat, neutral_band=base_model19.neutral_band, target_vol=base_model19.target_vol,
+        direction_horizon=base_model19.direction_horizon, rolling_stats_window=base_model19.rolling_stats_window,
+        risk_engine=risk_engine19,
+    )
+    bundled_model19 = pl.load_prediction_model(bundled_path19)
+    assert bundled_model19.risk_engine is not None
+    assert bundled_model19.risk_engine.risk_lookback == 10
+    with torch.no_grad():
+        assert torch.allclose(bundled_model19.risk_engine(x19f), risk_engine19(x19f))
+    # base_model19 (saved WITHOUT risk_engine=... above) has none - save_model/
+    # save_to_db deliberately never auto-inherit self.risk_engine (see their
+    # own docstrings).
+    reloaded_base19 = pl.load_prediction_model(base_path19)
+    assert reloaded_base19.risk_engine is None
+    print("19g. PredictionModel risk_engine bundling OK: round-trips via save_model/load_model, absent stays None")
+
+    # 19g2. continue_training on a risk-engine-bundled model must not
+    # crash, and the resaved checkpoint must load cleanly afterward -
+    # regression test for a bug where `base_model.risk_engine`, once set
+    # by _from_checkpoint (a real registered nn.Module submodule, since
+    # RiskEngine extends nn.Module), made base_model.state_dict() silently
+    # include "risk_engine.*" keys - both inside continue_training's own
+    # internal warm-start copy (model.load_state_dict(base_model.state_dict())
+    # onto a FRESH model with no risk_engine submodule yet - an immediate
+    # crash) and inside _checkpoint_dict's own self.state_dict() at resave
+    # time (no crash there, but silently produced a checkpoint who's OWN
+    # state_dict carried stale risk_engine weights forward while its
+    # top-level "risk_engine" key stayed None - permanently unloadable
+    # afterward, since a freshly-constructed model has no risk_engine
+    # submodule at the point _from_checkpoint calls load_state_dict).
+    continue_on_risk_args19 = argparse.Namespace(**{
+        **pl.DEFAULT_CONFIG, "years": 3, "cutoff_date": None, "train_frac": 0.8, "test_frac": 0.1,
+        "epochs": 2, "lr": 1e-3, "weight_decay": 0.0, "bce_weight": 1.0, "sharpe_weight": 0.0,
+        "sharpe_window": 10, "direction_horizon": 5, "checkpoint_metric": "val_loss",
+        "target_vol": pl.DEFAULT_TARGET_VOL, "neutral_band": 0.0, "signal_range": {}, "device": "cpu",
+    })
+    continued_result19 = pl.continue_training(continue_on_risk_args19, bundled_model19)
+    resaved_path19 = os.path.join(tmp19, "continued_from_bundled19.pt")
+    continued_result19.model.save_model(
+        resaved_path19, x_mean=continued_result19.x_mean, x_std=continued_result19.x_std,
+        pairs=continued_result19.pairs, lookback=continued_result19.lookback,
+        features=bundled_model19.features, cma_windows=bundled_model19.cma_windows,
+        sigma_hat=continued_result19.sigma_hat, neutral_band=continued_result19.neutral_band,
+        target_vol=continue_on_risk_args19.target_vol,
+        direction_horizon=continue_on_risk_args19.direction_horizon,
+        rolling_stats_window=bundled_model19.rolling_stats_window,
+    )
+    raw_checkpoint19 = torch.load(resaved_path19, map_location="cpu", weights_only=True)
+    polluted_keys19 = [k for k in raw_checkpoint19["state_dict"] if k.startswith("risk_engine.")]
+    assert not polluted_keys19, f"THE BUG IS BACK: state_dict still carries stale risk_engine keys: {polluted_keys19}"
+    # The ultimate regression check - THIS exact call is what used to fail
+    # for a user continuing training a second time on such a model.
+    reloaded_continued19 = pl.load_prediction_model(resaved_path19)
+    assert reloaded_continued19.risk_engine is None  # never passed forward - by design, see save_model's docstring
+    print("19g2. continue_training on a risk-engine-bundled model OK: no crash, resaved checkpoint reloads cleanly")
+
+    # 19h. evaluate_risk_engine: dense (T, n_assets) attenuation, warm-up
+    # rows default to max_risk_att (no attenuation), everything within bounds.
+    positions19 = np.random.default_rng(7).normal(size=(200, 2)).astype(np.float32) * 0.05
+    dates19 = continue_dates[:200]
+    attenuation19 = re.evaluate_risk_engine(loaded_engine19, positions19, continue_returns, dates19)
+    assert attenuation19.shape == (200, 2)
+    assert (attenuation19[: loaded_engine19.risk_lookback - 1] == loaded_engine19.max_risk_att).all()
+    assert attenuation19.min() >= loaded_engine19.min_risk_att - 1e-6
+    assert attenuation19.max() <= loaded_engine19.max_risk_att + 1e-6
+    print("19h. evaluate_risk_engine OK: warm-up rows default to max_risk_att, output stays within bounds")
+
+# 19i. compute_portfolio's optional `attenuation` param: None (default)
+# leaves the dict shape completely unchanged (no risk_attenuated keys at
+# all, not even NaN-filled); a given attenuation multiplies
+# positions_modulated EXACTLY (applied AFTER target-vol scaling, per this
+# module's own docstring).
+from models import portfolio_pnl as pp19
+rng19 = np.random.default_rng(11)
+probs19 = 0.5 + 0.2 * np.sign(rng19.normal(size=(200, 2)))
+returns19 = rng19.normal(scale=0.005, size=(200, 2))
+out19_no_att = pp19.compute_portfolio(probs19, returns19, direction_horizon=5, target_vol=0.1)
+assert "positions_risk_attenuated" not in out19_no_att
+att19_const = np.full((200, 2), 0.4, dtype=np.float32)
+out19_att = pp19.compute_portfolio(probs19, returns19, direction_horizon=5, target_vol=0.1, attenuation=att19_const)
+valid19 = ~np.isnan(out19_att["positions_modulated"]).any(axis=1)
+ratio19 = out19_att["positions_risk_attenuated"][valid19] / out19_att["positions_modulated"][valid19]
+assert np.allclose(ratio19, 0.4, atol=1e-6)
+print("19i. compute_portfolio OK: attenuation=None leaves the dict shape unchanged; a given attenuation scales positions_modulated exactly")
+
+# --- 20. api/server.py's "save best model so far" regression: the
+# DISPLAYED best-so-far score must always match whatever would actually
+# get saved - even across MULTIPLE seed restarts where a LATER restart
+# starts out worse than an EARLIER one's own peak (see
+# api/server.py's _on_best_checkpoint docstring for the exact bug this
+# guards against: it used to overwrite _BEST_CHECKPOINT_STATE
+# unconditionally on every validated epoch of EVERY restart, so a worse
+# LATER restart could silently replace a better EARLIER one).
+#
+# Imports api.server here (nowhere else in this file does) - safe despite
+# this file's own "no DB, no network" design: FastAPI/pydantic themselves
+# touch neither, and the only DB-touching call (save_to_db, inside
+# save_best_checkpoint) is deliberately NOT exercised below - this test
+# stops at summarize_checkpoint (also DB-free), which is everything
+# save_best_checkpoint does except the actual upload.
+import api.server as srv
+srv.load_close_prices = pl.load_close_prices  # reuse whatever fake is currently patched onto pl
+
+job_id20 = "smoke-test-job-20"
+srv._JOBS[job_id20] = {
+    "status": "pending", "result": None, "error": None, "logs": [],
+    "progress": {"seed_index": 1, "n_seeds": 3, "lambda_index": 1, "n_lambdas": 1, "epoch": 0, "total_epochs": 6, "percent": 0.0},
+    "interim": None, "interim_history": [], "stop_requested": False,
+}
+config20 = {
+    **pl.DEFAULT_CONFIG,
+    "pairs": continue_pairs, "lookback": 15, "years": 3, "train_frac": 0.8, "test_frac": 0.1,
+    "features": ["log_return", "vol"], "cma_windows": [], "bandpass_windows": [],
+    "epochs": 6, "n_seeds": 3, "device": "cpu", "hidden_size": 4,
+    "checkpoint_metric": "sharpe", "sharpe_weight": 0.0, "sharpe_window": 10,
+    "save_db": False, "model_description": "",
+}
+# _run_training_job's own final save_model() call always writes to its
+# DEFAULT local path ("models/prediction_model.pt" - the SAME real,
+# git-tracked file every actual training run also writes to) since it
+# never passes a `path` - redirect that ONE call to a tmpdir for the
+# duration of this test so it can't clobber a real file on disk, then
+# restore the real method immediately after.
+_real_save_model20 = pl.PredictionModel.save_model
+_tmpdir20 = tempfile.mkdtemp()
+def _redirected_save_model20(self, path="models/prediction_model.pt", **kwargs):
+    return _real_save_model20(self, os.path.join(_tmpdir20, "job20.pt"), **kwargs)
+pl.PredictionModel.save_model = _redirected_save_model20
+try:
+    srv._run_training_job(job_id20, config20)
+finally:
+    pl.PredictionModel.save_model = _real_save_model20
+job20 = srv._JOBS[job_id20]
+assert job20["status"] == "done", job20.get("error")
+stored20 = srv._BEST_CHECKPOINT_STATE.get(job_id20)
+assert stored20 is not None, "expected at least one on_best_checkpoint call across 3 restarts x 6 epochs"
+assert abs(stored20["score"] - job20["best_score_overall"]) < 1e-9, (
+    f"THE BUG IS BACK: the DISPLAYED best-so-far ({job20['best_score_overall']}) no longer matches what's "
+    f"actually stored to be saved ({stored20['score']}) - see api/server.py's _on_best_checkpoint"
+)
+
+# summarize_checkpoint is everything save_best_checkpoint (the real
+# endpoint) does short of the actual DB upload - confirms the CORRECTLY-
+# selected best_state builds a valid, finite snapshot.
+snapshot20 = pl.summarize_checkpoint(stored20["model"], stored20["data"], stored20["args"], stored20["best_state"])
+assert snapshot20 is not None, "every asset should have a validated checkpoint after 3 restarts x 6 epochs"
+_, _, summary20 = snapshot20
+assert np.isfinite(summary20["val"]["loss"])
+print(
+    f"20. api/server.py save-best OK: displayed best-so-far ({job20['best_score_overall']:.4f}) matches what "
+    f"actually gets saved across {job20['progress']['n_seeds']} seed restarts"
+)
+
+# 21. Merged two-phase job (train_risk_engine=True): _run_training_job
+# trains the prediction model (phase 1), then continues STRAIGHT into
+# train_risk_engine on the just-trained, in-memory model (phase 2) - no
+# separate save/reload round trip, no separate job. Confirms: the job
+# reaches "done" with both phases run, progress/interim correctly switch
+# to phase "risk_engine" partway through, the result payload carries a
+# risk_engine summary, and the ONE saved checkpoint has a RiskEngine
+# actually attached (bundled - see PredictionModel._checkpoint_dict's own
+# risk_engine key).
+job_id21 = "smoke-test-job-21"
+srv._JOBS[job_id21] = {
+    "status": "pending", "result": None, "error": None, "logs": [],
+    "progress": {
+        "seed_index": 1, "n_seeds": 1, "lambda_index": 1, "n_lambdas": 1, "epoch": 0, "total_epochs": 3,
+        "percent": 0.0, "phase": "prediction", "n_phases": 2, "phase_index": 1,
+    },
+    "interim": None, "interim_history": [], "stop_requested": False,
+}
+config21 = {
+    **pl.DEFAULT_CONFIG,
+    "pairs": continue_pairs, "lookback": 15, "years": 3, "train_frac": 0.8, "test_frac": 0.1,
+    "features": ["log_return", "vol"], "cma_windows": [], "bandpass_windows": [],
+    "epochs": 3, "n_seeds": 1, "device": "cpu", "hidden_size": 4,
+    "checkpoint_metric": "val_loss", "sharpe_weight": 0.0,
+    "save_db": False, "model_description": "",
+    "train_risk_engine": True,
+    "risk_lookback": 10, "risk_rolling_stats_window": 20, "risk_cma_windows": [[10, 50]],
+    "risk_bandpass_windows": [], "risk_bandpass_order": 3,
+    "min_risk_att": 0.0, "max_risk_att": 1.0, "risk_hidden_size": 4, "risk_num_layers": 1, "risk_dropout": 0.0,
+    "risk_n_attn_heads": 2, "risk_epochs": 3, "risk_lr": 1e-2, "risk_weight_decay": 0.0,
+    "risk_sortino_window": 8, "full_exposure_penalty": 0.05,
+}
+_real_save_model21 = pl.PredictionModel.save_model
+_tmpdir21 = tempfile.mkdtemp()
+def _redirected_save_model21(self, path="models/prediction_model.pt", **kwargs):
+    return _real_save_model21(self, os.path.join(_tmpdir21, "job21.pt"), **kwargs)
+pl.PredictionModel.save_model = _redirected_save_model21
+try:
+    srv._run_training_job(job_id21, config21)
+finally:
+    pl.PredictionModel.save_model = _real_save_model21
+job21 = srv._JOBS[job_id21]
+assert job21["status"] == "done", job21.get("error")
+assert job21["progress"]["phase"] == "risk_engine", job21["progress"]
+assert job21["progress"]["phase_index"] == 2
+assert job21["progress"]["percent"] == 100.0
+assert any(h.get("phase") == "risk_engine" for h in job21["interim_history"]), (
+    "expected at least one phase-2 interim entry (train/val Sortino) in interim_history"
+)
+risk_summary21 = job21["result"]["risk_engine"]
+assert risk_summary21 is not None
+assert risk_summary21["train_sortino"] is None or np.isfinite(risk_summary21["train_sortino"])
+assert risk_summary21["val_sortino"] is None or np.isfinite(risk_summary21["val_sortino"])
+saved21 = pl.load_prediction_model(os.path.join(_tmpdir21, "job21.pt"))
+assert saved21.risk_engine is not None, "the SAVED checkpoint must have the risk engine bundled in (same job, one save)"
+assert saved21.risk_engine.risk_lookback == 10
+print(
+    f"21. api/server.py two-phase merge OK: phase 1 -> phase 2 in one job, risk engine bundled into the saved "
+    f"checkpoint (train_sortino={risk_summary21['train_sortino']}, val_sortino={risk_summary21['val_sortino']})"
+)
 
 print("\nALL SMOKE TESTS PASSED")

@@ -117,6 +117,9 @@ def run(args: Namespace) -> None:
             target_vol=getattr(args, "target_vol", None) or DEFAULT_TARGET_VOL,
             bandpass_windows=getattr(args, "bandpass_windows", None),
             bandpass_order=getattr(args, "bandpass_order", None) or DEFAULT_BANDPASS_ORDER,
+            signal_range=getattr(args, "signal_range", None),
+            direction_horizon=getattr(args, "direction_horizon", 5) or 5,
+            rolling_stats_window=getattr(args, "rolling_stats_window", 20) or 20,
         )
     if args.save_db:
         name = prediction_model_name(args)
@@ -128,6 +131,9 @@ def run(args: Namespace) -> None:
             target_vol=getattr(args, "target_vol", None) or DEFAULT_TARGET_VOL,
             bandpass_windows=getattr(args, "bandpass_windows", None),
             bandpass_order=getattr(args, "bandpass_order", None) or DEFAULT_BANDPASS_ORDER,
+            signal_range=getattr(args, "signal_range", None),
+            direction_horizon=getattr(args, "direction_horizon", 5) or 5,
+            rolling_stats_window=getattr(args, "rolling_stats_window", 20) or 20,
         )
         print(f"Persisted model to database as {name!r}")
 

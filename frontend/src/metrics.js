@@ -106,3 +106,84 @@ export function hitRateForSplit(probabilitiesSplit, pairs, band) {
   }
   return out;
 }
+
+// First index in `dates` (ISO "YYYY-MM-DD" strings, so plain string
+// comparison sorts correctly) whose date is >= startDate. `dates.length`
+// (i.e. "nothing visible") if every date is BEFORE startDate - the plot
+// start date is later than all available history - rather than -1, so a
+// caller can always slice(idx) safely without a wrap-around bug.
+// startDate falsy (not set) means "no crop": returns 0.
+export function findPlotStartIndex(dates, startDate) {
+  if (!startDate) return 0;
+  const idx = dates.findIndex((d) => d >= startDate);
+  return idx === -1 ? dates.length : idx;
+}
+
+// Recursively slices every array found in `payload` (including nested
+// arrays under per-pair keys, e.g. api/server.py's _cumulative_return_payload/
+// _portfolio_payload/_probability_payload shapes) from `startIndex` onward -
+// crops a date-aligned evaluation payload down to a chosen display window
+// for the CHARTS/TABLES only, without re-fetching or recomputing anything
+// server-side (the backend still fetches/computes over the model's full
+// requested history - see EvaluationView.jsx's own "years" field - this is
+// purely what gets DRAWN). Only arrays whose length equals `total` (the
+// UNCROPPED series length, e.g. `dates.length`) are treated as
+// date-aligned and sliced; anything else (numbers, strings, a shorter
+// array that isn't one of these per-day series) passes through untouched -
+// this is what lets the SAME function crop `dates` itself, every per-pair
+// sub-object, AND api/server.py's `distribution` payload (which has no
+// `dates` field of its own, but its `actual`/`forecasted` arrays are the
+// SAME length as every other split's `dates`, so passing that length in
+// as `total` crops it consistently too).
+export function sliceArraysFrom(payload, startIndex, total) {
+  if (Array.isArray(payload)) {
+    return payload.length === total ? payload.slice(startIndex) : payload;
+  }
+  if (payload && typeof payload === "object") {
+    const out = {};
+    for (const [key, value] of Object.entries(payload)) {
+      out[key] = sliceArraysFrom(value, startIndex, total);
+    }
+    return out;
+  }
+  return payload;
+}
+
+// Field names that are genuinely CUMULATIVE series (running sums from the
+// evaluation's own day 0 - see api/server.py's _cumulative_return_payload/
+// _portfolio_payload) as opposed to a per-day snapshot (positions,
+// probabilities, distribution samples) that merely happens to be nested in
+// the same payload shape.
+const CUMULATIVE_KEYS = new Set([
+  "cumulative", "cumulative_pnl",
+  "cumulative_pnl_modulated", "cumulative_pnl_baseline", "cumulative_pnl_risk_attenuated",
+]);
+
+// Subtracts each cumulative array's own FIRST value from every point in it,
+// so a series already cropped to start partway through (see
+// sliceArraysFrom/findPlotStartIndex) reads as "cumulative return SINCE the
+// crop start" - 0 at the first visible day - instead of carrying forward
+// whatever it had already accumulated before the crop (e.g. a chart cropped
+// to the last year of a 3-year evaluation would otherwise still open at 3
+// years' worth of accumulated return). Only touches keys in CUMULATIVE_KEYS -
+// positions/probabilities/distribution samples are structurally NOT
+// cumulative and must pass through untouched - recurses through the same
+// nested {<pair>: {...}} shape sliceArraysFrom does. Call this on an
+// ALREADY-CROPPED payload (its own first element becomes the new zero
+// point), never on the full, uncropped one.
+export function rebaseCumulativeSeries(payload) {
+  if (Array.isArray(payload)) return payload;
+  if (payload && typeof payload === "object") {
+    const out = {};
+    for (const [key, value] of Object.entries(payload)) {
+      if (CUMULATIVE_KEYS.has(key) && Array.isArray(value) && value.length > 0) {
+        const base = value[0];
+        out[key] = value.map((v) => v - base);
+      } else {
+        out[key] = rebaseCumulativeSeries(value);
+      }
+    }
+    return out;
+  }
+  return payload;
+}

@@ -1,24 +1,28 @@
 import { CartesianGrid, Legend, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
-import { AXIS_COLOR, BASELINE_COLOR, GRID_COLOR, MODULATED_COLOR, pairColor } from "../theme";
+import { AXIS_COLOR, BASELINE_COLOR, GRID_COLOR, MODULATED_COLOR, RISK_ATTENUATED_COLOR } from "../theme";
 
-// Whole-book cumulative PnL (summed across every pair's position * that
-// day's realized return - see models/portfolio_pnl.py's compute_portfolio):
-// the probability-modulated, target-vol-scaled strategy against the
-// unmodulated risk-parity baseline, PLUS each pair's own modulated
-// contribution in the same plot (see api/server.py's _portfolio_payload -
-// `perAssetCumulativePnl[pair]` sums, per day, to `cumulativeModulated`).
-// Per-asset lines use the same fixed categorical palette every other
-// per-pair chart in this app uses (see theme.js's pairColor), thinner than
-// the two book-level lines so the aggregate comparison stays the visual
-// headline.
+// Whole-book cumulative PnL ONLY (summed across every pair's position *
+// that day's realized return - see models/portfolio_pnl.py's
+// compute_portfolio): the probability-modulated, target-vol-scaled
+// strategy against the unmodulated risk-parity baseline. Deliberately
+// does NOT plot per-asset contributions (see the sibling
+// PortfolioAssetPnlChart, rendered directly below this one in
+// EvaluationView.jsx with the SAME `dates`/margins/YAxis width so the two
+// charts' x-axes line up) - keeping the book-level comparison as its own
+// plot means its y-scale is never distorted by a single volatile asset's
+// swings.
+//
+// `cumulativeRiskAttenuated` (optional - only present when the loaded
+// model has a RiskEngine attached, see models/risk_engine.py) adds a
+// THIRD whole-book line: the SAME modulated strategy with its per-asset
+// attenuation applied on top, so the risk overlay's effect is visible
+// directly against both the unattenuated modulated line and the baseline.
 export default function PortfolioPnlChart({
-  dates, pairs, cumulativeModulated, cumulativeBaseline, perAssetCumulativePnl, height = 320,
+  dates, cumulativeModulated, cumulativeBaseline, cumulativeRiskAttenuated = null, height = 320,
 }) {
   const data = dates.map((date, i) => {
     const row = { date, modulated: cumulativeModulated[i], baseline: cumulativeBaseline[i] };
-    for (const pair of pairs) {
-      row[pair] = perAssetCumulativePnl[pair][i];
-    }
+    if (cumulativeRiskAttenuated) row.riskAttenuated = cumulativeRiskAttenuated[i];
     return row;
   });
 
@@ -40,18 +44,6 @@ export default function PortfolioPnlChart({
             contentStyle={{ fontSize: 12, borderRadius: 6 }}
           />
           <Legend wrapperStyle={{ fontSize: 12 }} />
-          {pairs.map((pair) => (
-            <Line
-              key={pair}
-              type="monotone"
-              dataKey={pair}
-              name={`${pair} (modulated)`}
-              stroke={pairColor(pairs, pair)}
-              strokeWidth={1}
-              dot={false}
-              isAnimationActive={false}
-            />
-          ))}
           <Line
             type="monotone"
             dataKey="modulated"
@@ -72,6 +64,17 @@ export default function PortfolioPnlChart({
             dot={false}
             isAnimationActive={false}
           />
+          {cumulativeRiskAttenuated && (
+            <Line
+              type="monotone"
+              dataKey="riskAttenuated"
+              name="Total (risk-attenuated)"
+              stroke={RISK_ATTENUATED_COLOR}
+              strokeWidth={2.5}
+              dot={false}
+              isAnimationActive={false}
+            />
+          )}
         </LineChart>
       </ResponsiveContainer>
     </div>

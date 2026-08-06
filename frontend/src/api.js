@@ -61,3 +61,17 @@ export function evaluate(config) {
     body: JSON.stringify(config),
   });
 }
+
+export function recomputePortfolio(evalId, neutralBand) {
+  return request(`/api/evaluate/${evalId}/portfolio`, {
+    method: "POST",
+    body: JSON.stringify({ neutral_band: neutralBand }),
+  });
+}
+
+export function trainRiskEngine(config) {
+  return request("/api/train-risk-engine", {
+    method: "POST",
+    body: JSON.stringify(config),
+  });
+}

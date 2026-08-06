@@ -1,5 +1,5 @@
 import { CartesianGrid, Legend, Line, LineChart, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
-import { AXIS_COLOR, BASELINE_COLOR, GRID_COLOR, MODULATED_COLOR } from "../theme";
+import { AXIS_COLOR, BASELINE_COLOR, GRID_COLOR, MODULATED_COLOR, RISK_ATTENUATED_COLOR } from "../theme";
 
 // One asset's own position over time: the probability-modulated,
 // target-vol-scaled weight (see models/portfolio_pnl.py's compute_portfolio)
@@ -7,10 +7,15 @@ import { AXIS_COLOR, BASELINE_COLOR, GRID_COLOR, MODULATED_COLOR } from "../them
 // scaled to the model's target_vol, for a like-for-like comparison) - both
 // can go negative (short) since the modulated weight flips sign with the
 // probability signal. `series` is {position_modulated: [...],
-// position_baseline: [...]} (see api/server.py's _portfolio_payload).
+// position_baseline: [...], [position_risk_attenuated: [...]]} (see
+// api/server.py's _portfolio_payload) - the risk-attenuated line (only
+// present when the loaded model has a RiskEngine attached) is the SAME
+// modulated weight with its per-day attenuation applied on top.
 export default function PortfolioPositionChart({ title, dates, series, height = 260 }) {
+  const hasRisk = series.position_risk_attenuated != null;
   const data = dates.map((date, i) => ({
     date, modulated: series.position_modulated[i], baseline: series.position_baseline[i],
+    ...(hasRisk ? { riskAttenuated: series.position_risk_attenuated[i] } : {}),
   }));
 
   return (
@@ -53,6 +58,18 @@ export default function PortfolioPositionChart({ title, dates, series, height = 
             connectNulls={false}
             isAnimationActive={false}
           />
+          {hasRisk && (
+            <Line
+              type="monotone"
+              dataKey="riskAttenuated"
+              name="Risk-attenuated"
+              stroke={RISK_ATTENUATED_COLOR}
+              strokeWidth={1.5}
+              dot={false}
+              connectNulls={false}
+              isAnimationActive={false}
+            />
+          )}
         </LineChart>
       </ResponsiveContainer>
     </div>
