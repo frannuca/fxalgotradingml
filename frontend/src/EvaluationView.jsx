@@ -190,7 +190,7 @@ export default function EvaluationView() {
                 <option value="">— choose —</option>
                 {models.map((m) => (
                   <option key={m.name} value={m.name}>
-                    {m.name}{m.risk_engine ? " (has risk engine)" : ""}
+                    {m.name}{m.is_ensemble ? ` (ensemble of ${m.n_members})` : ""}{m.risk_engine ? " (has risk engine)" : ""}
                   </option>
                 ))}
               </select>

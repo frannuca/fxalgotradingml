@@ -192,7 +192,7 @@ export default function RiskEngineView() {
                 <option value="">— choose —</option>
                 {models.map((m) => (
                   <option key={m.name} value={m.name}>
-                    {m.name}{m.risk_engine ? " (already has a risk engine)" : ""}
+                    {m.name}{m.is_ensemble ? " (ensemble - not supported here)" : ""}{m.risk_engine ? " (already has a risk engine)" : ""}
                   </option>
                 ))}
               </select>

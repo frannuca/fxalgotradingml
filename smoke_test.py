@@ -60,6 +60,19 @@ def _safe_default_save_model(self, path="models/prediction_model.pt", **kwargs):
     return _unsafe_default_save_model(self, path, **kwargs)
 pl.PredictionModel.save_model = _safe_default_save_model
 
+# save_ensemble_model is a STANDALONE function (not a PredictionModel
+# method - an ensemble isn't one nn.Module), so it calls torch.save(...)
+# directly and is NOT covered by the patch above - it needs its own,
+# same-shaped redirect (caught the hard way once already: a test that
+# called api/server.py's real use_kfold_cv path wrote straight to the
+# tracked file before this existed).
+_unsafe_save_ensemble_model = pl.save_ensemble_model
+def _safe_save_ensemble_model(path="models/prediction_model.pt", *args, **kwargs):
+    if path == "models/prediction_model.pt":
+        path = os.path.join(_SMOKE_TEST_SAVE_DIR, "unbracketed_save.pt")
+    return _unsafe_save_ensemble_model(path, *args, **kwargs)
+pl.save_ensemble_model = _safe_save_ensemble_model
+
 # Captured before test 7 permanently monkeypatches pl.load_close_prices -
 # test 12b needs the REAL function (it's testing load_close_prices itself),
 # reached directly rather than via the (by then patched) module attribute.
@@ -1318,5 +1331,330 @@ print(
     f"21. api/server.py two-phase merge OK: phase 1 -> phase 2 in one job, risk engine bundled into the saved "
     f"checkpoint (train_sortino={risk_summary21['train_sortino']}, val_sortino={risk_summary21['val_sortino']})"
 )
+
+# 22a. generate_purged_kfold_splits: exhaustive checks on the pure
+# splitting primitive - no overlap between any train/val pair, purge zone
+# on BOTH sides of every fold's validation block genuinely excluded from
+# training, and the documented error cases actually raise.
+splits22a = pl.generate_purged_kfold_splits(n_foldable=100, n_folds=5, purge_gap=10)
+assert len(splits22a) == 5
+all_val22a = []
+for k, (train_idx, val_idx) in enumerate(splits22a):
+    assert len(set(train_idx.tolist()) & set(val_idx.tolist())) == 0, f"fold {k}: train/val overlap"
+    val_lo, val_hi = int(val_idx.min()), int(val_idx.max())
+    purge_zone = set(range(max(val_lo - 10, 0), min(val_hi + 10 + 1, 100)))
+    leaked = purge_zone.intersection(train_idx.tolist()) - set(val_idx.tolist())
+    assert not leaked, f"fold {k}: train indices inside the purge zone: {leaked}"
+    all_val22a.extend(val_idx.tolist())
+# Every one of the 100 indices is SOMEONE's validation index exactly once
+# (the folds partition [0, n_foldable) completely, even though train pools
+# overlap across folds).
+assert sorted(all_val22a) == list(range(100))
+try:
+    pl.generate_purged_kfold_splits(n_foldable=3, n_folds=5, purge_gap=1)
+    raise AssertionError("expected ValueError: not enough sequences for 5 folds")
+except ValueError:
+    pass
+try:
+    pl.generate_purged_kfold_splits(n_foldable=10, n_folds=1, purge_gap=1)
+    raise AssertionError("expected ValueError: n_folds must be >= 2")
+except ValueError:
+    pass
+print("22a. generate_purged_kfold_splits OK: no train/val overlap, purge zones respected, validation blocks partition the full range")
+
+# 22b. run_kfold_pipeline end to end (models/portfolio_lstm.py level): 3
+# folds train successfully on the same synthetic 300-day fixture used
+# above, each fold's own PredictionResult scores finite, EVERY fold's
+# model + its own risk engine (train_risk_engine=True exercises the
+# per-fold risk-engine path too) is kept as an ensemble member (no more
+# "best fold" - see run_kfold_pipeline's own docstring on why), and the
+# leakage-aware historical curve covers the WHOLE foldable range exactly
+# once with no gaps.
+torch.manual_seed(22)
+kfold_args22 = argparse.Namespace(**{
+    **pl.DEFAULT_CONFIG, "pairs": continue_pairs, "lookback": 15, "years": 3, "train_frac": 0.8, "test_frac": 0.1,
+    "features": ["log_return", "vol"], "cma_windows": [], "bandpass_windows": [],
+    "epochs": 2, "n_seeds": 1, "device": "cpu", "hidden_size": 4,
+    "checkpoint_metric": "val_loss", "sharpe_weight": 0.0, "load_model": None,
+    "train_risk_engine": True, "risk_lookback": 10, "risk_epochs": 2, "risk_cma_windows": [],
+    "risk_bandpass_windows": [], "min_risk_att": 0.0, "max_risk_att": 1.0,
+})
+kfold_result22 = pl.run_kfold_pipeline(kfold_args22, n_folds=3)
+assert kfold_result22.n_folds == 3
+assert len(kfold_result22.fold_scores) == 3
+assert all(np.isfinite(s) for s in kfold_result22.fold_scores)
+assert abs(kfold_result22.mean_score - float(np.mean(kfold_result22.fold_scores))) < 1e-9
+assert kfold_result22.purge_gap == kfold_args22.lookback + kfold_args22.direction_horizon
+assert len(kfold_result22.members) == 3
+assert all(m.pairs == continue_pairs for m in kfold_result22.members)
+assert len(kfold_result22.member_risk_engines) == 3
+assert all(re is not None for re in kfold_result22.member_risk_engines), "train_risk_engine=True should give every fold its own RiskEngine"
+# The historical curve concatenates each fold's own validation block IN
+# FOLD ORDER (see _historical_ensemble_curve's own docstring on why that's
+# already chronological) - confirm the resulting dates are genuinely
+# strictly increasing end to end, not just "non-empty per block".
+hist_dates22 = kfold_result22.historical_dates
+assert len(hist_dates22) > 0
+assert (hist_dates22[1:] > hist_dates22[:-1]).all(), "historical curve dates must be strictly chronological"
+assert np.isfinite(kfold_result22.historical_probabilities).all()
+assert ((kfold_result22.historical_probabilities >= 0) & (kfold_result22.historical_probabilities <= 1)).all()
+# mu/sigma/z_labels (the "forecast vs actual" distribution chart's own
+# inputs - see _distribution_payload) must be tracked too, same length as
+# everything else - a real regression once left these empty for every
+# ensemble job (see api/server.py's own distribution payload).
+assert len(kfold_result22.historical_mu) == len(hist_dates22)
+assert len(kfold_result22.historical_sigma) == len(hist_dates22)
+assert len(kfold_result22.historical_z_labels) == len(hist_dates22)
+assert np.isfinite(kfold_result22.historical_mu).all()
+assert np.isfinite(kfold_result22.historical_sigma).all() and (kfold_result22.historical_sigma > 0).all()
+assert len(kfold_result22.test_dates) == len(kfold_result22.test_probabilities)
+assert len(kfold_result22.test_mu) == len(kfold_result22.test_dates)
+assert len(kfold_result22.test_sigma) == len(kfold_result22.test_dates)
+assert len(kfold_result22.test_z_labels) == len(kfold_result22.test_dates)
+print(
+    f"22b. run_kfold_pipeline OK: 3 folds (+ per-fold risk engines), val_loss scores "
+    f"{[round(s, 4) for s in kfold_result22.fold_scores]}, historical curve spans {len(kfold_result22.historical_dates)} days"
+)
+
+# 22c. api/server.py end to end with use_kfold_cv=True: the job reaches
+# "done", progress/interim carry fold_index/n_folds throughout, and the
+# SAVED checkpoint is a genuine EnsemblePredictionModel bundling every
+# fold's own model + risk engine - not any single "winning" one.
+job_id22 = "smoke-test-job-22"
+srv._JOBS[job_id22] = {
+    "status": "pending", "result": None, "error": None, "logs": [],
+    "progress": {
+        "seed_index": 1, "n_seeds": 1, "lambda_index": 1, "n_lambdas": 1, "epoch": 0, "total_epochs": 2,
+        "percent": 0.0, "phase": "prediction", "n_phases": 1, "phase_index": 1,
+        "fold_index": 1, "n_folds": 3, "global_percent": 0.0,
+    },
+    "interim": None, "interim_history": [], "stop_requested": False,
+}
+config22 = {
+    **pl.DEFAULT_CONFIG,
+    "pairs": continue_pairs, "lookback": 15, "years": 3, "train_frac": 0.8, "test_frac": 0.1,
+    "features": ["log_return", "vol"], "cma_windows": [], "bandpass_windows": [],
+    "epochs": 2, "n_seeds": 1, "device": "cpu", "hidden_size": 4,
+    "checkpoint_metric": "val_loss", "sharpe_weight": 0.0,
+    "save_db": False, "model_description": "",
+    "use_kfold_cv": True, "n_folds": 3,
+    "train_risk_engine": True, "risk_lookback": 10, "risk_epochs": 2, "risk_cma_windows": [],
+    "risk_bandpass_windows": [], "min_risk_att": 0.0, "max_risk_att": 1.0,
+}
+# save_ensemble_model always writes to its own EXPLICIT path
+# ("models/prediction_model.pt" by default, same tracked-file risk as
+# every other save call in this file) - _run_training_job's ensemble
+# branch calls it with that exact literal default, so the SAME global
+# safety net (see this file's own top-of-file _safe_default_save_model)
+# already redirects it; no extra per-test patch needed here.
+srv._run_training_job(job_id22, config22)
+job22 = srv._JOBS[job_id22]
+assert job22["status"] == "done", job22.get("error")
+assert job22["progress"]["n_folds"] == 3
+assert job22["progress"]["fold_index"] == 3, "should have advanced through to the LAST fold by job completion"
+assert job22["progress"]["global_percent"] == 100.0
+assert any(h.get("n_folds") == 3 for h in job22["interim_history"]), (
+    "expected at least one interim entry tagged with n_folds=3 (see _on_fold_start/current_fold_index)"
+)
+kfold_summary22 = job22["result"]["kfold"]
+assert kfold_summary22 is not None
+assert kfold_summary22["n_folds"] == 3
+assert len(kfold_summary22["fold_scores"]) == 3
+assert kfold_summary22["n_members"] == 3
+assert kfold_summary22["has_risk_engine"] is True
+assert "best_fold_index" not in kfold_summary22, "THE OLD BUG IS BACK: ensembling should never pick a single 'best' fold"
+# "train" is intentionally empty (no single train/val split for an
+# ensemble - see api/server.py's own ensemble branch); "val" carries the
+# leakage-aware historical curve, "test" the shared held-out split - both
+# populated for every configured pair.
+assert job22["result"]["hit_rate"]["train"] == {p: 0.5 for p in continue_pairs}
+assert set(job22["result"]["hit_rate"]["val"].keys()) == set(continue_pairs)
+assert set(job22["result"]["hit_rate"]["test"].keys()) == set(continue_pairs)
+assert len(job22["result"]["probabilities"]["train"]["dates"]) == 0
+assert len(job22["result"]["probabilities"]["val"]["dates"]) > 0
+assert len(job22["result"]["probabilities"]["test"]["dates"]) > 0
+# THE BUG THIS GUARDS AGAINST: the "forecast vs actual" distribution chart
+# was left EMPTY for every ensemble job (val/test included) - only
+# probabilities were ever tracked through _historical_ensemble_curve, not
+# mu/sigma/z_labels (see models/portfolio_lstm.py's own fix).
+for pair in continue_pairs:
+    assert len(job22["result"]["distribution"]["val"][pair]["actual"]) > 0, "distribution chart is empty for 'val' - the bug is back"
+    assert len(job22["result"]["distribution"]["test"][pair]["actual"]) > 0, "distribution chart is empty for 'test' - the bug is back"
+# The SAVED checkpoint is the actual ensemble, not any single fold's model.
+saved22 = pl.load_prediction_model(os.path.join(_SMOKE_TEST_SAVE_DIR, "unbracketed_save.pt"))
+assert isinstance(saved22, pl.EnsemblePredictionModel)
+assert saved22.n_members == 3
+assert saved22.risk_engine is not None, "every fold got its own risk engine (train_risk_engine=True) - the ensemble should report having one"
+print(
+    f"22c. api/server.py use_kfold_cv=True OK: 3 folds end to end, progress/interim fold-tagged throughout, "
+    f"saved checkpoint is a genuine {saved22.n_members}-member ensemble with risk engines attached"
+)
+
+# 23a/23b. _train_restart_with_retry: a single restart's non-finite-
+# gradient failure (the known MPS multi-layer-LSTM bug - see
+# _assert_finite_grad) no longer aborts the WHOLE multi-seed/K-fold run -
+# it retries THAT restart, falling back mps->cpu on the very first
+# failure (retrying on the SAME device would just reproduce a
+# deterministic bug identically), and only re-raises once
+# MAX_TRAIN_ATTEMPTS is exhausted. Exercised without real MPS hardware by
+# monkeypatching pl._train_and_evaluate itself - a real _PreparedData
+# fixture (reused from the continue_pairs/continue_returns fixture above,
+# via _build_full_sequences/_prepare_data) supplies real CPU tensors so
+# _prepared_data_to_device's own .to(device) calls have something valid to
+# operate on, with .device overridden to simulate "mps".
+args23 = argparse.Namespace(**{
+    **pl.DEFAULT_CONFIG, "pairs": continue_pairs, "lookback": 15, "years": 3, "train_frac": 0.8, "test_frac": 0.1,
+    "features": ["log_return", "vol"], "cma_windows": [], "bandpass_windows": [], "device": "cpu",
+})
+data23 = pl._prepare_data(args23)
+data23.device = torch.device("mps")  # simulate - real tensors stay on cpu underneath, only the LABEL says mps
+
+_real_train_and_evaluate = pl._train_and_evaluate
+
+
+def _make_fake_train_and_evaluate(fail_times, message="Non-finite gradient during test"):
+    calls = []
+
+    def _fake(data, args, on_best_checkpoint=None):
+        calls.append(data.device)
+        if len(calls) <= fail_times:
+            raise RuntimeError(message)
+        return "SUCCESS_SENTINEL"
+
+    return _fake, calls
+
+
+# 23a: fails twice, succeeds on the 3rd attempt - falls back to cpu after
+# the FIRST failure and stays there (retrying "mps" again would be
+# pointless for a deterministic bug).
+pl._train_and_evaluate, calls23a = _make_fake_train_and_evaluate(fail_times=2)
+try:
+    result23a = pl._train_restart_with_retry(data23, argparse.Namespace(**vars(args23)), None, "test-restart-23a", seed=0)
+finally:
+    pl._train_and_evaluate = _real_train_and_evaluate
+assert result23a == "SUCCESS_SENTINEL"
+assert len(calls23a) == 3
+assert calls23a[0] == torch.device("mps")
+assert calls23a[1] == torch.device("cpu")
+assert calls23a[2] == torch.device("cpu")
+print("23a. _train_restart_with_retry OK: retries in place, falls back mps->cpu on first failure, succeeds without aborting the whole run")
+
+# 23b: fails every time (even after the cpu fallback) - must give up
+# after EXACTLY MAX_TRAIN_ATTEMPTS attempts, with a clear error, not hang
+# or retry forever.
+pl._train_and_evaluate, calls23b = _make_fake_train_and_evaluate(fail_times=999)
+try:
+    try:
+        pl._train_restart_with_retry(data23, argparse.Namespace(**vars(args23)), None, "test-restart-23b", seed=0)
+        raise AssertionError("expected RuntimeError after exhausting all retry attempts")
+    except RuntimeError as exc:
+        assert "test-restart-23b" in str(exc) and str(pl.MAX_TRAIN_ATTEMPTS) in str(exc)
+finally:
+    pl._train_and_evaluate = _real_train_and_evaluate
+assert len(calls23b) == pl.MAX_TRAIN_ATTEMPTS
+print(f"23b. _train_restart_with_retry OK: gives up after exactly {pl.MAX_TRAIN_ATTEMPTS} attempts (not fewer, not forever)")
+
+# 24a. continue_training_ensemble (models/portfolio_lstm.py level):
+# continues EVERY member of an already-trained ensemble (reusing saved22
+# from test 22c, which already has 3 members + their own risk engines)
+# independently, each getting a FRESH risk engine (train_risk_engine=True) -
+# the OLD ones must never be silently carried forward (see
+# continue_training's own discipline, mirrored here per member).
+old_risk_engines24 = [m.risk_engine for m in saved22.members]
+assert all(re is not None for re in old_risk_engines24)
+continue_ensemble_args24 = argparse.Namespace(**{
+    **pl.DEFAULT_CONFIG, "pairs": continue_pairs, "years": 3, "train_frac": 0.8, "test_frac": 0.1,
+    "epochs": 2, "device": "cpu",
+    "checkpoint_metric": "val_loss", "sharpe_weight": 0.0, "load_model": None,
+    "train_risk_engine": True, "risk_lookback": 10, "risk_epochs": 2, "risk_cma_windows": [],
+    "risk_bandpass_windows": [], "min_risk_att": 0.0, "max_risk_att": 1.0,
+})
+member_results24, member_risk_engines24 = pl.continue_training_ensemble(continue_ensemble_args24, saved22)
+assert len(member_results24) == saved22.n_members == 3
+assert all(r.pairs == continue_pairs for r in member_results24)
+assert len(member_risk_engines24) == 3
+assert all(re is not None for re in member_risk_engines24)
+assert all(new is not old for new, old in zip(member_risk_engines24, old_risk_engines24)), (
+    "a continued member's risk engine must be a FRESH one, never the old one carried forward"
+)
+ensemble_temp24 = pl.EnsemblePredictionModel([r.model for r in member_results24])
+averaged24 = pl._average_ensemble_results(member_results24, ensemble_temp24)
+assert averaged24.pairs == continue_pairs
+assert len(averaged24.dates_train) > 0 and len(averaged24.dates_val) > 0
+print("24a. continue_training_ensemble OK: continued 3 members independently, each with a genuinely fresh risk engine")
+
+# 24b. api/server.py end to end: continue_from pointed at a saved ENSEMBLE
+# checkpoint continues every member, saves a NEW ensemble (never
+# overwriting the base), and reports genuine train/val/test splits -
+# unlike a fresh K-fold job (which has none, only historical/test - see
+# the "ensemble" vs "kfold" result fields, deliberately distinct shapes).
+base_ensemble_path24 = os.path.join(_SMOKE_TEST_SAVE_DIR, "unbracketed_save.pt")
+job_id24 = "smoke-test-job-24"
+srv._JOBS[job_id24] = {
+    "status": "pending", "result": None, "error": None, "logs": [],
+    "progress": {
+        "seed_index": 1, "n_seeds": 1, "lambda_index": 1, "n_lambdas": 1, "epoch": 0, "total_epochs": 2,
+        "percent": 0.0, "phase": "prediction", "n_phases": 1, "phase_index": 1,
+        "fold_index": 1, "n_folds": 1, "global_percent": 0.0,
+    },
+    "interim": None, "interim_history": [], "stop_requested": False,
+}
+config24 = {
+    **pl.DEFAULT_CONFIG,
+    "pairs": [], "years": 3, "train_frac": 0.8, "test_frac": 0.1,
+    "epochs": 2, "device": "cpu",
+    "checkpoint_metric": "val_loss", "sharpe_weight": 0.0,
+    "save_db": False, "model_description": "",
+    "continue_from": base_ensemble_path24,
+    "train_risk_engine": True, "risk_lookback": 10, "risk_epochs": 2, "risk_cma_windows": [],
+    "risk_bandpass_windows": [], "min_risk_att": 0.0, "max_risk_att": 1.0,
+}
+srv._run_training_job(job_id24, config24)
+job24 = srv._JOBS[job_id24]
+assert job24["status"] == "done", job24.get("error")
+assert job24["result"]["kfold"] is None
+ensemble_summary24 = job24["result"]["ensemble"]
+assert ensemble_summary24 is not None
+assert ensemble_summary24["n_members"] == 3
+assert ensemble_summary24["has_risk_engine"] is True
+# Unlike a fresh K-fold job, a CONTINUED ensemble has genuine train/val/test
+# splits (each member's own continue_training produces one).
+assert len(job24["result"]["probabilities"]["train"]["dates"]) > 0
+assert len(job24["result"]["probabilities"]["val"]["dates"]) > 0
+saved24 = pl.load_prediction_model(base_ensemble_path24)
+assert isinstance(saved24, pl.EnsemblePredictionModel)
+assert saved24.n_members == 3
+print("24b. api/server.py continue_from=<ensemble> OK: continued all 3 members, saved a new ensemble, genuine train/val/test reported")
+
+# 25. run_kfold_pipeline on device="mps" (skipped where MPS isn't
+# available, e.g. most CI - this only runs on Apple Silicon dev machines,
+# but that's exactly where the bug it guards against was actually hit).
+# THE BUG THIS GUARDS AGAINST: _historical_ensemble_curve's own mu/sigma
+# tracking (added for the "forecast vs actual" distribution chart fix)
+# multiplied a tensor still on `device` (mps) by `sigma_hat_t.cpu()` -
+# `.cpu()` applied to only ONE operand mid-expression instead of to the
+# final result - raising "Expected all tensors to be on the same device"
+# the moment a K-fold job actually ran on MPS. A CPU-only smoke run can
+# never catch this class of bug (CPU-vs-CPU is trivially consistent) - it
+# needs a REAL non-cpu device to reproduce, hence the explicit availability
+# check rather than unconditionally running this on every machine.
+if torch.backends.mps.is_available():
+    torch.manual_seed(25)
+    mps_args25 = argparse.Namespace(**{
+        **pl.DEFAULT_CONFIG, "pairs": continue_pairs, "lookback": 15, "years": 3, "train_frac": 0.8, "test_frac": 0.1,
+        "features": ["log_return", "vol"], "cma_windows": [], "bandpass_windows": [],
+        "epochs": 2, "n_seeds": 1, "device": "mps", "hidden_size": 4,
+        "checkpoint_metric": "val_loss", "sharpe_weight": 0.0, "load_model": None,
+    })
+    kfold_result25 = pl.run_kfold_pipeline(mps_args25, n_folds=3)
+    assert len(kfold_result25.historical_dates) > 0
+    assert np.isfinite(kfold_result25.historical_probabilities).all()
+    assert np.isfinite(kfold_result25.historical_mu).all()
+    assert np.isfinite(kfold_result25.historical_sigma).all()
+    assert np.isfinite(kfold_result25.test_mu).all()
+    assert np.isfinite(kfold_result25.test_sigma).all()
+    print("25. run_kfold_pipeline on device='mps' OK: no cpu/mps device-mismatch, historical curve mu/sigma finite")
+else:
+    print("25. run_kfold_pipeline on device='mps' SKIPPED (MPS not available on this machine)")
 
 print("\nALL SMOKE TESTS PASSED")

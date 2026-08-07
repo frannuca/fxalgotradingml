@@ -235,7 +235,9 @@ export default function ContinueTrainingView() {
               <select value={modelName} onChange={(e) => selectModel(e.target.value)}>
                 <option value="">— choose —</option>
                 {models.map((m) => (
-                  <option key={m.name} value={m.name}>{m.name}</option>
+                  <option key={m.name} value={m.name}>
+                    {m.name}{m.is_ensemble ? ` (ensemble of ${m.n_members})` : ""}
+                  </option>
                 ))}
               </select>
             </div>
@@ -270,6 +272,16 @@ export default function ContinueTrainingView() {
                 </tbody>
               </table>
             </div>
+          )}
+
+          {selectedModel && selectedModel.is_ensemble && (
+            <p className="status-line" style={{ marginTop: 8, color: "#b45309" }}>
+              This is a {selectedModel.n_members}-member ensemble (from K-fold cross-validation). Continuing it
+              continues EVERY member independently with the settings below, then saves a new ensemble bundling all
+              {selectedModel.n_members} continued members - not a single model. Any risk engines already attached are
+              never carried forward (they were trained against each member's OLD weights); risk-engine retraining
+              isn't exposed in this view yet.
+            </p>
           )}
 
           {selectedModel && (

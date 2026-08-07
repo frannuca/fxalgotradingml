@@ -57,16 +57,34 @@ export default function TrainingProgressPanel({ progress, interim, logs, logBoxR
   // Sharpe) - branch on it explicitly rather than probing for a field that
   // would otherwise just read as `undefined` mid-transition.
   const isRiskPhase = progress.phase === "risk_engine";
+  // K-fold CV (see TrainRequest.use_kfold_cv/models/portfolio_lstm.py's
+  // run_kfold_pipeline) - n_folds stays 1 for a normal single-split run, so
+  // this (and the second, GLOBAL progress bar below) only ever shows up
+  // when K-fold was actually selected.
+  const isKfold = progress.n_folds > 1;
 
   return (
     <div className="panel">
       <h3 style={{ marginBottom: 6 }}>
         Progress
         {progress.n_phases > 1 ? ` — phase ${progress.phase_index}/${progress.n_phases} (${isRiskPhase ? "risk engine" : "prediction model"})` : ""}
+        {isKfold && !isRiskPhase ? ` — fold ${progress.fold_index}/${progress.n_folds}` : ""}
         {!isRiskPhase && progress.n_seeds > 1 ? ` — restart ${progress.seed_index}/${progress.n_seeds}` : ""}
         {!isRiskPhase && progress.n_lambdas > 1 ? ` — bce_weight ${progress.lambda_index}/${progress.n_lambdas}` : ""}
         {" "}— epoch {progress.epoch}/{progress.total_epochs}
       </h3>
+      {isKfold && !isRiskPhase && (
+        <p className="status-line" style={{ marginTop: 0, marginBottom: 4 }}>Overall (all {progress.n_folds} folds)</p>
+      )}
+      {isKfold && !isRiskPhase && (
+        <>
+          <div className="progress-track">
+            <div className="progress-fill" style={{ width: `${progress.global_percent}%` }} />
+          </div>
+          <div className="progress-percent">{progress.global_percent.toFixed(1)}%</div>
+          <p className="status-line" style={{ marginTop: 8, marginBottom: 4 }}>This fold</p>
+        </>
+      )}
       <div className="progress-track">
         <div className="progress-fill" style={{ width: `${progress.percent}%` }} />
       </div>

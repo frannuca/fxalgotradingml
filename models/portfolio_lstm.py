@@ -77,6 +77,7 @@ import copy
 import io
 import logging
 import os
+import dataclasses
 from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import Callable
@@ -1175,23 +1176,161 @@ class PredictionModel(nn.Module):
         return cls._from_checkpoint(checkpoint)
 
 
-def load_prediction_model(path: str) -> PredictionModel:
-    """Load a PredictionModel checkpoint from a local file."""
-    return PredictionModel.load_model(path)
+def load_prediction_model(path: str) -> "PredictionModel | EnsemblePredictionModel":
+    """Load a PredictionModel checkpoint from a local file - or an
+    EnsemblePredictionModel, if this checkpoint was saved by
+    save_ensemble_model (see its own "is_ensemble" marker)."""
+    checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+    if checkpoint.get("is_ensemble"):
+        return ensemble_from_checkpoint(checkpoint)
+    return PredictionModel._from_checkpoint(checkpoint)
 
 
-def load_prediction_model_from_db(name: str) -> PredictionModel:
-    """Load a PredictionModel checkpoint from quant.model_registry by name."""
-    return PredictionModel.load_from_db(name)
+def load_prediction_model_from_db(name: str) -> "PredictionModel | EnsemblePredictionModel":
+    """Load a PredictionModel checkpoint from quant.model_registry by name -
+    or an EnsemblePredictionModel, if this checkpoint was saved by
+    save_ensemble_to_db (see load_prediction_model's own docstring)."""
+    from data.model_registry import load_model_blob
+
+    checkpoint = torch.load(io.BytesIO(load_model_blob(name)), map_location="cpu", weights_only=True)
+    if checkpoint.get("is_ensemble"):
+        return ensemble_from_checkpoint(checkpoint)
+    return PredictionModel._from_checkpoint(checkpoint)
 
 
-def load_prediction_model_auto(value: str) -> PredictionModel:
-    """Load a PredictionModel from either a local file path or a
+def load_prediction_model_auto(value: str) -> "PredictionModel | EnsemblePredictionModel":
+    """Load a PredictionModel (or EnsemblePredictionModel, if this
+    checkpoint was saved by save_ensemble_model/save_ensemble_to_db - see
+    their own "is_ensemble" marker) from either a local file path or a
     quant.model_registry name - tries the local file first (so an existing
     path always wins even if it happens to collide with a DB name)."""
     if os.path.exists(value):
         return load_prediction_model(value)
     return load_prediction_model_from_db(value)
+
+
+class EnsemblePredictionModel:
+    """A persisted, ensembled group of K independently-trained
+    PredictionModels (see run_kfold_pipeline's own ensemble mode) - NOT an
+    nn.Module itself (no parameters are shared, and nothing here is ever
+    trained jointly); purely a container that runs every member's own
+    complete forward pass - each with its OWN x_mean/x_std/sigma_hat and
+    optional attached RiskEngine, since every fold fits its own
+    standardization/calibration on its own purged training data (see
+    _prepare_kfold_data) - and averages their OUTPUTS. See
+    evaluate_ensemble_model for exactly how predictions get combined:
+    probabilities are averaged POST-probit (never the raw (mu, sigma)
+    pair - a mixture of Gaussians isn't itself Gaussian, so averaging mu/
+    sigma directly isn't principled the way averaging calibrated
+    probabilities is), and position weights (including any risk-attenuated
+    ones) are likewise averaged only after each member has independently
+    run its own complete pipeline.
+
+    Deliberately unsupported: continue_training (there's no single well-
+    defined "continue an ensemble" operation - which member would warm-
+    start?) and the standalone risk-engine-retrofit flow
+    (POST /api/train-risk-engine) - both should raise a clear error if
+    pointed at an ensemble checkpoint rather than silently doing something
+    arbitrary to just one member.
+    """
+
+    def __init__(self, members: list[PredictionModel]):
+        if not members:
+            raise ValueError("EnsemblePredictionModel needs at least one member")
+        self.members = members
+        first = members[0]
+        # Every member shares these by construction - K folds of the SAME
+        # config (see run_kfold_pipeline) - so it's read off member 0
+        # rather than re-validated on every access.
+        self.pairs = first.pairs
+        self.lookback = first.lookback
+        self.features = first.features
+        self.cma_windows = first.cma_windows
+        self.bandpass_windows = first.bandpass_windows
+        self.bandpass_order = first.bandpass_order
+        self.direction_horizon = first.direction_horizon
+        self.rolling_stats_window = first.rolling_stats_window
+        self.neutral_band = first.neutral_band
+        self.target_vol = first.target_vol
+        self.signal_range = first.signal_range
+        # An ensemble "has a risk engine" only if EVERY member does (see
+        # run_kfold_pipeline's per-fold risk engine training - either every
+        # fold gets one or none do, never a mix) - a partial set is treated
+        # as "no risk engine" rather than guessing which members to use.
+        self.risk_engine = first.risk_engine if all(m.risk_engine is not None for m in members) else None
+
+    def to(self, device) -> "EnsemblePredictionModel":
+        self.members = [m.to(device) for m in self.members]
+        return self
+
+    def eval(self) -> "EnsemblePredictionModel":
+        for m in self.members:
+            m.eval()
+        return self
+
+    @property
+    def n_members(self) -> int:
+        return len(self.members)
+
+
+def ensemble_checkpoint_dict(
+    members: list[PredictionModel], member_kwargs: list[dict],
+    member_risk_engines: "list[RiskEngine | None] | None" = None,  # noqa: F821 - see models/risk_engine.py
+) -> dict:
+    """Build the checkpoint dict save_ensemble_model()/save_ensemble_to_db()
+    write - a list of ordinary single-model checkpoints (see
+    PredictionModel._checkpoint_dict), each carrying its OWN x_mean/x_std/
+    sigma_hat/optional RiskEngine, under a top-level "is_ensemble" marker
+    load_prediction_model/_from_db/_auto check for.
+
+    `member_kwargs[i]` is the exact kwargs dict _checkpoint_dict needs for
+    `members[i]` (x_mean, x_std, pairs, lookback, features, cma_windows,
+    sigma_hat, neutral_band, target_vol, bandpass_windows, bandpass_order,
+    signal_range, direction_horizon, rolling_stats_window) - every member
+    shares the SAME values for all of these except x_mean/x_std/sigma_hat
+    (each fold fits its own - see _prepare_kfold_data/evaluate_prediction_model),
+    but a caller (run_kfold_pipeline) already has them per-member from each
+    fold's own PredictionResult, so there's no reason to re-derive them.
+    """
+    if member_risk_engines is None:
+        member_risk_engines = [None] * len(members)
+    return {
+        "is_ensemble": True,
+        "members": [
+            member._checkpoint_dict(risk_engine=risk_engine, **kwargs)
+            for member, kwargs, risk_engine in zip(members, member_kwargs, member_risk_engines)
+        ],
+    }
+
+
+def save_ensemble_model(
+    path: str, members: list[PredictionModel], member_kwargs: list[dict],
+    member_risk_engines: "list[RiskEngine | None] | None" = None,  # noqa: F821
+) -> None:
+    """Persist a K-model ensemble (see EnsemblePredictionModel/
+    ensemble_checkpoint_dict) to a local file."""
+    torch.save(ensemble_checkpoint_dict(members, member_kwargs, member_risk_engines), path)
+    logger.info("Saved %d-model ensemble to %s", len(members), path)
+
+
+def save_ensemble_to_db(
+    name: str, members: list[PredictionModel], member_kwargs: list[dict],
+    member_risk_engines: "list[RiskEngine | None] | None" = None, description: str = "",  # noqa: F821
+) -> None:
+    """Persist a K-model ensemble to quant.model_registry (see save_ensemble_model)."""
+    from data.model_registry import save_model_blob
+
+    buffer = io.BytesIO()
+    torch.save(ensemble_checkpoint_dict(members, member_kwargs, member_risk_engines), buffer)
+    save_model_blob(name, buffer.getvalue(), model_type="prediction", description=description)
+
+
+def ensemble_from_checkpoint(checkpoint: dict) -> EnsemblePredictionModel:
+    """Reconstruct an EnsemblePredictionModel from a checkpoint built by
+    ensemble_checkpoint_dict - each member reconstructed exactly like a
+    normal single-model checkpoint (see PredictionModel._from_checkpoint)."""
+    members = [PredictionModel._from_checkpoint(m) for m in checkpoint["members"]]
+    return EnsemblePredictionModel(members)
 
 
 # --------------------------------------------------------------------------
@@ -2403,10 +2542,28 @@ class _PreparedData:
     device: torch.device
 
 
-def _prepare_data(
+@dataclass
+class _FullSequences:
+    """Everything built from raw prices before any train/val/test/fold
+    split is applied - shared by _prepare_data's own single chronological
+    split and _prepare_kfold_data's purged K-fold splits (see
+    _build_full_sequences), so both stay byte-for-byte consistent about
+    what "the data" even is."""
+
+    pairs: list[str]
+    lookback: int
+    n_channels: int
+    direction_horizon: int
+    X: np.ndarray
+    next_returns: np.ndarray
+    z_labels: np.ndarray
+    dates: pd.DatetimeIndex
+    rp_weights_full: np.ndarray
+    cov_full: np.ndarray
+
+
+def _build_full_sequences(
     args: argparse.Namespace,
-    x_mean: np.ndarray | None = None,
-    x_std: np.ndarray | None = None,
     pairs: list[str] | None = None,
     lookback: int | None = None,
     features: list[str] | None = None,
@@ -2415,25 +2572,13 @@ def _prepare_data(
     bandpass_order: int | None = None,
     direction_horizon: int | None = None,
     rolling_stats_window: int | None = None,
-) -> _PreparedData:
-    """Load data (via db.py), build sequences, split by time, and
-    standardize - everything a training (or inference) run needs that
-    doesn't depend on the model's random seed.
-
-    If `x_mean`/`x_std` are given (loading a previously-saved model), they
-    are used as-is instead of being freshly fit - inference must
-    standardize new data exactly the way the loaded model was trained.
-
-    If `pairs`/`lookback`/`features`/`cma_windows`/`bandpass_windows`/
-    `bandpass_order`/`direction_horizon`/`rolling_stats_window` are given,
-    they OVERRIDE the matching `args.*` value - used when loading a saved
-    model, whose checkpoint carries the exact values it was trained with
-    (see PredictionModel._from_checkpoint/load_pipeline below); a loaded
-    model's own stored values must win over whatever a caller passes in -
-    `rolling_stats_window` in particular changes the actual FEATURE VALUES
-    fed to the network (rolling vol/skew/kurt, z-score normalization), so
-    a mismatch here is not just a reporting inconsistency but a genuine
-    train/inference distribution shift.
+) -> _FullSequences:
+    """Load data (via db.py) and build the FULL, pre-split (X, next_returns,
+    z_labels, dates, rp_weights, cov) sequence arrays - the part of data
+    preparation that doesn't depend on how (or how many ways) the result
+    gets split into train/val/test. See _prepare_data's own docstring for
+    what each parameter overrides; `_prepare_data` and `_prepare_kfold_data`
+    both call this, then apply their own (single vs. K-fold) split on top.
     """
     if pairs is None:
         pairs = list(dict.fromkeys(args.pairs))  # de-duplicate, keep order
@@ -2486,6 +2631,55 @@ def _prepare_data(
     # still only ever look at returns strictly before t, split boundary or not.
     cov_window = getattr(args, "cov_window", None) or DEFAULT_COV_WINDOW
     rp_weights_full, cov_full = precompute_risk_parity(next_returns, cov_window)
+
+    return _FullSequences(
+        pairs=pairs, lookback=lookback, n_channels=n_channels, direction_horizon=direction_horizon,
+        X=X, next_returns=next_returns, z_labels=z_labels, dates=dates,
+        rp_weights_full=rp_weights_full, cov_full=cov_full,
+    )
+
+
+def _prepare_data(
+    args: argparse.Namespace,
+    x_mean: np.ndarray | None = None,
+    x_std: np.ndarray | None = None,
+    pairs: list[str] | None = None,
+    lookback: int | None = None,
+    features: list[str] | None = None,
+    cma_windows: list | None = None,
+    bandpass_windows: list | None = None,
+    bandpass_order: int | None = None,
+    direction_horizon: int | None = None,
+    rolling_stats_window: int | None = None,
+) -> _PreparedData:
+    """Load data (via db.py), build sequences, split by time, and
+    standardize - everything a training (or inference) run needs that
+    doesn't depend on the model's random seed.
+
+    If `x_mean`/`x_std` are given (loading a previously-saved model), they
+    are used as-is instead of being freshly fit - inference must
+    standardize new data exactly the way the loaded model was trained.
+
+    If `pairs`/`lookback`/`features`/`cma_windows`/`bandpass_windows`/
+    `bandpass_order`/`direction_horizon`/`rolling_stats_window` are given,
+    they OVERRIDE the matching `args.*` value - used when loading a saved
+    model, whose checkpoint carries the exact values it was trained with
+    (see PredictionModel._from_checkpoint/load_pipeline below); a loaded
+    model's own stored values must win over whatever a caller passes in -
+    `rolling_stats_window` in particular changes the actual FEATURE VALUES
+    fed to the network (rolling vol/skew/kurt, z-score normalization), so
+    a mismatch here is not just a reporting inconsistency but a genuine
+    train/inference distribution shift.
+    """
+    full = _build_full_sequences(
+        args, pairs=pairs, lookback=lookback, features=features, cma_windows=cma_windows,
+        bandpass_windows=bandpass_windows, bandpass_order=bandpass_order, direction_horizon=direction_horizon,
+        rolling_stats_window=rolling_stats_window,
+    )
+    pairs, lookback, n_channels = full.pairs, full.lookback, full.n_channels
+    direction_horizon = full.direction_horizon
+    X, next_returns, z_labels, dates = full.X, full.next_returns, full.z_labels, full.dates
+    rp_weights_full, cov_full = full.rp_weights_full, full.cov_full
 
     # Chronological 3-way split: the most recent `test_frac` fraction of
     # ALL sequences is carved off FIRST as the test set - held out
@@ -2577,6 +2771,168 @@ def _prepare_data(
         x_std=x_std,
         device=device,
     )
+
+
+def generate_purged_kfold_splits(
+    n_foldable: int, n_folds: int, purge_gap: int,
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Split sample indices `[0, n_foldable)` into `n_folds` contiguous,
+    roughly-equal validation blocks (Lopez de Prado's "purged K-fold CV") -
+    for fold k, everything NOT in block k is a training candidate, MINUS a
+    `purge_gap`-wide buffer on EACH side of block k (dropped entirely, not
+    reassigned to either side).
+
+    `purge_gap` should be `lookback + direction_horizon` (see
+    _prepare_data's own purge/embargo comment on why: consecutive samples
+    are stride-1, so a sample's forward label window and its lookback
+    INPUT window overlap heavily with its neighbors' - without this
+    buffer, a training sample just outside the validation block would
+    still have its label - or its lookback window - reach INTO the
+    validation block, leaking information the model is trained to predict
+    into what validation scores it on). Unlike _prepare_data's single
+    train/val boundary (purged on ONE side only, since train sits entirely
+    before val), a K-fold validation block sits INSIDE the training pool
+    (except at the very ends), so both sides need purging.
+
+    Returns a list of `n_folds` (train_indices, val_indices) pairs, both
+    sorted integer arrays into `[0, n_foldable)`. Raises ValueError if
+    `n_folds` doesn't leave every fold a non-empty validation block, or if
+    purging leaves a fold with an empty training set (mirrors
+    _prepare_data's own "left an empty training set" error).
+    """
+    if n_folds < 2:
+        raise ValueError(f"n_folds must be >= 2, got {n_folds}")
+    if n_foldable < n_folds:
+        raise ValueError(
+            f"Only {n_foldable} foldable sequences available, not enough for {n_folds} folds - "
+            f"increase 'years' to fetch more history, or reduce n_folds."
+        )
+    fold_edges = np.linspace(0, n_foldable, n_folds + 1, dtype=int)
+    all_indices = np.arange(n_foldable)
+    splits = []
+    for k in range(n_folds):
+        val_start, val_end = int(fold_edges[k]), int(fold_edges[k + 1])
+        if val_end <= val_start:
+            raise ValueError(
+                f"Fold {k + 1}/{n_folds} would have an empty validation block ({n_foldable} sequences split "
+                f"{n_folds} ways) - reduce n_folds or fetch more history."
+            )
+        val_indices = all_indices[val_start:val_end]
+        purge_start = max(val_start - purge_gap, 0)
+        purge_end = min(val_end + purge_gap, n_foldable)
+        train_mask = np.ones(n_foldable, dtype=bool)
+        train_mask[purge_start:purge_end] = False
+        train_indices = all_indices[train_mask]
+        if len(train_indices) == 0:
+            raise ValueError(
+                f"Purging {purge_gap} samples (lookback + direction_horizon) on each side of fold {k + 1}/{n_folds}'s "
+                f"validation block left an empty training set - increase 'years' to fetch more history, or reduce "
+                f"n_folds/lookback/direction_horizon."
+            )
+        splits.append((train_indices, val_indices))
+    return splits
+
+
+def _prepare_kfold_data(
+    args: argparse.Namespace, n_folds: int,
+) -> tuple[list[_PreparedData], int, _FullSequences, list[tuple[np.ndarray, np.ndarray]]]:
+    """Build `n_folds` independent _PreparedData instances via purged,
+    embargoed K-fold cross-validation (see generate_purged_kfold_splits) -
+    a more robust alternative to _prepare_data's single train/val split for
+    MODEL SELECTION: instead of one (noisy) validation score, this gives a
+    genuine distribution of `n_folds` scores for the SAME configuration
+    (see run_kfold_pipeline), so a config that's only good on one lucky
+    split shows up as high cross-fold variance instead of silently winning.
+
+    The most recent `args.test_frac` fraction of ALL sequences is STILL
+    carved off first, exactly like _prepare_data - genuinely held out from
+    every fold's train AND validation, never touched until the winning
+    fold's final test evaluation. K-fold splitting only happens on what
+    remains, with its own purge buffer against the test boundary (same
+    principle as _prepare_data's own val/test purge).
+
+    Each fold gets its OWN x_mean/x_std, fit on THAT fold's own training
+    indices only (never on its validation block, or on any other fold's
+    data) - the standard "never fit preprocessing on held-out data"
+    discipline, applied per fold rather than once globally.
+
+    Returns `(fold_data, purge_gap, full, splits)` - `fold_data[k]` is fold
+    k's own _PreparedData (dates_train/dates_val/X_train/X_val/etc.
+    specific to that fold; dates_test/X_test/etc. are the SAME underlying
+    test rows in every fold, just standardized by that fold's own
+    x_mean/x_std). `full` (the pre-split _FullSequences) and `splits` (the
+    SAME index-space (train_idx, val_idx) pairs used to build `fold_data`)
+    are returned too so a caller (run_kfold_pipeline's own ensemble/
+    historical-curve construction) can run an ARBITRARY member against an
+    ARBITRARY fold's raw data without rebuilding any of this - needed for
+    the leakage-aware historical curve, which runs fold k's own model
+    against fold j's validation dates for j != k.
+    """
+    full = _build_full_sequences(args)
+    pairs, lookback, n_channels = full.pairs, full.lookback, full.n_channels
+    direction_horizon = full.direction_horizon
+    X, next_returns, z_labels, dates = full.X, full.next_returns, full.z_labels, full.dates
+    rp_weights_full, cov_full = full.rp_weights_full, full.cov_full
+
+    purge_gap = lookback + direction_horizon
+
+    test_frac = getattr(args, "test_frac", 0.0) or 0.0
+    n_total = len(X)
+    n_test = int(n_total * test_frac)
+    n_remaining = n_total - n_test
+    # Same end-boundary purge _prepare_data applies before its own test
+    # split (see its own comment) - a buffer that belongs to NEITHER any
+    # fold NOR the test set, dropped entirely, so no fold's train/val ever
+    # comes within purge_gap samples of the test set's own first sample.
+    n_foldable = max(n_remaining - purge_gap, 0) if n_test > 0 else n_remaining
+    if n_foldable <= 0:
+        raise ValueError(
+            f"Purging {purge_gap} samples ahead of the test split left no sequences to fold over "
+            f"({n_remaining} remaining, test_frac={test_frac}) - increase 'years' to fetch more history."
+        )
+
+    X_full_test = X[n_remaining:]
+    next_returns_test_raw = next_returns[n_remaining:]
+    z_labels_test_raw = z_labels[n_remaining:]
+    dates_test = dates[n_remaining:]
+
+    device = get_device(getattr(args, "device", "auto"))
+    splits = generate_purged_kfold_splits(n_foldable, n_folds, purge_gap)
+
+    fold_data: list[_PreparedData] = []
+    for train_idx, val_idx in splits:
+        X_full_train, X_full_val = X[train_idx], X[val_idx]
+        x_mean, x_std = standardize(X_full_train, axis=(0, 1))  # THIS fold's own train-only stats
+
+        X_train = torch.tensor((X_full_train - x_mean) / x_std, device=device)
+        X_val = torch.tensor((X_full_val - x_mean) / x_std, device=device)
+        X_test = torch.tensor((X_full_test - x_mean) / x_std, device=device)
+
+        fold_data.append(_PreparedData(
+            pairs=pairs,
+            lookback=lookback,
+            n_channels=n_channels,
+            dates_train=dates[train_idx],
+            dates_val=dates[val_idx],
+            dates_test=dates_test,
+            X_train=X_train,
+            X_val=X_val,
+            X_test=X_test,
+            z_labels_train=torch.tensor(z_labels[train_idx], device=device),
+            z_labels_val=torch.tensor(z_labels[val_idx], device=device),
+            z_labels_test=torch.tensor(z_labels_test_raw, device=device),
+            next_returns_train=next_returns[train_idx],
+            next_returns_val=next_returns[val_idx],
+            next_returns_test=next_returns_test_raw,
+            rp_weights_train=torch.tensor(rp_weights_full[train_idx].astype(np.float32), device=device),
+            rp_weights_val=torch.tensor(rp_weights_full[val_idx].astype(np.float32), device=device),
+            cov_train=torch.tensor(cov_full[train_idx].astype(np.float32), device=device),
+            cov_val=torch.tensor(cov_full[val_idx].astype(np.float32), device=device),
+            x_mean=x_mean,
+            x_std=x_std,
+            device=device,
+        ))
+    return fold_data, purge_gap, full, splits
 
 
 def _decided_hit_rate(probabilities: np.ndarray, labels: np.ndarray, neutral_band: float) -> np.ndarray:
@@ -2744,6 +3100,78 @@ def evaluate_prediction_model(
         sigma_hat=sigma_hat,
         neutral_band=float(neutral_band),
     )
+
+
+def _average_ensemble_results(member_results: list[PredictionResult], ensemble: EnsemblePredictionModel) -> PredictionResult:
+    """Average several members' own PredictionResults (same underlying
+    train/val/test dates/labels/next_returns across members - they depend
+    only on the raw return series, never on a member's own weights/scaling
+    - only probabilities/mu/sigma genuinely differ per member) into ONE
+    PredictionResult, shaped IDENTICALLY to a single model's own
+    evaluate_prediction_model output so every downstream consumer
+    (api/server.py's evaluate()/_run_training_job, compute_portfolio, the
+    confusion-matrix/hit-rate/distribution payload builders) needs no
+    ensemble-specific branch of its own.
+
+    Shared by evaluate_ensemble_model (per-member results freshly
+    evaluated from data - see its own docstring) and
+    continue_training_ensemble (per-member results already returned by
+    each member's own continue_training call - no extra data-prep needed
+    there, continue_training already ran evaluate_prediction_model
+    internally).
+
+    Probabilities are averaged POST-probit, never the raw (mu, sigma) pair
+    (a mixture of Gaussians isn't itself Gaussian, so averaging mu/sigma
+    directly isn't principled the way averaging calibrated probabilities
+    is) - mu/sigma themselves ARE still averaged too (arithmetic mean, an
+    acceptable approximation for the "forecast vs actual" distribution
+    chart, a supplementary illustrative view, not a decision-making metric).
+    """
+    first = member_results[0]
+    neutral_band = first.neutral_band
+    kwargs: dict = {"model": ensemble, "pairs": ensemble.pairs, "lookback": ensemble.lookback, "neutral_band": float(neutral_band)}
+    for split in ("train", "val", "test"):
+        kwargs[f"dates_{split}"] = getattr(first, f"dates_{split}")
+        kwargs[f"direction_labels_{split}"] = getattr(first, f"direction_labels_{split}")
+        kwargs[f"z_labels_{split}"] = getattr(first, f"z_labels_{split}")
+        kwargs[f"next_returns_{split}"] = getattr(first, f"next_returns_{split}")
+        probs = np.mean([getattr(r, f"probabilities_{split}") for r in member_results], axis=0)
+        kwargs[f"probabilities_{split}"] = probs
+        kwargs[f"mu_{split}"] = np.mean([getattr(r, f"mu_{split}") for r in member_results], axis=0)
+        kwargs[f"sigma_{split}"] = np.mean([getattr(r, f"sigma_{split}") for r in member_results], axis=0)
+        kwargs[f"hit_rate_{split}"] = _decided_hit_rate(probs, kwargs[f"direction_labels_{split}"], neutral_band)
+    kwargs["x_mean"] = ensemble.members[0].x_mean
+    kwargs["x_std"] = ensemble.members[0].x_std
+    kwargs["sigma_hat"] = np.mean([r.sigma_hat for r in member_results], axis=0)
+    return PredictionResult(**kwargs)
+
+
+def evaluate_ensemble_model(
+    ensemble: EnsemblePredictionModel, args: argparse.Namespace, neutral_band: float | None = None,
+) -> PredictionResult:
+    """Run an EnsemblePredictionModel's own inference path (see its
+    docstring): each member gets its OWN complete _prepare_data call (its
+    own x_mean/x_std - see _prepare_kfold_data's per-fold standardization)
+    and its OWN evaluate_prediction_model pass, then averaged via
+    _average_ensemble_results (see its own docstring on exactly how).
+
+    `neutral_band` defaults to the ensemble's own persisted value (None ->
+    ensemble.neutral_band), same convention load_pipeline's single-model
+    path uses.
+    """
+    if neutral_band is None:
+        neutral_band = ensemble.neutral_band
+    member_results = []
+    for member in ensemble.members:
+        data_m = _prepare_data(
+            args, x_mean=member.x_mean, x_std=member.x_std, pairs=member.pairs, lookback=member.lookback,
+            features=member.features, cma_windows=member.cma_windows, bandpass_windows=member.bandpass_windows,
+            bandpass_order=member.bandpass_order, direction_horizon=member.direction_horizon,
+            rolling_stats_window=member.rolling_stats_window,
+        )
+        member = member.to(data_m.device)
+        member_results.append(evaluate_prediction_model(member, data_m, neutral_band=neutral_band))
+    return _average_ensemble_results(member_results, ensemble)
 
 
 def _run_train_prediction_model(
@@ -2926,6 +3354,95 @@ def continue_training(
     return evaluate_prediction_model(model, data, neutral_band=getattr(args, "neutral_band", 0.0))
 
 
+def continue_training_ensemble(
+    args: argparse.Namespace, base_ensemble: EnsemblePredictionModel,
+    on_member_start: Callable[[int, int], None] | None = None,
+    on_best_checkpoint: Callable[[PredictionModel, "_PreparedData", argparse.Namespace, int, list, float | None], None] | None = None,
+    on_member_risk_epoch: Callable[[int, int, int, int, float | None, float | None, float | None], None] | None = None,
+    stop_check: Callable[[], bool] | None = None,
+) -> tuple[list[PredictionResult], "list[RiskEngine | None]"]:  # noqa: F821 - see models/risk_engine.py
+    """Continue training EVERY member of an already-trained K-fold
+    ensemble independently (see EnsemblePredictionModel) - the SAME
+    extended data window and training hyperparameters (from `args`) for
+    all, each member's own architecture and warm-started weights handled
+    exactly as continue_training's own single-model version already
+    guarantees (recovered from THAT member, never from `args`).
+
+    Mirrors continue_training's own risk-engine discipline: a member's
+    EXISTING risk engine (if any) is NEVER silently carried forward into
+    the continued result - it was trained against that member's OLD
+    probability outputs, and continuing to train invalidates that pairing
+    (see continue_training's own docstring on why save_model's own
+    `risk_engine` param defaults to None, never `self.risk_engine`). A
+    FRESH risk engine is trained per member instead, if
+    `args.train_risk_engine` is set - same per-fold pattern
+    run_kfold_pipeline already uses, just against each member's own
+    CONTINUED weights instead of a freshly-trained one.
+
+    `on_member_start(member_index, n_members)`, if given, is called right
+    before each member's own continue_training begins (1-indexed).
+    `on_member_risk_epoch(member_index, n_members, epoch, epochs,
+    train_sortino, val_sortino, best_val_sortino)` is the same for each
+    member's own optional risk-engine sub-phase.
+
+    Returns (member_results, member_risk_engines) - member_results[i] is
+    member i's own continued PredictionResult (from continue_training,
+    already carrying its own train/val/test - see _average_ensemble_results,
+    which a caller typically combines these through), member_risk_engines[i]
+    its freshly-trained RiskEngine or None.
+    """
+    n_members = len(base_ensemble.members)
+    member_results: list[PredictionResult] = []
+    member_risk_engines: "list[RiskEngine | None]" = []
+    for i, member in enumerate(base_ensemble.members):
+        if stop_check is not None and stop_check():
+            raise TrainingStopped()
+        if on_member_start is not None:
+            on_member_start(i + 1, n_members)
+        # Deliberately matches api/server.py's own _FOLD_RE ("=== fold
+        # %d/%d: ...") so the SAME log-line-driven progress bar
+        # run_kfold_pipeline's fold loop already updates picks this up
+        # for free, with no separate regex needed for member vs fold.
+        logger.info("=== fold %d/%d: continuing ensemble member ===", i + 1, n_members)
+        result_i = continue_training(args, member, on_best_checkpoint=on_best_checkpoint)
+
+        # In-memory checkpoint round trip (no disk I/O) - result_i.model
+        # doesn't carry x_mean/x_std/features/etc as instance attributes
+        # (only _from_checkpoint sets those - see its own docstring, and
+        # PredictionModel.save_model's own docstring on why risk_engine
+        # deliberately isn't threaded through here: a member's OLD risk
+        # engine must never be silently carried forward into its continued
+        # weights - see this function's own docstring). Same trick
+        # run_kfold_pipeline's own per-fold members use, needed here so
+        # EnsemblePredictionModel/_average_ensemble_results can treat every
+        # member uniformly regardless of whether it came fresh from
+        # continue_training or from a later save/load round trip.
+        member_kwargs_i = dict(
+            x_mean=result_i.x_mean, x_std=result_i.x_std, pairs=result_i.pairs, lookback=result_i.lookback,
+            features=args.features, cma_windows=args.cma_windows,
+            sigma_hat=result_i.sigma_hat, neutral_band=result_i.neutral_band, target_vol=args.target_vol,
+            bandpass_windows=args.bandpass_windows, bandpass_order=args.bandpass_order,
+            signal_range=args.signal_range,
+            direction_horizon=args.direction_horizon, rolling_stats_window=args.rolling_stats_window,
+        )
+        clean_checkpoint = result_i.model._checkpoint_dict(**member_kwargs_i)
+        result_i.model = PredictionModel._from_checkpoint(clean_checkpoint)
+        member_results.append(result_i)
+
+        risk_engine_i = None
+        if getattr(args, "train_risk_engine", False):
+            from models.risk_engine import train_risk_engine as _train_risk_engine
+
+            def _member_on_epoch(epoch, epochs, train_sortino, val_sortino, best_val_sortino, _i=i) -> None:
+                if on_member_risk_epoch is not None:
+                    on_member_risk_epoch(_i + 1, n_members, epoch, epochs, train_sortino, val_sortino, best_val_sortino)
+
+            risk_engine_i, _ = _train_risk_engine(result_i.model, args, on_epoch=_member_on_epoch, stop_check=stop_check)
+        member_risk_engines.append(risk_engine_i)
+
+    return member_results, member_risk_engines
+
+
 def summarize_checkpoint(
     model_template: PredictionModel, data: "_PreparedData", args: argparse.Namespace, best_state: list,
 ) -> tuple[PredictionModel, PredictionResult, dict] | None:
@@ -3031,6 +3548,15 @@ def load_pipeline(args: argparse.Namespace) -> PredictionResult:
     the original training split.
     """
     model = load_prediction_model_auto(args.load_model)
+    if isinstance(model, EnsemblePredictionModel):
+        # evaluate_ensemble_model runs its OWN per-member _prepare_data
+        # calls internally (each member needs its own x_mean/x_std - see
+        # that function's own docstring) rather than the single _prepare_data
+        # call below, which assumes one shared model. The checkpoint's own
+        # band wins over the config's, same priority the single-model path
+        # below uses (see its own comment) - `neutral_band=None` here
+        # makes evaluate_ensemble_model default to ensemble.neutral_band.
+        return evaluate_ensemble_model(model, args, neutral_band=None)
     requested_pairs = list(dict.fromkeys(args.pairs)) if args.pairs else None
     if requested_pairs is not None and set(requested_pairs) != set(model.pairs):
         logger.warning(
@@ -3078,9 +3604,84 @@ def run_pipeline(args: argparse.Namespace) -> PredictionResult:
     return _train_and_evaluate(_prepare_data(args), args)
 
 
+#: How many times a SINGLE restart (one seed/bce_weight combo, or one
+#: K-fold fold - see _train_restart_with_retry) is retried after a
+#: non-finite-gradient failure before the whole run is finally allowed to
+#: abort - see _assert_finite_grad's own docstring on the known PyTorch
+#: MPS multi-layer-LSTM backward-pass bug this exists for.
+MAX_TRAIN_ATTEMPTS = 5
+
+
+def _prepared_data_to_device(data: "_PreparedData", device: torch.device) -> "_PreparedData":
+    """Return a COPY of `data` with every tensor field moved to `device` -
+    used by _train_restart_with_retry to fall back from MPS to CPU for a
+    single failing restart (see _assert_finite_grad's own docstring on why
+    that's the only thing that can actually fix that specific,
+    deterministic bug - retrying on the SAME device would just fail
+    identically again) without re-fetching/re-splitting/re-standardizing
+    anything.
+    """
+    return dataclasses.replace(
+        data, device=device,
+        X_train=data.X_train.to(device), X_val=data.X_val.to(device), X_test=data.X_test.to(device),
+        z_labels_train=data.z_labels_train.to(device), z_labels_val=data.z_labels_val.to(device),
+        z_labels_test=data.z_labels_test.to(device),
+        rp_weights_train=data.rp_weights_train.to(device), rp_weights_val=data.rp_weights_val.to(device),
+        cov_train=data.cov_train.to(device), cov_val=data.cov_val.to(device),
+    )
+
+
+def _train_restart_with_retry(
+    data: "_PreparedData", lambda_args: argparse.Namespace,
+    on_best_checkpoint: Callable[[PredictionModel, "_PreparedData", argparse.Namespace, int, list, float | None], None] | None,
+    restart_label: str, seed: int,
+) -> PredictionResult:
+    """Run ONE restart (_train_and_evaluate) with up to MAX_TRAIN_ATTEMPTS
+    attempts if it keeps hitting the known non-finite-gradient MPS bug
+    (see _assert_finite_grad) - a single bad restart no longer aborts the
+    WHOLE multi-seed sweep or K-fold run (see run_pipeline_multi_seed/
+    run_kfold_pipeline, both of which route every restart through this),
+    only re-raises (killing the whole run, exactly as before this existed)
+    once THIS restart alone has failed MAX_TRAIN_ATTEMPTS times in a row.
+
+    The first failure on device="mps" immediately falls back the retry to
+    "cpu" (see _prepared_data_to_device) - the bug is confirmed
+    deterministic for a given (hidden_size, num_layers) architecture, so
+    retrying on the SAME device would just reproduce it identically every
+    time; only a genuinely different device has a chance of succeeding.
+    Any OTHER exception (not this specific, known failure mode) propagates
+    immediately, unretried - this is deliberately narrow, not a generic
+    "retry on any error" mechanism that could mask a real bug.
+    """
+    attempt_data = data
+    last_exc: Exception | None = None
+    for attempt in range(1, MAX_TRAIN_ATTEMPTS + 1):
+        try:
+            torch.manual_seed(seed)  # re-seed EVERY attempt - same init/noise draws as the very first try
+            return _train_and_evaluate(attempt_data, lambda_args, on_best_checkpoint=on_best_checkpoint)
+        except RuntimeError as exc:
+            if "Non-finite gradient" not in str(exc):
+                raise
+            last_exc = exc
+            fell_back = False
+            if str(attempt_data.device) == "mps":
+                attempt_data = _prepared_data_to_device(data, torch.device("cpu"))
+                fell_back = True
+            logger.warning(
+                "%s: non-finite gradient on attempt %d/%d - %s",
+                restart_label, attempt, MAX_TRAIN_ATTEMPTS,
+                "falling back to device='cpu' and retrying" if fell_back else "retrying",
+            )
+    raise RuntimeError(
+        f"{restart_label} failed {MAX_TRAIN_ATTEMPTS} attempts in a row (non-finite gradient every time, "
+        f"including after falling back to CPU) - aborting. Last error: {last_exc}"
+    ) from last_exc
+
+
 def run_pipeline_multi_seed(
     args: argparse.Namespace,
     on_best_checkpoint: Callable[[PredictionModel, "_PreparedData", argparse.Namespace, int, list, float | None], None] | None = None,
+    data: "_PreparedData | None" = None,
 ) -> PredictionResult:
     """Train `n_seeds` independent PredictionModels - each seed optionally
     SWEPT over every `bce_weight` value given (pass a list, e.g.
@@ -3123,6 +3724,12 @@ def run_pipeline_multi_seed(
     seed/bce_weight combo is CURRENTLY running, not necessarily the
     eventual overall winner across every restart (a caller that only
     cares about n_seeds=1 sees no difference).
+
+    `data`, if given, is used AS-IS instead of building a fresh
+    `_prepare_data(args)` internally - lets a caller with its OWN already-
+    prepared split (see run_kfold_pipeline, which builds one independent
+    _PreparedData per purged fold via _prepare_kfold_data) reuse this same
+    seed/bce_weight sweep machinery per fold, rather than duplicating it.
     """
     if args.load_model:
         return load_pipeline(args)
@@ -3137,7 +3744,8 @@ def run_pipeline_multi_seed(
         raise ValueError("bce_weight sweep must have at least one value")
     n_lambdas = len(bce_weights)
 
-    data = _prepare_data(args)  # load/split/standardize once, reused by every seed/lambda combo
+    if data is None:
+        data = _prepare_data(args)  # load/split/standardize once, reused by every seed/lambda combo
 
     def _val_bce(result: PredictionResult) -> float:
         return binary_cross_entropy_np(result.probabilities_val, result.direction_labels_val)
@@ -3152,7 +3760,8 @@ def run_pipeline_multi_seed(
                 seed + 1, n_seeds, seed, bw, lambda_idx + 1, n_lambdas,
             )
             lambda_args = argparse.Namespace(**{**vars(args), "bce_weight": bw})
-            candidates.append(_train_and_evaluate(data, lambda_args, on_best_checkpoint=on_best_checkpoint))
+            restart_label = f"seed={seed}, bce_weight {bw} ({lambda_idx + 1}/{n_lambdas})"
+            candidates.append(_train_restart_with_retry(data, lambda_args, on_best_checkpoint, restart_label, seed))
 
         if n_lambdas == 1:
             seed_best = candidates[0]
@@ -3173,6 +3782,317 @@ def run_pipeline_multi_seed(
         len(seed_winners), best_idx, _val_bce(best), float(best.hit_rate_val.mean()),
     )
     return best
+
+
+def _val_score_for_checkpoint_metric(
+    result: PredictionResult, args: argparse.Namespace, checkpoint_metric: str,
+) -> float:
+    """Score `result`'s VALIDATION split by whichever metric
+    `checkpoint_metric` names ("val_loss"/"hit_rate"/"sharpe" - see
+    train_prediction_model's own docstring), returned HIGHER-IS-BETTER
+    always (val_loss is negated) - the SAME convention api/server.py's
+    _on_best_checkpoint/_interim_callback already use for "best so far"
+    display, so a caller (run_kfold_pipeline) can rank several results with
+    a single `max()` regardless of which metric is selected. Mirrors
+    summarize_checkpoint's own "val"-split computation.
+    """
+    if checkpoint_metric == "hit_rate":
+        return float(np.mean(result.hit_rate_val))
+    if checkpoint_metric == "sharpe":
+        direction_horizon = getattr(args, "direction_horizon", 5) or 5
+        target_vol = getattr(args, "target_vol", None) or DEFAULT_TARGET_VOL
+        cost_bps = getattr(args, "cost_bps", DEFAULT_COST_BPS)
+        signal_min, signal_max = resolve_signal_bounds(result.pairs, getattr(args, "signal_range", None))
+        portfolio = compute_portfolio(
+            result.probabilities_val, result.next_returns_val, direction_horizon, target_vol, cost_bps=cost_bps,
+            signal_min=signal_min, signal_max=signal_max, neutral_band=result.neutral_band,
+        )
+        pnl = portfolio["pnl_modulated"]
+        if len(pnl) > 1 and pnl.std() > 0:
+            return float(pnl.mean() / pnl.std() * (TRADING_DAYS_PER_YEAR ** 0.5))
+        return float("-inf")
+    # "val_loss" (default): NLL + bce_weight * BCE, negated (lower loss -> higher score).
+    bce_weight = getattr(args, "bce_weight", 1.0)
+    if isinstance(bce_weight, (list, tuple)):
+        bce_weight = bce_weight[0] if bce_weight else 1.0
+    mu = torch.as_tensor(result.mu_val)
+    sigma_raw = torch.as_tensor(result.sigma_val) / torch.as_tensor(result.sigma_hat)
+    z = torch.as_tensor(result.z_labels_val)
+    loss = float(gaussian_nll(mu, sigma_raw, z) + bce_weight * direction_bce(mu, sigma_raw, z))
+    return -loss
+
+
+@dataclass
+class KFoldResult:
+    """Result of run_kfold_pipeline - a purged K-fold cross-validation run
+    used as a MODEL SELECTION algorithm (see that function's own
+    docstring). `fold_scores` is the genuine distribution of validation
+    scores (one per fold, in `checkpoint_metric`'s own units, higher is
+    always better - see _val_score_for_checkpoint_metric) this
+    configuration achieved across `n_folds` independent, purged splits -
+    read `mean_score`/`std_score` together: a high mean with a high std is
+    a config that got lucky on some folds and unlucky on others, not a
+    robustly good one - this diagnostic is orthogonal to what actually
+    gets deployed (see below), and stays exactly as useful whether or not
+    ensembling is used.
+
+    The deployed result is the full ENSEMBLE of all `n_folds`
+    independently-trained models (`members`, `member_kwargs` the exact
+    kwargs each one's own _checkpoint_dict needs, `member_risk_engines`
+    each member's own RiskEngine or None - see this function's own
+    per-fold risk-engine training) - see EnsemblePredictionModel/
+    evaluate_ensemble_model for how their outputs get combined at FUTURE
+    evaluation time: a plain average across all K, since every member is
+    equally out-of-sample for data none of them ever saw.
+
+    `historical_*` is this JOB's own honest historical (train+val) curve -
+    built via the leakage-aware "only average members that trained on at
+    most `historical_overlap_threshold` of a given validation block" rule
+    (see _historical_ensemble_curve) - a job-time-only artifact, NOT
+    persisted in the saved checkpoint (same as any normal training job's
+    own train/val/test portfolio reporting). `test_*` is the SAME kind of
+    curve over the shared, never-trained-on test split, but averaged
+    across ALL K members unconditionally (every member is equally
+    out-of-sample there, no overlap check needed).
+    """
+
+    fold_scores: list[float]
+    mean_score: float
+    std_score: float
+    checkpoint_metric: str
+    n_folds: int
+    purge_gap: int
+    members: list[PredictionModel]
+    member_kwargs: list[dict]
+    member_risk_engines: "list[RiskEngine | None]"  # noqa: F821 - see models/risk_engine.py
+    historical_overlap_threshold: float
+    historical_dates: pd.DatetimeIndex
+    historical_probabilities: np.ndarray
+    historical_direction_labels: np.ndarray
+    historical_next_returns: np.ndarray
+    historical_z_labels: np.ndarray
+    historical_mu: np.ndarray
+    historical_sigma: np.ndarray
+    test_dates: pd.DatetimeIndex
+    test_probabilities: np.ndarray
+    test_direction_labels: np.ndarray
+    test_next_returns: np.ndarray
+    test_z_labels: np.ndarray
+    test_mu: np.ndarray
+    test_sigma: np.ndarray
+
+
+def _historical_ensemble_curve(
+    full: "_FullSequences", splits: list[tuple[np.ndarray, np.ndarray]], members: list[PredictionModel],
+    device: torch.device, overlap_threshold: float,
+) -> tuple[pd.DatetimeIndex, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Build ONE honest, leakage-aware historical (train+val) probability
+    curve from a K-fold-trained ensemble.
+
+    For each fold j's own validation block, the naive move - average every
+    fold's model over that block - would mix fold j's genuinely
+    out-of-sample prediction with K-1 OTHER folds' in-sample ones (each of
+    which trained directly on those days), inflating the reported curve.
+    Purging means the truth is more nuanced than "only fold j qualifies",
+    though: a NEIGHBORING fold's own purge buffer can ALSO exclude some of
+    fold j's validation days from ITS training set, so more than one
+    fold's model can be legitimately (near-)out-of-sample for a given day.
+
+    This computes, for every fold j, the set of "qualifying" folds k -
+    those whose OWN training set overlaps AT MOST `overlap_threshold`
+    (e.g. 0.23) of fold j's validation block - and averages just those
+    members' predictions over that block (member k's model run directly
+    against fold j's raw data, standardized by member k's OWN x_mean/
+    x_std - NOT reused from fold_data, which only carries each fold's
+    predictions over ITS OWN split). Concatenating every fold's own block
+    in order (folds are already chronological) gives one continuous,
+    leakage-aware curve spanning the entire K-fold-able history.
+
+    Returns (dates, probabilities, direction_labels, next_returns, z_labels,
+    mu, sigma) - the same shapes _probability_payload/
+    _cumulative_return_payload/_distribution_payload expect. mu/sigma are
+    each qualifying member's own CALIBRATED sigma (sigma * that member's
+    own sigma_hat - the same scale probit() uses, see
+    evaluate_prediction_model's own docstring on why), averaged the same
+    way probabilities are - an acceptable approximation for this
+    supplementary "forecast vs actual" chart (a mixture of Gaussians isn't
+    itself Gaussian).
+    """
+    all_dates, all_probs, all_labels, all_next_returns, all_z, all_mu, all_sigma = [], [], [], [], [], [], []
+    for j, (_, val_idx_j) in enumerate(splits):
+        qualifying = [
+            k for k, (train_idx_k, _) in enumerate(splits)
+            if len(set(val_idx_j.tolist()) & set(train_idx_k.tolist())) / len(val_idx_j) <= overlap_threshold
+        ]
+        X_block = full.X[val_idx_j]
+        z_block = full.z_labels[val_idx_j][:, -1, :]
+        member_probs, member_mu, member_sigma = [], [], []
+        for k in qualifying:
+            member = members[k].to(device)
+            member.eval()
+            X_std = torch.tensor((X_block - member.x_mean) / member.x_std, dtype=torch.float32, device=device)
+            with torch.no_grad():
+                mu, sigma = member(X_std)
+                mu_last, sigma_last = mu[:, -1, :], sigma[:, -1, :]
+                sigma_hat_t = torch.as_tensor(member.sigma_hat, device=device, dtype=torch.float32)
+                probs = probit(mu_last / (sigma_last * sigma_hat_t)).cpu().numpy()
+            member_probs.append(probs)
+            member_mu.append(mu_last.cpu().numpy())
+            member_sigma.append((sigma_last * sigma_hat_t).cpu().numpy())
+        all_dates.append(full.dates[val_idx_j])
+        all_probs.append(np.mean(member_probs, axis=0))
+        all_labels.append((z_block > 0).astype(np.float32))
+        all_next_returns.append(full.next_returns[val_idx_j])
+        all_z.append(z_block)
+        all_mu.append(np.mean(member_mu, axis=0))
+        all_sigma.append(np.mean(member_sigma, axis=0))
+
+    dates = all_dates[0].append(all_dates[1:]) if len(all_dates) > 1 else all_dates[0]
+    return (
+        dates, np.concatenate(all_probs, axis=0), np.concatenate(all_labels, axis=0),
+        np.concatenate(all_next_returns, axis=0), np.concatenate(all_z, axis=0),
+        np.concatenate(all_mu, axis=0), np.concatenate(all_sigma, axis=0),
+    )
+
+
+def run_kfold_pipeline(
+    args: argparse.Namespace,
+    n_folds: int,
+    on_fold_start: Callable[[int, int, int, int], None] | None = None,
+    on_best_checkpoint: Callable[[PredictionModel, "_PreparedData", argparse.Namespace, int, list, float | None], None] | None = None,
+    on_fold_risk_epoch: Callable[[int, int, int, int, float | None, float | None, float | None], None] | None = None,
+    stop_check: Callable[[], bool] | None = None,
+    historical_overlap_threshold: float = 0.23,
+) -> KFoldResult:
+    """Purged, embargoed K-fold cross-validation (see
+    generate_purged_kfold_splits/_prepare_kfold_data) as a MODEL SELECTION
+    algorithm - a more robust alternative to run_pipeline_multi_seed's own
+    single train/val split, which picks "whichever restart validated best"
+    against just ONE validation window (a noisy, small-sample estimate a
+    config can win by luck as much as by genuine quality).
+
+    Trains `n_folds` INDEPENDENT models, one per purged fold (each fold's
+    own _prepare_kfold_data split - same architecture/training
+    hyperparameters from `args`, including its own n_seeds/bce_weight sweep
+    if configured, via run_pipeline_multi_seed), scores each fold's
+    validation split by `args.checkpoint_metric` (see
+    _val_score_for_checkpoint_metric - "still allow the validation metric
+    selection": whichever metric checkpoint_metric names drives BOTH each
+    fold's own within-restart epoch selection AND this diagnostic score),
+    and - unlike an earlier "pick the single best fold" design - keeps
+    EVERY fold's own trained model as one member of a persisted ENSEMBLE
+    (see EnsemblePredictionModel): choosing "the best" fold would just
+    reintroduce the same selection-on-noise problem K-fold was built to
+    avoid, one level up. If `args.train_risk_engine` is set, each fold ALSO
+    gets its own RiskEngine trained on top of its own frozen predictor
+    (mirrors api/server.py's existing phase-2 pattern, once per fold).
+
+    `on_fold_start(fold_index, n_folds, n_train, n_val)`, if given, is
+    called right before each fold's own training begins (1-indexed
+    fold_index) - api/server.py's own job-progress reporting uses this to
+    tag "Fold k/n_folds" onto the SAME per-epoch progress callback a
+    single-split job already reports through (_epoch_report_callback).
+    `on_fold_risk_epoch(fold_index, n_folds, epoch, epochs, train_sortino,
+    val_sortino, best_val_sortino)`, if given, is the same for each fold's
+    own risk-engine training sub-phase.
+
+    `stop_check`, if given, is checked between folds (in addition to
+    whatever train_prediction_model's own per-epoch check already does
+    within a fold) - stopping between folds preserves whichever folds
+    already finished rather than discarding the whole run.
+    """
+    if n_folds < 2:
+        raise ValueError(f"n_folds must be >= 2, got {n_folds}")
+    checkpoint_metric = getattr(args, "checkpoint_metric", "val_loss") or "val_loss"
+    fold_data, purge_gap, full, splits = _prepare_kfold_data(args, n_folds)
+    device = get_device(getattr(args, "device", "auto"))
+    train_risk_engine_flag = getattr(args, "train_risk_engine", False)
+
+    fold_results: list[PredictionResult] = []
+    fold_scores: list[float] = []
+    members: list[PredictionModel] = []
+    member_kwargs: list[dict] = []
+    member_risk_engines: "list[RiskEngine | None]" = []  # noqa: F821
+    for k, data_k in enumerate(fold_data):
+        if stop_check is not None and stop_check():
+            raise TrainingStopped()
+        if on_fold_start is not None:
+            on_fold_start(k + 1, n_folds, len(data_k.dates_train), len(data_k.dates_val))
+        logger.info(
+            "=== fold %d/%d: %d train / %d val sequences (purge_gap=%d) ===",
+            k + 1, n_folds, len(data_k.dates_train), len(data_k.dates_val), purge_gap,
+        )
+        result_k = run_pipeline_multi_seed(args, on_best_checkpoint=on_best_checkpoint, data=data_k)
+        score_k = _val_score_for_checkpoint_metric(result_k, args, checkpoint_metric)
+        logger.info("Fold %d/%d: %s = %.4f", k + 1, n_folds, checkpoint_metric, score_k)
+        fold_results.append(result_k)
+        fold_scores.append(score_k)
+
+        # In-memory checkpoint round trip (no disk I/O) - result_k.model
+        # doesn't carry x_mean/x_std/features/etc as instance attributes
+        # (only _from_checkpoint sets those - see its own docstring); this
+        # is the SAME trick api/server.py's own risk-engine phase-2 uses,
+        # needed here so EnsemblePredictionModel/_historical_ensemble_curve
+        # can treat every member uniformly regardless of whether it came
+        # fresh from training or from a later save/load round trip.
+        kwargs_k = dict(
+            x_mean=result_k.x_mean, x_std=result_k.x_std, pairs=result_k.pairs, lookback=result_k.lookback,
+            features=args.features, cma_windows=args.cma_windows,
+            sigma_hat=result_k.sigma_hat, neutral_band=result_k.neutral_band, target_vol=args.target_vol,
+            bandpass_windows=args.bandpass_windows, bandpass_order=args.bandpass_order,
+            signal_range=args.signal_range,
+            direction_horizon=args.direction_horizon, rolling_stats_window=args.rolling_stats_window,
+        )
+        member_checkpoint = result_k.model._checkpoint_dict(**kwargs_k)
+        member_k = PredictionModel._from_checkpoint(member_checkpoint)
+
+        risk_engine_k = None
+        if train_risk_engine_flag:
+            from models.risk_engine import train_risk_engine as _train_risk_engine
+
+            def _fold_on_epoch(epoch, epochs, train_sortino, val_sortino, best_val_sortino, _k=k) -> None:
+                if on_fold_risk_epoch is not None:
+                    on_fold_risk_epoch(_k + 1, n_folds, epoch, epochs, train_sortino, val_sortino, best_val_sortino)
+
+            risk_engine_k, _ = _train_risk_engine(
+                member_k, args, on_epoch=_fold_on_epoch, stop_check=stop_check,
+            )
+        members.append(member_k)
+        member_kwargs.append(kwargs_k)
+        member_risk_engines.append(risk_engine_k)
+
+    scores_arr = np.array(fold_scores, dtype=np.float64)
+    mean_score, std_score = float(scores_arr.mean()), float(scores_arr.std())
+    logger.info(
+        "K-fold CV done: %s %.4f +/- %.4f across %d folds", checkpoint_metric, mean_score, std_score, n_folds,
+    )
+
+    hist_dates, hist_probs, hist_labels, hist_next_returns, hist_z, hist_mu, hist_sigma = _historical_ensemble_curve(
+        full, splits, members, device, historical_overlap_threshold,
+    )
+    test_dates = fold_results[0].dates_test
+    test_probabilities = np.mean([r.probabilities_test for r in fold_results], axis=0)
+    test_direction_labels = fold_results[0].direction_labels_test
+    test_next_returns = fold_results[0].next_returns_test
+    # z_labels_test is REALIZED ground truth - identical across members
+    # (see evaluate_ensemble_model's own docstring on the same point) -
+    # only mu/sigma (the models' own predictions) need averaging.
+    test_z_labels = fold_results[0].z_labels_test
+    test_mu = np.mean([r.mu_test for r in fold_results], axis=0)
+    test_sigma = np.mean([r.sigma_test for r in fold_results], axis=0)
+
+    return KFoldResult(
+        fold_scores=fold_scores, mean_score=mean_score, std_score=std_score,
+        checkpoint_metric=checkpoint_metric, n_folds=n_folds, purge_gap=purge_gap,
+        members=members, member_kwargs=member_kwargs, member_risk_engines=member_risk_engines,
+        historical_overlap_threshold=historical_overlap_threshold,
+        historical_dates=hist_dates, historical_probabilities=hist_probs,
+        historical_direction_labels=hist_labels, historical_next_returns=hist_next_returns,
+        historical_z_labels=hist_z, historical_mu=hist_mu, historical_sigma=hist_sigma,
+        test_dates=test_dates, test_probabilities=test_probabilities,
+        test_direction_labels=test_direction_labels, test_next_returns=test_next_returns,
+        test_z_labels=test_z_labels, test_mu=test_mu, test_sigma=test_sigma,
+    )
 
 
 def print_hit_rates(result: PredictionResult) -> None:

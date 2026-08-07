@@ -98,6 +98,17 @@ const DEFAULT_FORM = {
   save_db: true,
   model_description: "",
 
+  // --- Optional purged K-fold cross-validation (see
+  // models/portfolio_lstm.py's run_kfold_pipeline) - a more robust MODEL
+  // SELECTION alternative to the single train/val split above: trains
+  // n_folds independent models on purged, embargoed splits (still
+  // respecting "Number of seeds"/BCE-weight sweep above, per fold) and
+  // keeps whichever fold validated best by "Checkpoint selection metric"
+  // above - reuses that SAME selector and "Years of history"/"Cutoff date"
+  // above rather than duplicating them here.
+  use_kfold_cv: false,
+  n_folds: 5,
+
   // --- Optional risk-engine second phase (see models/risk_engine.py) ---
   // When true, api/server.py's _run_training_job continues STRAIGHT into
   // training a NEW RiskEngine on top of THIS run's own just-trained
@@ -126,7 +137,7 @@ const NUMERIC_FIELDS = new Set([
   "lookback", "years", "train_frac", "test_frac", "direction_horizon", "rolling_stats_window",
   "hidden_size", "num_layers", "dropout", "n_attn_heads",
   "epochs", "lr", "weight_decay", "neutral_band", "target_vol",
-  "n_seeds", "bandpass_order", "sharpe_weight", "sharpe_window",
+  "n_seeds", "bandpass_order", "sharpe_weight", "sharpe_window", "n_folds",
   "risk_lookback", "risk_rolling_stats_window", "risk_bandpass_order", "min_risk_att", "max_risk_att",
   "risk_hidden_size", "risk_num_layers", "risk_dropout", "risk_n_attn_heads",
   "risk_epochs", "risk_lr", "risk_weight_decay", "risk_sortino_window", "full_exposure_penalty",
@@ -408,6 +419,10 @@ export default function TrainingView() {
     }
     if (form.train_risk_engine && form.min_risk_att >= form.max_risk_att) {
       setError("Min risk attenuation must be less than max risk attenuation.");
+      return;
+    }
+    if (form.use_kfold_cv && form.n_folds < 2) {
+      setError("Number of folds must be at least 2.");
       return;
     }
     try {
@@ -782,6 +797,37 @@ export default function TrainingView() {
             training fails with a non-finite-gradient error, try "CPU" (a known PyTorch MPS bug affects some
             multi-layer, large-hidden-size architectures - see models/portfolio_lstm.py's train_prediction_model).
           </p>
+        </div>
+
+        <div className="panel">
+          <h2 style={{ marginTop: 0 }}>Cross-validation (K-fold)</h2>
+          <label className="field checkbox">
+            <input
+              type="checkbox"
+              checked={form.use_kfold_cv}
+              onChange={(e) => setForm((f) => ({ ...f, use_kfold_cv: e.target.checked }))}
+            />
+            Use purged K-fold cross-validation for model selection instead of a single validation split
+          </label>
+          <p className="status-line" style={{ marginTop: 4 }}>
+            A single validation split is a noisy, small-sample estimate - a config can look "best" by luck as much
+            as by genuine quality, especially once several seeds/BCE-weight values above are all competing for it.
+            Enabling this instead splits the data (still governed by "Years of history"/"Cutoff date" above,
+            outside "Test fraction", which stays a genuinely untouched final holdout) into "Number of folds" purged,
+            embargoed blocks (a buffer of lookback + direction_horizon decision days is dropped on EACH side of
+            every validation block, so no training sample's label or lookback window ever overlaps what it's
+            validated against - see models/portfolio_lstm.py's generate_purged_kfold_splits) and trains one fully
+            independent model per fold (each still respecting "Number of seeds"/the BCE-weight sweep above,
+            multiplying total training cost by "Number of folds"). "Checkpoint selection metric" above scores every
+            fold's own validation split, exactly as it already scores epochs/restarts - whichever fold validates
+            best is the one that gets saved; the full per-fold score distribution (mean and spread, not just the
+            winner) is reported once training finishes.
+          </p>
+          {form.use_kfold_cv && (
+            <div className="form-grid" style={{ marginTop: 8 }}>
+              <NumField label="Number of folds" name="n_folds" value={form.n_folds} onChange={updateField} />
+            </div>
+          )}
         </div>
 
         <div className="panel">

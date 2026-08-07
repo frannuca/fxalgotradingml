@@ -59,8 +59,11 @@ from models.portfolio_lstm import (
     DEFAULT_BANDPASS_ORDER,
     DEFAULT_CONFIG,
     DEFAULT_FEATURES,
+    EnsemblePredictionModel,
     PredictionModel,
     TrainingStopped,
+    _average_ensemble_results,
+    _decided_hit_rate,
     _epoch_report_callback,
     _stop_check_callback,
     apply_neutral_band,
@@ -173,7 +176,25 @@ def list_models() -> list[dict]:
     result = []
     for name, model_type, description, created_at, updated_at, blob in rows:
         checkpoint = torch.load(io.BytesIO(bytes(blob)), map_location="cpu", weights_only=True)
-        config = checkpoint.get("config", {})
+        # An ensemble checkpoint (see models/portfolio_lstm.py's
+        # ensemble_checkpoint_dict) has NO top-level "config"/"pairs"/etc
+        # of its own - just a list of ordinary member checkpoints, each in
+        # that same normal shape. Every architecture-defining field is
+        # identical across members by construction (K folds of the SAME
+        # config - see run_kfold_pipeline), so decoding member 0 for
+        # DISPLAY is exactly as representative as decoding a single-model
+        # checkpoint directly.
+        is_ensemble = bool(checkpoint.get("is_ensemble"))
+        members = checkpoint.get("members", []) if is_ensemble else [checkpoint]
+        first = members[0]
+        config = first.get("config", {})
+        # An ensemble "has a risk engine" only if EVERY member does (see
+        # EnsemblePredictionModel's own docstring) - a partial set is
+        # shown as none rather than misleadingly picking member 0's.
+        risk_engine_checkpoint = (
+            first.get("risk_engine") if not is_ensemble or all(m.get("risk_engine") is not None for m in members)
+            else None
+        )
         result.append({
             "name": name,
             "model_type": model_type,
@@ -181,24 +202,29 @@ def list_models() -> list[dict]:
             "created_at": created_at.isoformat(),
             "updated_at": updated_at.isoformat(),
             "size_bytes": len(blob),
-            "pairs": checkpoint.get("pairs"),
-            "lookback": checkpoint.get("lookback"),
+            "pairs": first.get("pairs"),
+            "lookback": first.get("lookback"),
             "n_channels": config.get("n_channels"),
             "hidden_size": config.get("hidden_size"),
             "num_layers": config.get("num_layers"),
             "dropout": config.get("dropout"),
             "n_attn_heads": config.get("n_attn_heads"),
             "cross_pairs": config.get("cross_pairs"),
-            "features": checkpoint.get("features"),
-            "cma_windows": checkpoint.get("cma_windows"),
-            "bandpass_windows": checkpoint.get("bandpass_windows"),
-            "bandpass_order": checkpoint.get("bandpass_order"),
-            "direction_horizon": checkpoint.get("direction_horizon", 5),
-            "rolling_stats_window": checkpoint.get("rolling_stats_window", 20),
-            "neutral_band": checkpoint.get("neutral_band"),
-            "target_vol": checkpoint.get("target_vol"),
-            "signal_range": checkpoint.get("signal_range", {}),
-            "risk_engine": _risk_engine_summary(checkpoint.get("risk_engine")),
+            "features": first.get("features"),
+            "cma_windows": first.get("cma_windows"),
+            "bandpass_windows": first.get("bandpass_windows"),
+            "bandpass_order": first.get("bandpass_order"),
+            "direction_horizon": first.get("direction_horizon", 5),
+            "rolling_stats_window": first.get("rolling_stats_window", 20),
+            "neutral_band": first.get("neutral_band"),
+            "target_vol": first.get("target_vol"),
+            "signal_range": first.get("signal_range", {}),
+            "risk_engine": _risk_engine_summary(risk_engine_checkpoint),
+            # None for every ordinary single-model checkpoint - only set
+            # for one saved by save_ensemble_model/save_ensemble_to_db
+            # (see models/portfolio_lstm.py's run_kfold_pipeline).
+            "is_ensemble": is_ensemble,
+            "n_members": len(members) if is_ensemble else None,
         })
     return result
 
@@ -274,6 +300,12 @@ _current_job_id: contextvars.ContextVar[str | None] = contextvars.ContextVar("cu
 # progress bar can track progress across the WHOLE sweep, not just seeds.
 _EPOCH_RE = re.compile(r"epoch (\d+)/(\d+) - train")
 _RESTART_RE = re.compile(r"restart (\d+)/(\d+) \(seed=\d+\), bce_weight \S+ \((\d+)/(\d+)\)")
+# Optional OUTER dimension (see models/portfolio_lstm.py's run_kfold_pipeline,
+# TrainRequest.use_kfold_cv) - one whole seed/lambda sweep PER FOLD, from its
+# own "=== fold %d/%d: ..." log line. When present, _update_percent nests the
+# existing seed/lambda percent INSIDE each fold's own share of the total, so
+# the progress bar reflects the WHOLE K-fold job, not just the current fold.
+_FOLD_RE = re.compile(r"=== fold (\d+)/(\d+):")
 _MAX_LOG_LINES = 500
 
 
@@ -302,8 +334,22 @@ class _JobLogHandler(logging.Handler):
             "progress", {
                 "seed_index": 1, "n_seeds": 1, "lambda_index": 1, "n_lambdas": 1,
                 "epoch": 0, "total_epochs": 1, "percent": 0.0,
+                "fold_index": 1, "n_folds": 1, "global_percent": 0.0,
             },
         )
+
+        fold_match = _FOLD_RE.search(message)
+        if fold_match:
+            progress["fold_index"] = int(fold_match.group(1))
+            progress["n_folds"] = int(fold_match.group(2))
+            # A new fold starts its OWN fresh seed/lambda sweep - reset so a
+            # stale prior fold's restart/epoch counters don't linger for the
+            # moment before this fold's own first "--- restart ---" line.
+            progress["seed_index"] = 1
+            progress["lambda_index"] = 1
+            progress["epoch"] = 0
+            self._update_percent(progress)
+            return
 
         restart_match = _RESTART_RE.search(message)
         if restart_match:
@@ -335,7 +381,18 @@ class _JobLogHandler(logging.Handler):
         total_combos = n_seeds * n_lambdas
         completed_combos = (progress["seed_index"] - 1) * n_lambdas + (progress["lambda_index"] - 1)
         current_combo_fraction = (progress["epoch"] / total_epochs) / total_combos
-        progress["percent"] = round((completed_combos / total_combos + current_combo_fraction) * 100, 1)
+        within_fold_fraction = completed_combos / total_combos + current_combo_fraction
+        progress["percent"] = round(within_fold_fraction * 100, 1)
+        # Nests within_fold_fraction inside this fold's own 1/n_folds share
+        # of the whole job (see models/portfolio_lstm.py's run_kfold_pipeline
+        # and the "=== fold %d/%d ===" log line above) - identical to
+        # `percent` when n_folds == 1 (the non-K-fold, common case), so the
+        # frontend can always show BOTH a per-fold and a global bar without
+        # special-casing which mode is active.
+        n_folds = max(progress.get("n_folds", 1), 1)
+        fold_index = max(progress.get("fold_index", 1), 1)
+        global_fraction = ((fold_index - 1) + within_fold_fraction) / n_folds
+        progress["global_percent"] = round(global_fraction * 100, 1)
 
 
 # Attach once, to the shared "models" ancestor logger - INFO records from
@@ -497,6 +554,23 @@ class TrainRequest(BaseModel):
     risk_weight_decay: float = 0.0
     risk_sortino_window: int = risk_engine_module.DEFAULT_RISK_SORTINO_WINDOW
     full_exposure_penalty: float = risk_engine_module.DEFAULT_FULL_EXPOSURE_PENALTY
+
+    # --- Optional purged K-fold cross-validation (see
+    # models/portfolio_lstm.py's run_kfold_pipeline) - a more robust MODEL
+    # SELECTION alternative to the single train/val split above. When
+    # True, `checkpoint_metric` above still selects WHICH metric drives
+    # selection (both the per-epoch checkpoint within each fold, and the
+    # across-fold winner) - it just gets evaluated across `n_folds`
+    # independent, purged/embargoed splits instead of one. Trains
+    # `n_folds` independent models (each fold internally still respects
+    # n_seeds/bce_weight above), reports the full per-fold score
+    # distribution, and keeps the single best-validating fold's model as
+    # the one that gets saved - exactly like "Best of N restarts" already
+    # does for seeds, one level up. Not combinable with `continue_from`
+    # (continuing an existing model's own architecture doesn't need
+    # re-selecting via CV) - _run_training_job rejects that combination.
+    use_kfold_cv: bool = False
+    n_folds: int = 5
 
 
 def _hit_rate_payload(pairs: list[str], hit_rate: np.ndarray) -> dict:
@@ -698,6 +772,13 @@ def _run_training_job(job_id: str, config: dict) -> None:
             "train_loss": train_loss, "train_hit_rate": train_hit_rate,
             "checkpoint_metric": checkpoint_metric,
         }
+        # Set by _on_fold_start (see the use_kfold_cv branch below) -
+        # absent entirely outside K-fold CV, so this table looks exactly
+        # as it always has for a normal single-split run.
+        current_fold_index = job.get("current_fold_index")
+        if current_fold_index is not None:
+            interim["fold_index"] = current_fold_index
+            interim["n_folds"] = job["progress"].get("n_folds", 1)
         if val_loss is not None:
             interim["val_loss"] = val_loss
             interim["val_hit_rate"] = val_hit_rate
@@ -806,6 +887,23 @@ def _run_training_job(job_id: str, config: dict) -> None:
     _JOBS[job_id]["status"] = "running"
     try:
         continue_from = config.get("continue_from")
+        use_kfold_cv = config.get("use_kfold_cv", False)
+        if continue_from and use_kfold_cv:
+            raise ValueError(
+                "use_kfold_cv is not combinable with continue_from - continuing an existing model's own "
+                "architecture doesn't need re-selecting via cross-validation. Disable one of the two."
+            )
+        kfold_result = None
+        # Set only when continuing an ENSEMBLE (see below) - the members/
+        # kwargs/risk-engines to bundle into a new ensemble checkpoint at
+        # save time, and (unlike the fresh-K-fold case) a normal `result`
+        # with genuine train/val/test splits (each member's own
+        # continue_training already produces one - see
+        # _average_ensemble_results), so the SAME single-model reporting
+        # code below runs unchanged once `result` is set.
+        continued_ensemble_members = None
+        continued_ensemble_kwargs = None
+        continued_ensemble_risk_engines = None
         if continue_from:
             # Continue-training mode (see models/portfolio_lstm.py's
             # continue_training): load the base model ONCE here, then
@@ -818,17 +916,24 @@ def _run_training_job(job_id: str, config: dict) -> None:
             # `result`'s) stays self-consistent with what was actually
             # trained, exactly as if the user had submitted a normal
             # config matching this model from scratch.
-            from models.portfolio_lstm import continue_training, load_prediction_model_auto
+            from models.portfolio_lstm import continue_training, continue_training_ensemble, load_prediction_model_auto
 
             base_model = load_prediction_model_auto(continue_from)
+            is_continuing_ensemble = isinstance(base_model, EnsemblePredictionModel)
+            # Every architecture-defining field is identical across an
+            # ensemble's own members by construction (K folds of the SAME
+            # config - see run_kfold_pipeline) - member 0 is exactly as
+            # representative as the base_model itself would be in the
+            # single-model case.
+            architecture_source = base_model.members[0] if is_continuing_ensemble else base_model
             args = Namespace(**{
                 **DEFAULT_CONFIG, **config, "load_model": None,
-                "pairs": base_model.pairs, "lookback": base_model.lookback,
-                "features": base_model.features, "cma_windows": base_model.cma_windows,
-                "bandpass_windows": base_model.bandpass_windows, "bandpass_order": base_model.bandpass_order,
-                "hidden_size": base_model.hidden_size, "num_layers": base_model.num_layers,
-                "dropout": base_model.dropout_p, "n_attn_heads": base_model.n_attn_heads,
-                "cross_pairs": base_model.cross_pairs,
+                "pairs": architecture_source.pairs, "lookback": architecture_source.lookback,
+                "features": architecture_source.features, "cma_windows": architecture_source.cma_windows,
+                "bandpass_windows": architecture_source.bandpass_windows, "bandpass_order": architecture_source.bandpass_order,
+                "hidden_size": architecture_source.hidden_size, "num_layers": architecture_source.num_layers,
+                "dropout": architecture_source.dropout_p, "n_attn_heads": architecture_source.n_attn_heads,
+                "cross_pairs": architecture_source.cross_pairs,
             })
             # Base name "save best model so far" (below) suffixes with ITS
             # OWN timestamp - see that endpoint - distinct from the
@@ -836,62 +941,121 @@ def _run_training_job(job_id: str, config: dict) -> None:
             # a few lines down, so an early snapshot is never silently
             # overwritten by (or collides with) the eventual final save.
             _JOBS[job_id]["model_base_name"] = os.path.splitext(os.path.basename(continue_from))[0]
-            result = continue_training(args, base_model, on_best_checkpoint=_on_best_checkpoint)
+
+            if is_continuing_ensemble:
+                n_members = len(base_model.members)
+
+                def _on_member_start(member_index: int, n_members_total: int) -> None:
+                    # _JobLogHandler's own "=== fold %d/%d: ..." log line
+                    # (see continue_training_ensemble's own matching format)
+                    # already updates job["progress"]["fold_index"]/"n_folds" -
+                    # this callback exists purely so _interim_callback can
+                    # stamp the SAME tag onto the live metrics table.
+                    job = _JOBS.get(job_id)
+                    if job is not None:
+                        job["current_fold_index"] = member_index
+
+                def _on_member_risk_epoch(
+                    member_index: int, n_members_total: int, epoch: int, epochs: int,
+                    train_sortino: float | None, val_sortino: float | None, best_val_sortino: float | None,
+                ) -> None:
+                    job = _JOBS.get(job_id)
+                    if job is None:
+                        return
+                    progress = job["progress"]
+                    progress["phase"] = "risk_engine"
+                    progress["fold_index"] = member_index
+                    progress["n_folds"] = n_members_total
+                    progress["epoch"] = epoch
+                    progress["total_epochs"] = epochs
+                    progress["percent"] = round(epoch / max(epochs, 1) * 100, 1)
+                    interim = {
+                        "phase": "risk_engine", "fold_index": member_index, "n_folds": n_members_total,
+                        "epoch": epoch, "total_epochs": epochs,
+                        "train_sortino": train_sortino, "val_sortino": val_sortino, "best_val_sortino": best_val_sortino,
+                    }
+                    job["interim"] = interim
+                    history = job.setdefault("interim_history", [])
+                    history.append(interim)
+                    if len(history) > 1000:
+                        del history[: len(history) - 1000]
+
+                member_results, member_risk_engines = continue_training_ensemble(
+                    args, base_model, on_member_start=_on_member_start, on_best_checkpoint=_on_best_checkpoint,
+                    on_member_risk_epoch=_on_member_risk_epoch,
+                    stop_check=lambda: _JOBS.get(job_id, {}).get("stop_requested", False),
+                )
+                continued_ensemble_members = [r.model for r in member_results]
+                continued_ensemble_kwargs = [
+                    dict(
+                        x_mean=r.x_mean, x_std=r.x_std, pairs=r.pairs, lookback=r.lookback,
+                        features=args.features, cma_windows=args.cma_windows,
+                        sigma_hat=r.sigma_hat, neutral_band=r.neutral_band, target_vol=args.target_vol,
+                        bandpass_windows=args.bandpass_windows, bandpass_order=args.bandpass_order,
+                        signal_range=args.signal_range,
+                        direction_horizon=args.direction_horizon, rolling_stats_window=args.rolling_stats_window,
+                    )
+                    for r in member_results
+                ]
+                continued_ensemble_risk_engines = member_risk_engines
+                result = _average_ensemble_results(member_results, EnsemblePredictionModel(continued_ensemble_members))
+            else:
+                result = continue_training(args, base_model, on_best_checkpoint=_on_best_checkpoint)
         else:
             args = Namespace(**{**DEFAULT_CONFIG, **config, "load_model": None})
             _JOBS[job_id]["model_base_name"] = prediction_model_name(args)
 
-            from models.portfolio_lstm import run_pipeline_multi_seed
+            if use_kfold_cv:
+                from models.portfolio_lstm import run_kfold_pipeline
 
-            result = run_pipeline_multi_seed(args, on_best_checkpoint=_on_best_checkpoint)
-        pairs = result.pairs
+                n_folds = getattr(args, "n_folds", 5) or 5
 
-        # --- Optional phase 2: risk engine (see TrainRequest.train_risk_engine) ---
-        # Trained INSIDE this same job/thread, right after phase 1 - no
-        # separate save/reload round trip. `result.model` itself doesn't
-        # carry x_mean/x_std/features/etc as instance attributes (those
-        # only get set by PredictionModel._from_checkpoint, i.e. after a
-        # save/load round trip - see that method's own docstring); rather
-        # than duplicate its attribute list here, build the SAME checkpoint
-        # dict save_model()/save_to_db() below use and reconstruct through
-        # _from_checkpoint - purely in-memory (no disk I/O), and guaranteed
-        # to stay consistent with save/load if that attribute list ever
-        # changes.
-        risk_engine_trained = None
-        risk_engine_summary = None
-        if getattr(args, "train_risk_engine", False):
-            logger.info("Phase 1 (prediction model) complete - continuing with phase 2 (risk engine)")
-            frozen_checkpoint = result.model._checkpoint_dict(
-                x_mean=result.x_mean, x_std=result.x_std, pairs=result.pairs, lookback=result.lookback,
-                features=args.features, cma_windows=args.cma_windows,
-                sigma_hat=result.sigma_hat, neutral_band=result.neutral_band, target_vol=args.target_vol,
-                bandpass_windows=args.bandpass_windows, bandpass_order=args.bandpass_order,
-                signal_range=args.signal_range,
-                direction_horizon=args.direction_horizon, rolling_stats_window=args.rolling_stats_window,
-            )
-            frozen_base = PredictionModel._from_checkpoint(frozen_checkpoint)
-            progress = _JOBS[job_id]["progress"]
-            progress["phase"] = "risk_engine"
-            progress["phase_index"] = 2
-            progress["epoch"] = 0
-            progress["total_epochs"] = getattr(args, "risk_epochs", None) or 100
-            progress["percent"] = 0.0
-            risk_engine_trained, risk_engine_summary = risk_engine_module.train_risk_engine(
-                frozen_base, args, on_epoch=_on_risk_epoch,
-                stop_check=lambda: _JOBS.get(job_id, {}).get("stop_requested", False),
-            )
-            progress["epoch"] = progress["total_epochs"]
-            progress["percent"] = 100.0
+                def _on_fold_start(fold_index: int, n_folds_total: int, n_train: int, n_val: int) -> None:
+                    # _JobLogHandler's own "=== fold %d/%d ===" log line
+                    # (emitted by run_kfold_pipeline itself, right before
+                    # this callback fires) already updates
+                    # job["progress"]["fold_index"]/"n_folds" - this
+                    # callback exists purely so _interim_callback below can
+                    # stamp the SAME fold tag onto the live metrics table,
+                    # which the log-line parser never touches.
+                    job = _JOBS.get(job_id)
+                    if job is not None:
+                        job["current_fold_index"] = fold_index
 
-        result.model.save_model(
-            x_mean=result.x_mean, x_std=result.x_std, pairs=result.pairs, lookback=result.lookback,
-            features=args.features, cma_windows=args.cma_windows,
-            sigma_hat=result.sigma_hat, neutral_band=result.neutral_band, target_vol=args.target_vol,
-            bandpass_windows=args.bandpass_windows, bandpass_order=args.bandpass_order,
-            signal_range=args.signal_range,
-            direction_horizon=args.direction_horizon, rolling_stats_window=args.rolling_stats_window,
-            risk_engine=risk_engine_trained,
-        )
+                def _on_fold_risk_epoch(
+                    fold_index: int, n_folds_total: int, epoch: int, epochs: int,
+                    train_sortino: float | None, val_sortino: float | None, best_val_sortino: float | None,
+                ) -> None:
+                    job = _JOBS.get(job_id)
+                    if job is None:
+                        return
+                    progress = job["progress"]
+                    progress["phase"] = "risk_engine"
+                    progress["fold_index"] = fold_index
+                    progress["n_folds"] = n_folds_total
+                    progress["epoch"] = epoch
+                    progress["total_epochs"] = epochs
+                    progress["percent"] = round(epoch / max(epochs, 1) * 100, 1)
+                    interim = {
+                        "phase": "risk_engine", "fold_index": fold_index, "n_folds": n_folds_total,
+                        "epoch": epoch, "total_epochs": epochs,
+                        "train_sortino": train_sortino, "val_sortino": val_sortino, "best_val_sortino": best_val_sortino,
+                    }
+                    job["interim"] = interim
+                    history = job.setdefault("interim_history", [])
+                    history.append(interim)
+                    if len(history) > 1000:
+                        del history[: len(history) - 1000]
+
+                kfold_result = run_kfold_pipeline(
+                    args, n_folds, on_fold_start=_on_fold_start, on_best_checkpoint=_on_best_checkpoint,
+                    on_fold_risk_epoch=_on_fold_risk_epoch,
+                    stop_check=lambda: _JOBS.get(job_id, {}).get("stop_requested", False),
+                )
+            else:
+                from models.portfolio_lstm import run_pipeline_multi_seed
+
+                result = run_pipeline_multi_seed(args, on_best_checkpoint=_on_best_checkpoint)
 
         if continue_from:
             # Deliberately NOT prediction_model_name(args) - in continue
@@ -904,88 +1068,267 @@ def _run_training_job(job_id: str, config: dict) -> None:
             name = f"{_JOBS[job_id]['model_base_name']}_continued_{datetime.now().strftime('%Y%m%dT%H%M%S')}"
         else:
             name = _JOBS[job_id]["model_base_name"]
-        if args.save_db:
-            result.model.save_to_db(
-                name, x_mean=result.x_mean, x_std=result.x_std, pairs=result.pairs, lookback=result.lookback,
-                features=args.features, cma_windows=args.cma_windows, description=args.model_description,
-                sigma_hat=result.sigma_hat, neutral_band=result.neutral_band, target_vol=args.target_vol,
-                bandpass_windows=args.bandpass_windows, bandpass_order=args.bandpass_order,
-                signal_range=args.signal_range,
-                direction_horizon=args.direction_horizon, rolling_stats_window=args.rolling_stats_window,
-                risk_engine=risk_engine_trained,
-            )
 
-        # Portfolio PnL + per-year Sharpe (see models/portfolio_pnl.py) for
-        # all three splits - same risk-parity-weight x probability-signal
-        # strategy the Evaluation page reports, computed here too so a
-        # freshly-trained model's Sharpe-by-year can be read off right
-        # after training, without a separate evaluation round-trip.
         direction_horizon = getattr(args, "direction_horizon", 5) or 5
         target_vol = args.target_vol
         cost_bps = getattr(args, "cost_bps", DEFAULT_COST_BPS)
-        band = result.neutral_band
-        signal_min, signal_max = resolve_signal_bounds(pairs, args.signal_range)
-        portfolio_train = compute_portfolio(
-            result.probabilities_train, result.next_returns_train, direction_horizon, target_vol,
-            cost_bps=cost_bps, signal_min=signal_min, signal_max=signal_max, neutral_band=band,
-        )
-        portfolio_val = compute_portfolio(
-            result.probabilities_val, result.next_returns_val, direction_horizon, target_vol,
-            cost_bps=cost_bps, signal_min=signal_min, signal_max=signal_max, neutral_band=band,
-        )
-        portfolio_test = compute_portfolio(
-            result.probabilities_test, result.next_returns_test, direction_horizon, target_vol,
-            cost_bps=cost_bps, signal_min=signal_min, signal_max=signal_max, neutral_band=band,
-        )
 
-        _JOBS[job_id]["result"] = {
-            "model_name": name,
-            "pairs": pairs,
-            # Initial value for the frontend's neutral-band control - the
-            # band this training run was configured with. hit_rate/
-            # confusion_matrix below are computed at THIS band purely as
-            # the initial display; probabilities/cumulative_returns carry
-            # everything needed to recompute both for a different band
-            # entirely client-side (see _probability_payload's docstring).
-            "neutral_band": result.neutral_band,
-            "hit_rate": {
-                "train": _hit_rate_payload(pairs, result.hit_rate_train),
-                "val": _hit_rate_payload(pairs, result.hit_rate_val),
-                "test": _hit_rate_payload(pairs, result.hit_rate_test),
-            },
-            "confusion_matrix": {
-                "train": _confusion_matrix_payload(pairs, result.probabilities_train, result.direction_labels_train, result.neutral_band),
-                "val": _confusion_matrix_payload(pairs, result.probabilities_val, result.direction_labels_val, result.neutral_band),
-                "test": _confusion_matrix_payload(pairs, result.probabilities_test, result.direction_labels_test, result.neutral_band),
-            },
-            "cumulative_returns": {
-                "train": _cumulative_return_payload(result.dates_train, pairs, result.next_returns_train),
-                "val": _cumulative_return_payload(result.dates_val, pairs, result.next_returns_val),
-                "test": _cumulative_return_payload(result.dates_test, pairs, result.next_returns_test),
-            },
-            "probabilities": {
-                "train": _probability_payload(result.dates_train, pairs, result.probabilities_train, result.direction_labels_train),
-                "val": _probability_payload(result.dates_val, pairs, result.probabilities_val, result.direction_labels_val),
-                "test": _probability_payload(result.dates_test, pairs, result.probabilities_test, result.direction_labels_test),
-            },
-            "distribution": {
-                "train": _distribution_payload(pairs, result.z_labels_train, result.mu_train, result.sigma_train),
-                "val": _distribution_payload(pairs, result.z_labels_val, result.mu_val, result.sigma_val),
-                "test": _distribution_payload(pairs, result.z_labels_test, result.mu_test, result.sigma_test),
-            },
-            "annual_sharpe": {
-                "train": annual_sharpe_table(result.dates_train, portfolio_train["pnl_modulated"], portfolio_train["pnl_baseline"]),
-                "val": annual_sharpe_table(result.dates_val, portfolio_val["pnl_modulated"], portfolio_val["pnl_baseline"]),
-                "test": annual_sharpe_table(result.dates_test, portfolio_test["pnl_modulated"], portfolio_test["pnl_baseline"]),
-            },
-            # Only present when train_risk_engine was set - see phase 2
-            # above. The Evaluation view's risk-attenuated PnL series come
-            # from re-running evaluate_risk_engine on the SAVED model
-            # (models.risk_engine attached under this same name) rather
-            # than from here - this is just the final train/val Sortino a
-            # user can read off right after training finishes.
-            "risk_engine": risk_engine_summary,
-        }
+        if kfold_result is not None:
+            # --- Ensemble path (use_kfold_cv=True) --------------------
+            # Every fold's own model (+ its own risk engine, if
+            # train_risk_engine was set - run_kfold_pipeline already
+            # trained one per fold) is bundled into ONE saved ensemble
+            # checkpoint - see EnsemblePredictionModel/save_ensemble_model.
+            # "Pick the best fold" would reintroduce the exact
+            # selection-on-noise problem K-fold was built to avoid, one
+            # level up, so every fold's model ships.
+            from models.portfolio_lstm import save_ensemble_model, save_ensemble_to_db
+
+            pairs = kfold_result.members[0].pairs
+            band = kfold_result.members[0].neutral_band
+            save_ensemble_model(
+                "models/prediction_model.pt", kfold_result.members, kfold_result.member_kwargs,
+                kfold_result.member_risk_engines,
+            )
+            if args.save_db:
+                save_ensemble_to_db(
+                    name, kfold_result.members, kfold_result.member_kwargs, kfold_result.member_risk_engines,
+                    description=args.model_description,
+                )
+
+            signal_min, signal_max = resolve_signal_bounds(pairs, args.signal_range)
+            n_assets = len(pairs)
+            empty_dates = pd.DatetimeIndex([])
+            empty_2d = np.zeros((0, n_assets), dtype=np.float32)
+            empty_pnl = np.zeros(0, dtype=np.float32)
+            train_hit_rate = _decided_hit_rate(empty_2d, empty_2d, band)
+
+            portfolio_val = compute_portfolio(
+                kfold_result.historical_probabilities, kfold_result.historical_next_returns, direction_horizon,
+                target_vol, cost_bps=cost_bps, signal_min=signal_min, signal_max=signal_max, neutral_band=band,
+            )
+            portfolio_test = compute_portfolio(
+                kfold_result.test_probabilities, kfold_result.test_next_returns, direction_horizon, target_vol,
+                cost_bps=cost_bps, signal_min=signal_min, signal_max=signal_max, neutral_band=band,
+            )
+
+            _JOBS[job_id]["result"] = {
+                "model_name": name,
+                "pairs": pairs,
+                "neutral_band": band,
+                # "train" is intentionally EMPTY throughout this payload -
+                # an ensemble has no single train/val split of its own
+                # (see run_kfold_pipeline's own docstring): "val" below
+                # carries the FULL leakage-aware historical (train+val)
+                # curve instead (see _historical_ensemble_curve), "test"
+                # the shared, never-trained-on split.
+                "hit_rate": {
+                    "train": _hit_rate_payload(pairs, train_hit_rate),
+                    "val": _hit_rate_payload(pairs, _decided_hit_rate(kfold_result.historical_probabilities, kfold_result.historical_direction_labels, band)),
+                    "test": _hit_rate_payload(pairs, _decided_hit_rate(kfold_result.test_probabilities, kfold_result.test_direction_labels, band)),
+                },
+                "confusion_matrix": {
+                    "train": _confusion_matrix_payload(pairs, empty_2d, empty_2d, band),
+                    "val": _confusion_matrix_payload(pairs, kfold_result.historical_probabilities, kfold_result.historical_direction_labels, band),
+                    "test": _confusion_matrix_payload(pairs, kfold_result.test_probabilities, kfold_result.test_direction_labels, band),
+                },
+                "cumulative_returns": {
+                    "train": _cumulative_return_payload(empty_dates, pairs, empty_2d),
+                    "val": _cumulative_return_payload(kfold_result.historical_dates, pairs, kfold_result.historical_next_returns),
+                    "test": _cumulative_return_payload(kfold_result.test_dates, pairs, kfold_result.test_next_returns),
+                },
+                "probabilities": {
+                    "train": _probability_payload(empty_dates, pairs, empty_2d, empty_2d),
+                    "val": _probability_payload(kfold_result.historical_dates, pairs, kfold_result.historical_probabilities, kfold_result.historical_direction_labels),
+                    "test": _probability_payload(kfold_result.test_dates, pairs, kfold_result.test_probabilities, kfold_result.test_direction_labels),
+                },
+                "distribution": {
+                    "train": _distribution_payload(pairs, empty_2d, empty_2d, empty_2d),
+                    "val": _distribution_payload(pairs, kfold_result.historical_z_labels, kfold_result.historical_mu, kfold_result.historical_sigma),
+                    "test": _distribution_payload(pairs, kfold_result.test_z_labels, kfold_result.test_mu, kfold_result.test_sigma),
+                },
+                "annual_sharpe": {
+                    "train": annual_sharpe_table(empty_dates, empty_pnl, empty_pnl),
+                    "val": annual_sharpe_table(kfold_result.historical_dates, portfolio_val["pnl_modulated"], portfolio_val["pnl_baseline"]),
+                    "test": annual_sharpe_table(kfold_result.test_dates, portfolio_test["pnl_modulated"], portfolio_test["pnl_baseline"]),
+                },
+                "risk_engine": None,
+                "kfold": {
+                    "fold_scores": kfold_result.fold_scores,
+                    "mean_score": kfold_result.mean_score,
+                    "std_score": kfold_result.std_score,
+                    "checkpoint_metric": kfold_result.checkpoint_metric,
+                    "n_folds": kfold_result.n_folds,
+                    "purge_gap": kfold_result.purge_gap,
+                    "n_members": len(kfold_result.members),
+                    "has_risk_engine": any(re is not None for re in kfold_result.member_risk_engines),
+                    "historical_overlap_threshold": kfold_result.historical_overlap_threshold,
+                },
+                "ensemble": None,
+            }
+        else:
+            # --- Single-model OR continued-ensemble path ----------------
+            pairs = result.pairs
+            is_ensemble_continuation = continued_ensemble_members is not None
+            risk_engine_trained = None
+            risk_engine_summary = None
+
+            if is_ensemble_continuation:
+                # Every member's own risk engine (if any) was already
+                # trained inside continue_training_ensemble itself, per
+                # member - nothing left to do here except bundle and save
+                # (see EnsemblePredictionModel/save_ensemble_model). No
+                # single "risk_engine_summary" makes sense across K
+                # independently-trained engines - see the "ensemble" field
+                # in the job result below instead.
+                from models.portfolio_lstm import save_ensemble_model, save_ensemble_to_db
+
+                save_ensemble_model(
+                    "models/prediction_model.pt", continued_ensemble_members, continued_ensemble_kwargs,
+                    continued_ensemble_risk_engines,
+                )
+                if args.save_db:
+                    save_ensemble_to_db(
+                        name, continued_ensemble_members, continued_ensemble_kwargs, continued_ensemble_risk_engines,
+                        description=args.model_description,
+                    )
+            else:
+                # Optional phase 2: risk engine (see TrainRequest.train_risk_engine).
+                # Trained INSIDE this same job/thread, right after phase 1 - no
+                # separate save/reload round trip. `result.model` itself doesn't
+                # carry x_mean/x_std/features/etc as instance attributes (those
+                # only get set by PredictionModel._from_checkpoint, i.e. after a
+                # save/load round trip - see that method's own docstring); rather
+                # than duplicate its attribute list here, build the SAME checkpoint
+                # dict save_model()/save_to_db() below use and reconstruct through
+                # _from_checkpoint - purely in-memory (no disk I/O), and guaranteed
+                # to stay consistent with save/load if that attribute list ever
+                # changes.
+                if getattr(args, "train_risk_engine", False):
+                    logger.info("Phase 1 (prediction model) complete - continuing with phase 2 (risk engine)")
+                    frozen_checkpoint = result.model._checkpoint_dict(
+                        x_mean=result.x_mean, x_std=result.x_std, pairs=result.pairs, lookback=result.lookback,
+                        features=args.features, cma_windows=args.cma_windows,
+                        sigma_hat=result.sigma_hat, neutral_band=result.neutral_band, target_vol=args.target_vol,
+                        bandpass_windows=args.bandpass_windows, bandpass_order=args.bandpass_order,
+                        signal_range=args.signal_range,
+                        direction_horizon=args.direction_horizon, rolling_stats_window=args.rolling_stats_window,
+                    )
+                    frozen_base = PredictionModel._from_checkpoint(frozen_checkpoint)
+                    progress = _JOBS[job_id]["progress"]
+                    progress["phase"] = "risk_engine"
+                    progress["phase_index"] = 2
+                    progress["epoch"] = 0
+                    progress["total_epochs"] = getattr(args, "risk_epochs", None) or 100
+                    progress["percent"] = 0.0
+                    risk_engine_trained, risk_engine_summary = risk_engine_module.train_risk_engine(
+                        frozen_base, args, on_epoch=_on_risk_epoch,
+                        stop_check=lambda: _JOBS.get(job_id, {}).get("stop_requested", False),
+                    )
+                    progress["epoch"] = progress["total_epochs"]
+                    progress["percent"] = 100.0
+
+                result.model.save_model(
+                    x_mean=result.x_mean, x_std=result.x_std, pairs=result.pairs, lookback=result.lookback,
+                    features=args.features, cma_windows=args.cma_windows,
+                    sigma_hat=result.sigma_hat, neutral_band=result.neutral_band, target_vol=args.target_vol,
+                    bandpass_windows=args.bandpass_windows, bandpass_order=args.bandpass_order,
+                    signal_range=args.signal_range,
+                    direction_horizon=args.direction_horizon, rolling_stats_window=args.rolling_stats_window,
+                    risk_engine=risk_engine_trained,
+                )
+                if args.save_db:
+                    result.model.save_to_db(
+                        name, x_mean=result.x_mean, x_std=result.x_std, pairs=result.pairs, lookback=result.lookback,
+                        features=args.features, cma_windows=args.cma_windows, description=args.model_description,
+                        sigma_hat=result.sigma_hat, neutral_band=result.neutral_band, target_vol=args.target_vol,
+                        bandpass_windows=args.bandpass_windows, bandpass_order=args.bandpass_order,
+                        signal_range=args.signal_range,
+                        direction_horizon=args.direction_horizon, rolling_stats_window=args.rolling_stats_window,
+                        risk_engine=risk_engine_trained,
+                    )
+
+            # Portfolio PnL + per-year Sharpe (see models/portfolio_pnl.py) for
+            # all three splits - same risk-parity-weight x probability-signal
+            # strategy the Evaluation page reports, computed here too so a
+            # freshly-trained model's Sharpe-by-year can be read off right
+            # after training, without a separate evaluation round-trip.
+            band = result.neutral_band
+            signal_min, signal_max = resolve_signal_bounds(pairs, args.signal_range)
+            portfolio_train = compute_portfolio(
+                result.probabilities_train, result.next_returns_train, direction_horizon, target_vol,
+                cost_bps=cost_bps, signal_min=signal_min, signal_max=signal_max, neutral_band=band,
+            )
+            portfolio_val = compute_portfolio(
+                result.probabilities_val, result.next_returns_val, direction_horizon, target_vol,
+                cost_bps=cost_bps, signal_min=signal_min, signal_max=signal_max, neutral_band=band,
+            )
+            portfolio_test = compute_portfolio(
+                result.probabilities_test, result.next_returns_test, direction_horizon, target_vol,
+                cost_bps=cost_bps, signal_min=signal_min, signal_max=signal_max, neutral_band=band,
+            )
+
+            _JOBS[job_id]["result"] = {
+                "model_name": name,
+                "pairs": pairs,
+                # Initial value for the frontend's neutral-band control - the
+                # band this training run was configured with. hit_rate/
+                # confusion_matrix below are computed at THIS band purely as
+                # the initial display; probabilities/cumulative_returns carry
+                # everything needed to recompute both for a different band
+                # entirely client-side (see _probability_payload's docstring).
+                "neutral_band": result.neutral_band,
+                "hit_rate": {
+                    "train": _hit_rate_payload(pairs, result.hit_rate_train),
+                    "val": _hit_rate_payload(pairs, result.hit_rate_val),
+                    "test": _hit_rate_payload(pairs, result.hit_rate_test),
+                },
+                "confusion_matrix": {
+                    "train": _confusion_matrix_payload(pairs, result.probabilities_train, result.direction_labels_train, result.neutral_band),
+                    "val": _confusion_matrix_payload(pairs, result.probabilities_val, result.direction_labels_val, result.neutral_band),
+                    "test": _confusion_matrix_payload(pairs, result.probabilities_test, result.direction_labels_test, result.neutral_band),
+                },
+                "cumulative_returns": {
+                    "train": _cumulative_return_payload(result.dates_train, pairs, result.next_returns_train),
+                    "val": _cumulative_return_payload(result.dates_val, pairs, result.next_returns_val),
+                    "test": _cumulative_return_payload(result.dates_test, pairs, result.next_returns_test),
+                },
+                "probabilities": {
+                    "train": _probability_payload(result.dates_train, pairs, result.probabilities_train, result.direction_labels_train),
+                    "val": _probability_payload(result.dates_val, pairs, result.probabilities_val, result.direction_labels_val),
+                    "test": _probability_payload(result.dates_test, pairs, result.probabilities_test, result.direction_labels_test),
+                },
+                "distribution": {
+                    "train": _distribution_payload(pairs, result.z_labels_train, result.mu_train, result.sigma_train),
+                    "val": _distribution_payload(pairs, result.z_labels_val, result.mu_val, result.sigma_val),
+                    "test": _distribution_payload(pairs, result.z_labels_test, result.mu_test, result.sigma_test),
+                },
+                "annual_sharpe": {
+                    "train": annual_sharpe_table(result.dates_train, portfolio_train["pnl_modulated"], portfolio_train["pnl_baseline"]),
+                    "val": annual_sharpe_table(result.dates_val, portfolio_val["pnl_modulated"], portfolio_val["pnl_baseline"]),
+                    "test": annual_sharpe_table(result.dates_test, portfolio_test["pnl_modulated"], portfolio_test["pnl_baseline"]),
+                },
+                # Only present when train_risk_engine was set - see phase 2
+                # above. The Evaluation view's risk-attenuated PnL series come
+                # from re-running evaluate_risk_engine on the SAVED model
+                # (models.risk_engine attached under this same name) rather
+                # than from here - this is just the final train/val Sortino a
+                # user can read off right after training finishes.
+                "risk_engine": risk_engine_summary,
+                "kfold": None,
+                # Only present when continue_from pointed at an ensemble
+                # (see continue_training_ensemble) - deliberately a
+                # DIFFERENT field from "kfold" above: this run never
+                # re-ran K-fold CV itself, just extended each existing
+                # member's own training, so there's no NEW purged-fold
+                # score distribution to report - only that it IS still an
+                # ensemble, and how many members/whether they still carry
+                # risk engines.
+                "ensemble": None if not is_ensemble_continuation else {
+                    "n_members": len(continued_ensemble_members),
+                    "has_risk_engine": any(re is not None for re in continued_ensemble_risk_engines),
+                },
+            }
 
         # The last CAPTURED epoch log line may fall short of the true final
         # epoch (it's only logged every epochs//10 epochs), so snap the bar
@@ -1031,6 +1374,17 @@ def start_training(req: TrainRequest) -> dict:
             "phase": "prediction",
             "n_phases": 2 if req.train_risk_engine else 1,
             "phase_index": 1,
+            # K-fold CV (see TrainRequest.use_kfold_cv/models/portfolio_lstm.py's
+            # run_kfold_pipeline) - fold_index/n_folds stay at 1 (the
+            # single-split default) unless use_kfold_cv is set, in which
+            # case _JobLogHandler's own "=== fold k/n ===" line updates
+            # them live. global_percent nests the per-fold `percent` inside
+            # its own 1/n_folds share of the whole job - identical to
+            # `percent` when n_folds == 1, so the frontend can always show
+            # both bars without special-casing which mode is active.
+            "fold_index": 1,
+            "n_folds": req.n_folds if req.use_kfold_cv else 1,
+            "global_percent": 0.0,
         },
         "interim": None,  # live train/val loss+hit-rate snapshot, updated during training - see _run_training_job
         "interim_history": [],
@@ -1208,6 +1562,12 @@ def _run_risk_engine_job(job_id: str, config: dict) -> None:
     _JOBS[job_id]["status"] = "running"
     try:
         base_model = load_prediction_model_auto(config["base_model"])
+        if isinstance(base_model, EnsemblePredictionModel):
+            raise ValueError(
+                f"{config['base_model']!r} is an ensemble (K-fold cross-validation) model - the standalone "
+                "risk-engine flow has no single well-defined base to train against. Enable K-fold cross-validation's "
+                "own risk-engine option when training a new model instead (each fold gets its own risk engine)."
+            )
         args = Namespace(**{**DEFAULT_CONFIG, **config})
         base_name = os.path.splitext(os.path.basename(config["base_model"]))[0]
         _JOBS[job_id]["model_base_name"] = base_name
@@ -1333,13 +1693,17 @@ def _predict_latest_probabilities(args: Namespace, model) -> tuple[dict[str, flo
     """
     pairs = model.pairs
     lookback = model.lookback
+    is_ensemble = isinstance(model, EnsemblePredictionModel)
     # model may live on an accelerator (MPS/CUDA - see
     # models/portfolio_lstm.get_device); every tensor built below is moved
     # to match before being passed to model() - this is a single tiny
     # inference call, so there's no real GPU benefit, but it must still
     # land on whatever device the (possibly GPU-trained) model actually
     # lives on or the forward pass would raise a device-mismatch error.
-    device = next(model.parameters()).device
+    # An ensemble has no single set of parameters (its members do, and
+    # they may not even share a device) - CPU is fine, this whole call is
+    # one tiny window's worth of inference regardless of member count.
+    device = torch.device("cpu") if is_ensemble else next(model.parameters()).device
     features = getattr(model, "features", None) or list(DEFAULT_FEATURES)
     cma_windows = getattr(model, "cma_windows", None) or []
     bandpass_windows = getattr(model, "bandpass_windows", None) or []
@@ -1364,10 +1728,8 @@ def _predict_latest_probabilities(args: Namespace, model) -> tuple[dict[str, flo
         cutoff_date,
     )
     last_window_features = feature_returns.to_numpy(dtype=np.float32)[-lookback:]  # (lookback, n_assets * n_channels)
-    X = torch.tensor((last_window_features - model.x_mean) / model.x_std, device=device).unsqueeze(0)
 
-    model.eval()
-    with torch.no_grad():
+    def _member_probs(member) -> np.ndarray:
         # model(X) returns (mu, sigma), dense over every day in the window
         # (see PredictionModel's docstring) - only the LAST timestep (the
         # "decision day") is used here, matching backtest reporting.
@@ -1377,10 +1739,21 @@ def _predict_latest_probabilities(args: Namespace, model) -> tuple[dict[str, flo
         # evaluate_prediction_model's docstring on calibration); there's
         # no validation set here to refit it against (this is a single
         # live window), so the training-time estimate is reused as-is.
-        sigma_hat = getattr(model, "sigma_hat", np.ones(len(pairs), dtype=np.float32))
-        sigma_hat_t = torch.as_tensor(sigma_hat, device=device, dtype=torch.float32)
-        mu, sigma = model(X)
-        probs = probit(mu[:, -1, :] / (sigma[:, -1, :] * sigma_hat_t)).cpu().numpy()
+        X = torch.tensor((last_window_features - member.x_mean) / member.x_std, device=device).unsqueeze(0)
+        member.eval()
+        with torch.no_grad():
+            sigma_hat = getattr(member, "sigma_hat", np.ones(len(pairs), dtype=np.float32))
+            sigma_hat_t = torch.as_tensor(sigma_hat, device=device, dtype=torch.float32)
+            mu, sigma = member(X)
+            return probit(mu[:, -1, :] / (sigma[:, -1, :] * sigma_hat_t)).cpu().numpy()
+
+    if is_ensemble:
+        # Average each member's OWN complete pipeline (own x_mean/x_std,
+        # own sigma_hat) - see EnsemblePredictionModel's own docstring on
+        # why this is never a single shared standardization/calibration.
+        probs = np.mean([_member_probs(member.to(device)) for member in model.members], axis=0)
+    else:
+        probs = _member_probs(model)
     # Same abstention rule the backtest metrics used (see
     # apply_neutral_band): inside the band the model reports exactly 0.5 -
     # an explicit "no call today", not a weak directional lean.
@@ -1408,6 +1781,18 @@ def _compute_portfolio_and_today(
     applied. `returns_df` (raw log returns, needed for the risk engine's
     own skew/kurt/CMA/bandpass inputs) is REQUIRED whenever `risk_engine`
     is given.
+
+    `risk_engine` may also be a LIST of RiskEngines (see evaluate()'s own
+    EnsemblePredictionModel branch) - one per ensemble member. Each one
+    independently attenuates the SAME shared `positions_modulated` (the
+    ensemble's own already-averaged position - see evaluate_ensemble_model),
+    and the resulting attenuation FACTORS are averaged across members
+    before being applied once. This is a deliberate simplification over
+    "average each member's own fully independent risk-attenuated
+    position": it still uses every member's own risk engine, just applied
+    to one shared position rather than each member's own separately-
+    computed one, which would need per-member position series this
+    function doesn't otherwise carry.
 
     "Today"'s own attenuation is computed by appending `today`'s own
     (pre-attenuation) position as one more day onto the historical
@@ -1438,7 +1823,12 @@ def _compute_portfolio_and_today(
 
     extended_positions = np.vstack([portfolio["positions_modulated"], today["position_modulated"].reshape(1, -1)])
     extended_dates = dates.append(pd.DatetimeIndex([dates[-1] + pd.Timedelta(days=1)]))
-    attenuation_full = evaluate_risk_engine(risk_engine, extended_positions, returns_df, extended_dates)
+    if isinstance(risk_engine, list):
+        attenuation_full = np.mean(
+            [evaluate_risk_engine(re, extended_positions, returns_df, extended_dates) for re in risk_engine], axis=0,
+        )
+    else:
+        attenuation_full = evaluate_risk_engine(risk_engine, extended_positions, returns_df, extended_dates)
     attenuation_hist, attenuation_today = attenuation_full[:-1], attenuation_full[-1]
 
     portfolio = compute_portfolio(
@@ -1528,7 +1918,16 @@ def evaluate(req: EvaluateRequest) -> dict:
         signal_min, signal_max = resolve_signal_bounds(pairs, getattr(result.model, "signal_range", None))
         latest_probabilities_array = np.array([latest_probabilities[p] for p in pairs], dtype=np.float32)
 
-        risk_engine = getattr(result.model, "risk_engine", None)
+        # For an ensemble (see EnsemblePredictionModel), pass EVERY
+        # member's own risk engine - _compute_portfolio_and_today averages
+        # their attenuation decisions rather than using just one member's
+        # (see its own docstring on why "has a risk engine" already means
+        # every member does). A single model passes its one RiskEngine
+        # exactly as before.
+        if isinstance(result.model, EnsemblePredictionModel):
+            risk_engine = [m.risk_engine for m in result.model.members] if result.model.risk_engine is not None else None
+        else:
+            risk_engine = getattr(result.model, "risk_engine", None)
         returns_df = None
         if risk_engine is not None:
             # Raw log returns - the risk engine's own skew/kurt/CMA/bandpass
